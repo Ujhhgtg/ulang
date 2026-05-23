@@ -5,7 +5,8 @@ mod lexer;
 mod parser;
 mod token;
 
-use clap::{Parser, Subcommand};
+use annotate_snippets::renderer::{AnsiColor, Effects};
+use clap::{Parser, Subcommand, builder::Styles};
 use std::fs;
 use std::path::Path;
 use std::process;
@@ -13,7 +14,12 @@ use std::process;
 use crate::token::{Span, Token};
 
 #[derive(Parser)]
-#[command(name = "ulang", version, about = "A tiny compiled language")]
+#[command(name = "ulang", version, about = "A tiny compiled language",
+    styles = Styles::styled()
+        .header(AnsiColor::BrightGreen.on_default() | Effects::BOLD | Effects::UNDERLINE)
+        .usage(AnsiColor::Cyan.on_default() | Effects::BOLD)
+        .literal(AnsiColor::BrightCyan.on_default() | Effects::BOLD)
+        .placeholder(AnsiColor::Cyan.on_default()))]
 struct Cli {
     #[command(subcommand)]
     command: Command,

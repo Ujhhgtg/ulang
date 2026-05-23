@@ -1,0 +1,9 @@
+[package]
+name = "ulang"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+inkwell = { version = "0.9", features = ["llvm22-1-prefer-dynamic"] }
+annotate-snippets = "0.12"
+clap = { version = "4", features = ["derive"] }

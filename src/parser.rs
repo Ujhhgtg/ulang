@@ -310,7 +310,11 @@ mod tests {
     fn test_binary_add() {
         let prog = parse("fn f() { 1+2; }").unwrap();
         match &prog.funcs[0].body.stmts[0] {
-            Stmt::Expr(Expr::Binary { op: BinOp::Add, lhs, rhs }) => {
+            Stmt::Expr(Expr::Binary {
+                op: BinOp::Add,
+                lhs,
+                rhs,
+            }) => {
                 assert!(matches!(lhs.as_ref(), Expr::IntLit(1)));
                 assert!(matches!(rhs.as_ref(), Expr::IntLit(2)));
             }
@@ -403,10 +407,7 @@ mod tests {
     fn test_call() {
         let prog = parse("fn f() { print(42); }").unwrap();
         match &prog.funcs[0].body.stmts[0] {
-            Stmt::Expr(Expr::Call {
-                callee,
-                arg,
-            }) => {
+            Stmt::Expr(Expr::Call { callee, arg }) => {
                 assert_eq!(callee, "print");
                 assert!(matches!(arg.as_ref(), Expr::IntLit(42)));
             }

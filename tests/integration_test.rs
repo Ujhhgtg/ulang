@@ -1,5 +1,5 @@
-use std::process::Command;
 use std::path::Path;
+use std::process::Command;
 
 fn ulang_binary() -> String {
     // During `cargo test`, the binary is built as `target/debug/ulang`
@@ -31,7 +31,9 @@ fn test_run_calc() {
 #[test]
 fn test_run_empty_source() {
     // Create a temporary empty .u file
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join("tmp_integration");
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("tmp_integration");
     let _ = std::fs::create_dir_all(&dir);
     let empty_u = dir.join("empty.u");
     std::fs::write(&empty_u, "fn main() {}\n").expect("write empty test file");
@@ -52,7 +54,9 @@ fn test_run_empty_source() {
 
 #[test]
 fn test_run_parse_error() {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join("tmp_integration");
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("tmp_integration");
     let _ = std::fs::create_dir_all(&dir);
     let bad_u = dir.join("bad.u");
     std::fs::write(&bad_u, "fn main() { missing_semicolon }\n").expect("write bad test file");

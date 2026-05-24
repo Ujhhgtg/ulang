@@ -1129,7 +1129,7 @@ impl<'ctx> CodeGen<'ctx> {
     fn m_substitute_types_in_expr(expr: &mut Box<Expr>, params: &[String], args: &[Type]) {
         match expr.as_mut() {
             Expr::Cast { to_type, .. } => {
-                // substitute_type_params is on Parser, need to call it via our own method
+                Self::substitute_type_params(to_type, params, args);
             }
             Expr::Call { args: call_args, .. }
             | Expr::QualifiedCall { args: call_args, .. } => {
@@ -1889,8 +1889,10 @@ impl<'ctx> CodeGen<'ctx> {
                 // For struct/primitive methods, look up return type from impl methods
                 let type_name = match &receiver_type {
                     Type::Struct(name) => Some(name.clone()),
+                    Type::GenericInstance(name, args) => Some(Self::mangle_generic_instance(name, args)),
                     Type::Ref { inner, .. } => match inner.as_ref() {
                         Type::Struct(name) => Some(name.clone()),
+                        Type::GenericInstance(name, args) => Some(Self::mangle_generic_instance(name, args)),
                         _ => Self::primitive_type_name(inner).map(|s| s.to_string()),
                     },
                     _ => Self::primitive_type_name(&receiver_type).map(|s| s.to_string()),
@@ -2251,10 +2253,14 @@ impl<'ctx> CodeGen<'ctx> {
                     .build_alloca(llvm_ty, name)
                     .map_err(|e| format!("failed to build alloca: {}", e))?;
                 let mut value = self.compile_expr(init)?;
-                if let Some(ann_ty) = type_ann {
-                    let inferred = self.expr_type(init);
-                    if ann_ty != &inferred {
-                        value = self.emit_cast(value, ann_ty)?;
+                // Only attempt type coercion when the LLVM types differ,
+                // to handle cases like StructLit vs GenericInstance types
+                if value.get_type() != llvm_ty {
+                    if let Some(ann_ty) = type_ann {
+                        let inferred = self.expr_type(init);
+                        if ann_ty != &inferred {
+                            value = self.emit_cast(value, ann_ty)?;
+                        }
                     }
                 }
                 self.builder
@@ -2593,11 +2599,17 @@ impl<'ctx> CodeGen<'ctx> {
                             }
                             match inner.as_ref() {
                                 Type::Struct(name) => {
-                                    let st =
-                                        self.struct_types.get(name).copied().ok_or_else(|| {
-                                            format!("unknown struct type '{}'", name)
-                                        })?;
+                                    let st = self.struct_types.get(name).copied().ok_or_else(|| {
+                                        format!("unknown struct type '{}'", name)
+                                    })?;
                                     (st, name.clone())
+                                }
+                                Type::GenericInstance(name, args) => {
+                                    let mangled = Self::mangle_generic_instance(name, args);
+                                    let st = self.struct_types.get(&mangled).copied().ok_or_else(|| {
+                                        format!("unknown struct type '{}'", mangled)
+                                    })?;
+                                    (st, mangled)
                                 }
                                 _ => {
                                     return Err(
@@ -2693,6 +2705,33 @@ impl<'ctx> CodeGen<'ctx> {
                 Ok(val)
             }
             Expr::Call { callee, args } => {
+                // Handle __builtin_size_of intrinsic
+                if callee == "__builtin_size_of" && args.len() == 1 {
+                    let arg_ty = self.expr_type(&args[0]);
+                    let llvm_ty = self.type_to_llvm(&arg_ty);
+                    let size = match llvm_ty {
+                        inkwell::types::BasicTypeEnum::IntType(i) => i.get_bit_width() as u64 / 8,
+                        inkwell::types::BasicTypeEnum::FloatType(f) => { if f == self.f32_type { 4 } else { 8 } }
+                        inkwell::types::BasicTypeEnum::PointerType(_) => 8,
+                        inkwell::types::BasicTypeEnum::StructType(s) => {
+                            let mut total = 0u64;
+                            for i in 0..s.count_fields() {
+                                if let Some(ft) = s.get_field_type_at_index(i) {
+                                    match ft {
+                                        inkwell::types::BasicTypeEnum::IntType(i) => total += i.get_bit_width() as u64 / 8,
+                                        inkwell::types::BasicTypeEnum::FloatType(f) => total += if f == self.f32_type { 4 } else { 8 },
+                                        inkwell::types::BasicTypeEnum::PointerType(_) => total += 8,
+                                        _ => total += 4,
+                                    }
+                                }
+                            }
+                            if total == 0 { total = 4; }
+                            total
+                        }
+                        _ => 4,
+                    };
+                    return Ok(self.ptr_int_type.const_int(size, false).into());
+                }
                 let arg_types: Vec<Type> = args.iter().map(|a| self.expr_type(a)).collect();
                 let fn_val = self
                     .resolve_function(callee, &arg_types)
@@ -2744,11 +2783,18 @@ impl<'ctx> CodeGen<'ctx> {
                 let qualified_name = format!("{}::{}", module, callee);
                 let mangled_name = format!("{}::{}/{}", module, callee, args.len());
                 let arg_types: Vec<Type> = args.iter().map(|a| self.expr_type(a)).collect();
+                // For generic structs, also try the monomorphized name
+                let monomorphized_name = self.monomorphized_names.get(module.as_str()).map(|mangled| {
+                    format!("{}::{}/{}", mangled, callee, args.len())
+                });
                 // Try direct lookup first, then mangled name (for impl methods), then overload map
                 let fn_val = self
                     .module
                     .get_function(&qualified_name)
                     .or_else(|| self.module.get_function(&mangled_name))
+                    .or_else(|| {
+                        monomorphized_name.as_ref().and_then(|n| self.module.get_function(n))
+                    })
                     .or_else(|| self.resolve_function(&qualified_name, &arg_types))
                     .or_else(|| self.resolve_function(callee, &arg_types))
                     .or_else(|| self.resolve_function(&mangled_name, &arg_types))
@@ -2894,7 +2940,7 @@ impl<'ctx> CodeGen<'ctx> {
                                     format!("failed to load struct for field access: {}", e)
                                 })?;
                         }
-                        Type::Struct(_name) => {
+                        Type::Struct(_) | Type::GenericInstance(_, _) => {
                             let llvm_ty = self.type_to_llvm(&ty);
                             val = self
                                 .builder
@@ -2915,8 +2961,14 @@ impl<'ctx> CodeGen<'ctx> {
                             let parent_ty = self.expr_type(expr);
                             let struct_name = match &parent_ty {
                                 Type::Struct(name) => name.clone(),
+                                Type::GenericInstance(name, args) => {
+                                    Self::mangle_generic_instance(name, args)
+                                }
                                 Type::Ref { inner, .. } => match inner.as_ref() {
                                     Type::Struct(name) => name.clone(),
+                                    Type::GenericInstance(name, args) => {
+                                        Self::mangle_generic_instance(name, args)
+                                    }
                                     _ => {
                                         return Err(format!(
                                             "cannot access field '{}' on non-struct type",
@@ -2969,20 +3021,19 @@ impl<'ctx> CodeGen<'ctx> {
                 method,
                 args,
             } => {
-                // Special case: .len() on strings
+                // Special case: .len() on &str
                 if method == "len" && args.is_empty() {
-                    let val = self.compile_expr(receiver)?;
-                    match val {
-                        BasicValueEnum::StructValue(sv) => {
-                            // &str/str is a { ptr, i64 } struct; field 1 is byte length
-                            let len = self
-                                .builder
-                                .build_extract_value(sv, 1, "str_len")
-                                .map_err(|e| format!("failed to extract str length: {}", e))?;
-                            return Ok(len);
-                        }
-                        _ => {
-                            return Err("cannot call .len() on a non-string value".to_string());
+                    let rt = self.expr_type(receiver);
+                    let is_str = matches!(&rt, Type::Ref { inner, .. } if **inner == Type::Str);
+                    if is_str {
+                        let val = self.compile_expr(receiver)?;
+                        match val {
+                            BasicValueEnum::StructValue(sv) => {
+                                let len = self.builder.build_extract_value(sv, 1, "str_len")
+                                    .map_err(|e| format!("failed to extract str length: {}", e))?;
+                                return Ok(len);
+                            }
+                            _ => return Err("cannot call .len() on a non-string value".to_string()),
                         }
                     }
                 }
@@ -2991,8 +3042,10 @@ impl<'ctx> CodeGen<'ctx> {
                 let receiver_type = self.expr_type(receiver);
                 let (type_name, _is_ref) = match &receiver_type {
                     Type::Struct(name) => (name.clone(), false),
+                    Type::GenericInstance(name, args) => (Self::mangle_generic_instance(name, args), false),
                     Type::Ref { inner, .. } => match inner.as_ref() {
                         Type::Struct(name) => (name.clone(), true),
+                        Type::GenericInstance(name, args) => (Self::mangle_generic_instance(name, args), true),
                         Type::Bool => ("bool".to_string(), true),
                         Type::I8 => ("i8".to_string(), true),
                         Type::I16 => ("i16".to_string(), true),
@@ -3088,18 +3141,19 @@ impl<'ctx> CodeGen<'ctx> {
                 fields,
                 ..
             } => {
+                let actual_name = self.monomorphized_names.get(struct_name.as_str()).cloned().unwrap_or_else(|| struct_name.clone());
                 let struct_type = self
                     .struct_types
-                    .get(struct_name)
+                    .get(&actual_name)
                     .copied()
-                    .ok_or_else(|| format!("unknown struct '{}'", struct_name))?;
+                    .ok_or_else(|| format!("unknown struct '{}'", actual_name))?;
                 let struct_val: inkwell::values::AggregateValueEnum<'ctx> =
                     struct_type.get_undef().into();
                 let mut result = struct_val;
                 // Pre-fetch struct field types for coercion
                 let struct_def_fields: Vec<Type> = self
                     .struct_fields
-                    .get(struct_name)
+                    .get(&actual_name)
                     .map(|f| f.iter().map(|fd| fd.ty.clone()).collect())
                     .unwrap_or_default();
                 for (i, (field_name, field_expr)) in fields.iter().enumerate() {
@@ -3108,7 +3162,7 @@ impl<'ctx> CodeGen<'ctx> {
                     if let Some(field_ty) = struct_def_fields.get(i) {
                         let field_llvm_ty = self.type_to_llvm(field_ty);
                         if field_val.get_type() != field_llvm_ty {
-                            field_val = self.emit_cast(field_val, field_ty)?;
+                                                        field_val = self.emit_cast(field_val, field_ty)?;
                         }
                     }
                     result = self
@@ -3760,7 +3814,7 @@ impl<'ctx> CodeGen<'ctx> {
                     }
                 }
             }
-            _ => Err("unsupported value type for cast".to_string()),
+            _ => Err(format!("unsupported value type for cast: val={:?}", val)),
         }
     }
 }

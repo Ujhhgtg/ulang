@@ -15,7 +15,9 @@ use inkwell::values::{AnyValue, BasicMetadataValueEnum, BasicValueEnum, PointerV
 
 use inkwell::attributes::Attribute;
 
-use crate::ast::{BinOp, Block, EnumDecl, Expr, Function, ImplDecl, Program, Stmt, StructDecl, StructField, Type};
+use crate::ast::{
+    BinOp, Block, EnumDecl, Expr, Function, ImplDecl, Program, Stmt, StructDecl, StructField, Type,
+};
 
 use crate::token::Span;
 
@@ -162,7 +164,7 @@ impl<'ctx> CodeGen<'ctx> {
             Type::SelfType => {
                 *ty = actual_type.clone();
             }
-            Type::Ref { inner, .. } | Type::Ptr { inner, .. } => {
+            Type::Ref { inner, .. } | Type::Ptr { inner, .. } | Type::Array { inner, .. } => {
                 Self::resolve_type_self(inner, actual_type);
             }
             _ => {}
@@ -479,6 +481,9 @@ impl<'ctx> CodeGen<'ctx> {
             Type::Struct(name) => name.clone(),
             Type::GenericInstance(name, _) => name.clone(),
             Type::Ref { inner, .. } => Self::type_to_mangled_name(inner),
+            Type::Array { inner, len } => {
+                format!("array_{}_{}", Self::type_to_mangled_name(inner), len)
+            }
             _ => panic!("unsupported type for trait method: {:?}", ty),
         }
     }
@@ -511,6 +516,11 @@ impl<'ctx> CodeGen<'ctx> {
                 .map(|traits| traits.contains(trait_name))
                 .unwrap_or(false),
             Type::Ref { inner, .. } => self.check_type_implements_trait(inner, trait_name),
+            Type::Array { .. } => {
+                // Arrays implement Index/IndexMut (builtin), and also
+                // any trait their element type implements (for derive checks)
+                trait_name == "Index" || trait_name == "IndexMut"
+            }
             // Tuple/unit types are not derivable (no plan for these)
             _ => false,
         }
@@ -1104,8 +1114,19 @@ impl<'ctx> CodeGen<'ctx> {
                         Type::GenericInstance(name, inner_args) => {
                             Self::mangle_generic_instance(name, inner_args)
                         }
-                        Type::Ref { inner, .. } => format!("ref_{}", Self::mangle_generic_instance_inner(inner)),
-                        Type::Ptr { inner, .. } => format!("ptr_{}", Self::mangle_generic_instance_inner(inner)),
+                        Type::Ref { inner, .. } => {
+                            format!("ref_{}", Self::mangle_generic_instance_inner(inner))
+                        }
+                        Type::Ptr { inner, .. } => {
+                            format!("ptr_{}", Self::mangle_generic_instance_inner(inner))
+                        }
+                        Type::Array { inner, len } => {
+                            format!(
+                                "array_{}_{}",
+                                Self::mangle_generic_instance_inner(inner),
+                                len
+                            )
+                        }
                         _ => format!("{:?}", a),
                     }
                 }
@@ -1121,6 +1142,13 @@ impl<'ctx> CodeGen<'ctx> {
         match ty {
             Type::Struct(name) => name.clone(),
             Type::GenericInstance(name, args) => Self::mangle_generic_instance(name, args),
+            Type::Array { inner, len } => {
+                format!(
+                    "array_{}_{}",
+                    Self::mangle_generic_instance_inner(inner),
+                    len
+                )
+            }
             _ => format!("{:?}", ty),
         }
     }
@@ -1131,8 +1159,12 @@ impl<'ctx> CodeGen<'ctx> {
             Expr::Cast { to_type, .. } => {
                 Self::substitute_type_params(to_type, params, args);
             }
-            Expr::Call { args: call_args, .. }
-            | Expr::QualifiedCall { args: call_args, .. } => {
+            Expr::Call {
+                args: call_args, ..
+            }
+            | Expr::QualifiedCall {
+                args: call_args, ..
+            } => {
                 for arg in call_args.iter_mut() {
                     let mut inner = Box::new(arg.clone());
                     Self::m_substitute_types_in_expr(&mut inner, params, args);
@@ -1140,9 +1172,7 @@ impl<'ctx> CodeGen<'ctx> {
                 }
             }
             Expr::EnumLit {
-                enum_name,
-                payload,
-                ..
+                enum_name, payload, ..
             } => {
                 if let Some(pos) = params.iter().position(|p| p == enum_name) {
                     if let Some(Type::GenericInstance(base, _)) = args.get(pos) {
@@ -1247,6 +1277,20 @@ impl<'ctx> CodeGen<'ctx> {
                     *expr = *inner;
                 }
             }
+            Expr::Array(elems) => {
+                for elem in elems.iter_mut() {
+                    let mut inner = Box::new(elem.clone());
+                    Self::m_substitute_types_in_expr(&mut inner, params, args);
+                    *elem = *inner;
+                }
+            }
+            Expr::Repeat(expr, _) => {
+                Self::m_substitute_types_in_expr(expr, params, args);
+            }
+            Expr::Index { array, index } => {
+                Self::m_substitute_types_in_expr(array, params, args);
+                Self::m_substitute_types_in_expr(index, params, args);
+            }
             _ => {}
         }
     }
@@ -1255,9 +1299,7 @@ impl<'ctx> CodeGen<'ctx> {
     fn m_substitute_block(block: &mut Block, params: &[String], args: &[Type]) {
         for stmt in &mut block.stmts {
             match stmt {
-                Stmt::Let {
-                    type_ann, init, ..
-                } => {
+                Stmt::Let { type_ann, init, .. } => {
                     if let Some(ty) = type_ann {
                         Self::substitute_type_params(ty, params, args);
                     }
@@ -1265,9 +1307,7 @@ impl<'ctx> CodeGen<'ctx> {
                     Self::m_substitute_types_in_expr(&mut expr_box, params, args);
                     *init = *expr_box;
                 }
-                Stmt::Const {
-                    type_ann, init, ..
-                } => {
+                Stmt::Const { type_ann, init, .. } => {
                     if let Some(ty) = type_ann {
                         Self::substitute_type_params(ty, params, args);
                     }
@@ -1306,7 +1346,7 @@ impl<'ctx> CodeGen<'ctx> {
                     *ty = arg.clone();
                 }
             }
-            Type::Ref { inner, .. } | Type::Ptr { inner, .. } => {
+            Type::Ref { inner, .. } | Type::Ptr { inner, .. } | Type::Array { inner, .. } => {
                 Self::substitute_type_params(inner, params, args);
             }
             Type::Tuple(elems) => {
@@ -1314,7 +1354,7 @@ impl<'ctx> CodeGen<'ctx> {
                     Self::substitute_type_params(elem, params, args);
                 }
             }
-            Type::GenericInstance(name, gen_args) => {
+            Type::GenericInstance(_name, gen_args) => {
                 // Substitute in the args
                 for arg in gen_args.iter_mut() {
                     Self::substitute_type_params(arg, params, args);
@@ -1330,9 +1370,7 @@ impl<'ctx> CodeGen<'ctx> {
     }
 
     /// Collect GenericInstance from a method's params, return type, and body.
-    fn collect_generic_instances_from_method(
-        func: &Function,
-    ) -> Vec<(String, Vec<Type>)> {
+    fn collect_generic_instances_from_method(func: &Function) -> Vec<(String, Vec<Type>)> {
         let mut instances = Vec::new();
         let mut seen = HashSet::new();
 
@@ -1386,7 +1424,7 @@ impl<'ctx> CodeGen<'ctx> {
                         instances.push((name.clone(), args.clone()));
                     }
                 }
-                Type::Ref { inner, .. } | Type::Ptr { inner, .. } => {
+                Type::Ref { inner, .. } | Type::Ptr { inner, .. } | Type::Array { inner, .. } => {
                     Self::collect_from_types(&[inner.as_ref().clone()], instances, seen);
                 }
                 Type::Tuple(elems) => {
@@ -1423,7 +1461,8 @@ impl<'ctx> CodeGen<'ctx> {
 
         // Scan enums
         for decl in &program.enums {
-            let variant_types: Vec<Type> = decl.variants.iter().filter_map(|v| v.ty.clone()).collect();
+            let variant_types: Vec<Type> =
+                decl.variants.iter().filter_map(|v| v.ty.clone()).collect();
             Self::collect_from_types(&variant_types, &mut instances, &mut seen);
         }
 
@@ -1432,7 +1471,11 @@ impl<'ctx> CodeGen<'ctx> {
             Self::collect_from_types(&[decl.impl_type.clone()], &mut instances, &mut seen);
             for method in &decl.methods {
                 Self::collect_from_types(
-                    &method.params.iter().map(|p| p.ty.clone()).collect::<Vec<_>>(),
+                    &method
+                        .params
+                        .iter()
+                        .map(|p| p.ty.clone())
+                        .collect::<Vec<_>>(),
                     &mut instances,
                     &mut seen,
                 );
@@ -1470,7 +1513,8 @@ impl<'ctx> CodeGen<'ctx> {
             return Ok(());
         }
         self.monomorphized.insert(mangled.clone());
-        self.monomorphized_names.insert(base_name.to_string(), mangled.clone());
+        self.monomorphized_names
+            .insert(base_name.to_string(), mangled.clone());
 
         // 1a. Create concrete LLVM struct type (generic struct)
         if let Some(decl) = self.generic_struct_defs.get(base_name) {
@@ -1495,7 +1539,8 @@ impl<'ctx> CodeGen<'ctx> {
                 .map(|f| self.type_to_llvm(&f.ty))
                 .collect();
             struct_type.set_body(&field_types, false);
-            self.struct_fields.insert(mangled.clone(), substituted_fields);
+            self.struct_fields
+                .insert(mangled.clone(), substituted_fields);
             self.struct_types.insert(mangled.clone(), struct_type);
         }
 
@@ -1524,7 +1569,8 @@ impl<'ctx> CodeGen<'ctx> {
                 .map(|f| self.type_to_llvm(&f.ty))
                 .collect();
             struct_type.set_body(&field_types, false);
-            self.struct_fields.insert(mangled.clone(), substituted_fields);
+            self.struct_fields
+                .insert(mangled.clone(), substituted_fields);
             self.struct_types.insert(mangled.clone(), struct_type);
             // Register concrete enum in enum_defs for variant lookup
             let mut concrete_decl = decl.clone();
@@ -1552,12 +1598,7 @@ impl<'ctx> CodeGen<'ctx> {
                 let mut method_func = method.clone();
 
                 // Substitute type params in the method
-                Self::monomorphize_method(
-                    &mut method_func,
-                    impl_params,
-                    args,
-                    &self_type,
-                );
+                Self::monomorphize_method(&mut method_func, impl_params, args, &self_type);
 
                 // Compute mangled name
                 let mangled_method = format!(
@@ -1569,9 +1610,7 @@ impl<'ctx> CodeGen<'ctx> {
                 method_func.name = mangled_method.clone();
 
                 // Recursively monomorphize any GenericInstance types
-                let body_instances = Self::collect_generic_instances_from_method(
-                    &method_func,
-                );
+                let body_instances = Self::collect_generic_instances_from_method(&method_func);
                 for (sub_base, sub_args) in &body_instances {
                     if self.generic_struct_defs.contains_key(sub_base)
                         || self.generic_enum_defs.contains_key(sub_base)
@@ -1596,30 +1635,36 @@ impl<'ctx> CodeGen<'ctx> {
         Ok(())
     }
 
-
     pub fn compile_module(&mut self, program: &Program) -> Result<(), String> {
         // Phase 0: Create opaque struct types for ALL structs/enums
         for decl in &program.structs {
             if !decl.type_params.is_empty() {
-                self.generic_struct_defs.insert(decl.name.clone(), decl.clone());
+                self.generic_struct_defs
+                    .insert(decl.name.clone(), decl.clone());
                 self.impl_methods.entry(decl.name.clone()).or_default();
             }
             let struct_type = self.context.opaque_struct_type(&decl.name);
-            self.struct_fields.insert(decl.name.clone(), decl.fields.clone());
+            self.struct_fields
+                .insert(decl.name.clone(), decl.fields.clone());
             self.struct_types.insert(decl.name.clone(), struct_type);
         }
         for decl in &program.enums {
             if !decl.type_params.is_empty() {
-                self.generic_enum_defs.insert(decl.name.clone(), decl.clone());
+                self.generic_enum_defs
+                    .insert(decl.name.clone(), decl.clone());
                 self.impl_methods.entry(decl.name.clone()).or_default();
             }
             let mut fields: Vec<StructField> = vec![StructField {
-                name: "__tag".to_string(), ty: Type::I8, span: Span::empty(0),
+                name: "__tag".to_string(),
+                ty: Type::I8,
+                span: Span::empty(0),
             }];
             for variant in &decl.variants {
                 if let Some(ref payload_ty) = variant.ty {
                     fields.push(StructField {
-                        name: format!("__{}", variant.name), ty: payload_ty.clone(), span: Span::empty(0),
+                        name: format!("__{}", variant.name),
+                        ty: payload_ty.clone(),
+                        span: Span::empty(0),
                     });
                 }
             }
@@ -1636,10 +1681,18 @@ impl<'ctx> CodeGen<'ctx> {
                 Type::Struct(name) => name.clone(),
                 Type::GenericInstance(name, _) => name.clone(),
                 Type::SelfType => "Self".to_string(),
-                _ => return Err(format!("impl target must be a struct type or Self, got {:?}", decl.impl_type)),
+                _ => {
+                    return Err(format!(
+                        "impl target must be a struct type or Self, got {:?}",
+                        decl.impl_type
+                    ));
+                }
             };
             if !decl.type_params.is_empty() {
-                self.generic_impls.entry(type_name).or_default().push((decl.type_params.clone(), decl.clone()));
+                self.generic_impls
+                    .entry(type_name)
+                    .or_default()
+                    .push((decl.type_params.clone(), decl.clone()));
                 continue;
             }
             for method in &decl.methods {
@@ -1651,54 +1704,88 @@ impl<'ctx> CodeGen<'ctx> {
                 let mut method_func = method.clone();
                 method_func.name = mangled_name.clone();
                 self.declare_function(&method_func)?;
-                self.impl_methods.entry(type_name.clone()).or_default().push((method.name.clone(), mangled_name));
+                self.impl_methods
+                    .entry(type_name.clone())
+                    .or_default()
+                    .push((method.name.clone(), mangled_name));
             }
         }
         // Phase 1: Declare all functions
-        for func in &program.funcs { self.declare_function(func)?; }
+        for func in &program.funcs {
+            self.declare_function(func)?;
+        }
         // Phase 0.6: Discover and monomorphize all needed generic instances
         let generic_instances = Self::collect_generic_instances(program);
         for (base_name, args) in &generic_instances {
-            if self.generic_struct_defs.contains_key(base_name) || self.generic_enum_defs.contains_key(base_name) {
+            if self.generic_struct_defs.contains_key(base_name)
+                || self.generic_enum_defs.contains_key(base_name)
+            {
                 self.ensure_monomorphized(base_name, args)?;
             }
         }
         // Phase 0.65: Set struct bodies for non-generic structs/enums
         for decl in &program.structs {
-            if !decl.type_params.is_empty() { continue; }
+            if !decl.type_params.is_empty() {
+                continue;
+            }
             if let Some(st) = self.struct_types.get(&decl.name) {
-                let ft: Vec<BasicTypeEnum<'ctx>> = decl.fields.iter().map(|f| self.type_to_llvm(&f.ty)).collect();
+                let ft: Vec<BasicTypeEnum<'ctx>> = decl
+                    .fields
+                    .iter()
+                    .map(|f| self.type_to_llvm(&f.ty))
+                    .collect();
                 st.set_body(&ft, false);
             }
         }
         for decl in &program.enums {
-            if !decl.type_params.is_empty() { continue; }
+            if !decl.type_params.is_empty() {
+                continue;
+            }
             if let Some(st) = self.struct_types.get(&decl.name) {
                 let fields = self.struct_fields.get(&decl.name).unwrap();
-                let ft: Vec<BasicTypeEnum<'ctx>> = fields.iter().map(|f| self.type_to_llvm(&f.ty)).collect();
+                let ft: Vec<BasicTypeEnum<'ctx>> =
+                    fields.iter().map(|f| self.type_to_llvm(&f.ty)).collect();
                 st.set_body(&ft, false);
             }
         }
         // Phase 0.75: Process #[derive(...)] (non-generic only)
         for decl in &program.structs {
-            if decl.type_params.is_empty() { self.process_struct_derives(decl, program)?; }
+            if decl.type_params.is_empty() {
+                self.process_struct_derives(decl, program)?;
+            }
         }
         for decl in &program.enums {
             if decl.type_params.is_empty() {
-                let f = self.struct_fields.get(&decl.name).cloned().unwrap_or_default();
-                let sd = StructDecl { name: decl.name.clone(), fields: f, type_params: vec![], attribs: decl.attribs.clone(), span: decl.span };
+                let f = self
+                    .struct_fields
+                    .get(&decl.name)
+                    .cloned()
+                    .unwrap_or_default();
+                let sd = StructDecl {
+                    name: decl.name.clone(),
+                    fields: f,
+                    type_params: vec![],
+                    attribs: decl.attribs.clone(),
+                    span: decl.span,
+                };
                 self.process_struct_derives(&sd, program)?;
             }
         }
         // Phase 2: Compile bodies for non-extern functions
         for func in &program.funcs {
-            if !func.is_extern { self.compile_function_body(func)?; }
+            if !func.is_extern {
+                self.compile_function_body(func)?;
+            }
         }
         // Phase 2b: Compile non-generic impl method bodies
         for decl in &program.impls {
-            if !decl.type_params.is_empty() { continue; }
+            if !decl.type_params.is_empty() {
+                continue;
+            }
             let type_name = match &decl.impl_type {
-                Type::Struct(name) => name.clone(), Type::SelfType => "Self".to_string(), _ => continue,
+                Type::Struct(name) => name.clone(),
+                Type::SelfType => "Self".to_string(),
+                _ => continue,
             };
             let self_type = Type::Struct(type_name.clone());
             for method in &decl.methods {
@@ -1819,6 +1906,17 @@ impl<'ctx> CodeGen<'ctx> {
             }
             Type::Ref { .. } => self.context.ptr_type(AddressSpace::default()).into(),
             Type::Ptr { .. } => self.context.ptr_type(AddressSpace::default()).into(),
+            Type::Array { inner, len } => {
+                let elem_ty = self.type_to_llvm(inner);
+                let arr_ty = match elem_ty {
+                    BasicTypeEnum::IntType(it) => it.array_type(*len as u32),
+                    BasicTypeEnum::FloatType(ft) => ft.array_type(*len as u32),
+                    BasicTypeEnum::StructType(st) => st.array_type(*len as u32),
+                    BasicTypeEnum::ArrayType(at) => at.array_type(*len as u32),
+                    _ => panic!("unsupported array element type: {:?}", elem_ty),
+                };
+                arr_ty.into()
+            }
             Type::Struct(name) => self
                 .struct_types
                 .get(name)
@@ -1833,15 +1931,26 @@ impl<'ctx> CodeGen<'ctx> {
                 .into(),
             Type::GenericInstance(name, args) => {
                 let mangled = Self::mangle_generic_instance(name, args);
-                self.struct_types.get(&mangled).copied().unwrap_or_else(|| {
-                    self.struct_types.get(name).copied().unwrap_or_else(|| {
-                        panic!("unknown generic struct instance '{}' — known types: {:?}",
-                            mangled, self.struct_types.keys().collect::<Vec<_>>())
+                self.struct_types
+                    .get(&mangled)
+                    .copied()
+                    .unwrap_or_else(|| {
+                        self.struct_types.get(name).copied().unwrap_or_else(|| {
+                            panic!(
+                                "unknown generic struct instance '{}' — known types: {:?}",
+                                mangled,
+                                self.struct_types.keys().collect::<Vec<_>>()
+                            )
+                        })
                     })
-                }).into()
+                    .into()
             }
-            Type::Alias(_, _) => { panic!("Type::Alias should have been resolved before codegen"); }
-            Type::SelfType => { panic!("SelfType used outside of impl context"); }
+            Type::Alias(_, _) => {
+                panic!("Type::Alias should have been resolved before codegen");
+            }
+            Type::SelfType => {
+                panic!("SelfType used outside of impl context");
+            }
         }
     }
 
@@ -1889,10 +1998,14 @@ impl<'ctx> CodeGen<'ctx> {
                 // For struct/primitive methods, look up return type from impl methods
                 let type_name = match &receiver_type {
                     Type::Struct(name) => Some(name.clone()),
-                    Type::GenericInstance(name, args) => Some(Self::mangle_generic_instance(name, args)),
+                    Type::GenericInstance(name, args) => {
+                        Some(Self::mangle_generic_instance(name, args))
+                    }
                     Type::Ref { inner, .. } => match inner.as_ref() {
                         Type::Struct(name) => Some(name.clone()),
-                        Type::GenericInstance(name, args) => Some(Self::mangle_generic_instance(name, args)),
+                        Type::GenericInstance(name, args) => {
+                            Some(Self::mangle_generic_instance(name, args))
+                        }
                         _ => Self::primitive_type_name(inner).map(|s| s.to_string()),
                     },
                     _ => Self::primitive_type_name(&receiver_type).map(|s| s.to_string()),
@@ -1931,6 +2044,7 @@ impl<'ctx> CodeGen<'ctx> {
                 let resolved_ty = match &parent_ty {
                     Type::Ref { inner, .. } => inner.as_ref(),
                     Type::Struct(_) => &parent_ty,
+                    Type::GenericInstance(_, _) => &parent_ty,
                     _ => &parent_ty,
                 };
                 match resolved_ty {
@@ -1953,6 +2067,17 @@ impl<'ctx> CodeGen<'ctx> {
                             _ => Type::I32,
                         }
                     }
+                    Type::Str => {
+                        // When resolved_ty is already Str (outer Ref unwound)
+                        match index {
+                            0 => Type::Ptr {
+                                inner: Box::new(Type::I8),
+                                is_mut: false,
+                            },
+                            1 => Type::Usize,
+                            _ => Type::I32,
+                        }
+                    }
                     Type::Struct(name) => {
                         if let Some(field_name) = field
                             && let Some(fields) = self.struct_fields.get(name)
@@ -1962,6 +2087,24 @@ impl<'ctx> CodeGen<'ctx> {
                         } else if *index < usize::MAX {
                             // Tuple-like access on struct (not typical)
                             if let Some(fields) = self.struct_fields.get(name)
+                                && *index < fields.len()
+                            {
+                                return fields[*index].ty.clone();
+                            }
+                            Type::I32
+                        } else {
+                            Type::I32
+                        }
+                    }
+                    Type::GenericInstance(name, args) => {
+                        let mangled = Self::mangle_generic_instance(name, args);
+                        if let Some(field_name) = field
+                            && let Some(fields) = self.struct_fields.get(&mangled)
+                            && let Some(f) = fields.iter().find(|f| f.name == *field_name)
+                        {
+                            f.ty.clone()
+                        } else if *index < usize::MAX {
+                            if let Some(fields) = self.struct_fields.get(&mangled)
                                 && *index < fields.len()
                             {
                                 return fields[*index].ty.clone();
@@ -1998,6 +2141,10 @@ impl<'ctx> CodeGen<'ctx> {
                     .unwrap_or(Type::I32)
             }
             Expr::Call { callee, args } => {
+                // Handle __builtin_size_of intrinsic
+                if callee == "__builtin_size_of" && args.len() == 1 {
+                    return Type::Usize;
+                }
                 let arg_types: Vec<Type> = args.iter().map(|a| self.expr_type(a)).collect();
                 // Try direct lookup, then overloaded
                 let name = if self.module.get_function(callee).is_some() {
@@ -2061,6 +2208,32 @@ impl<'ctx> CodeGen<'ctx> {
                 }
             }
             Expr::EnumLit { enum_name, .. } => Type::Struct(enum_name.clone()),
+            Expr::Index { array, .. } => {
+                let array_ty = self.expr_type(array);
+                match &array_ty {
+                    Type::Array { inner, .. } => *inner.clone(),
+                    Type::Ref { inner, .. } => match inner.as_ref() {
+                        Type::Array { inner: ai, .. } => *ai.clone(),
+                        _ => Type::I32,
+                    },
+                    _ => Type::I32,
+                }
+            }
+            Expr::Array(elems) => {
+                if elems.is_empty() {
+                    Type::I32
+                } else {
+                    let elem_ty = self.expr_type(&elems[0]);
+                    Type::Array {
+                        inner: Box::new(elem_ty),
+                        len: elems.len(),
+                    }
+                }
+            }
+            Expr::Repeat(expr, count) => Type::Array {
+                inner: Box::new(self.expr_type(expr)),
+                len: *count,
+            },
             _ => Self::literal_type(expr),
         }
     }
@@ -2116,6 +2289,28 @@ impl<'ctx> CodeGen<'ctx> {
                 op: BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge,
                 ..
             } => Type::Bool,
+            Expr::Array(elems) => {
+                if elems.is_empty() {
+                    Type::I32 // fallback; empty arrays are rejected by parser
+                } else {
+                    let elem_ty = Self::literal_type(&elems[0]);
+                    Type::Array {
+                        inner: Box::new(elem_ty),
+                        len: elems.len(),
+                    }
+                }
+            }
+            Expr::Repeat(expr, count) => Type::Array {
+                inner: Box::new(Self::literal_type(expr)),
+                len: *count,
+            },
+            Expr::Index { array, .. } => {
+                let array_ty = Self::literal_type(array);
+                match &array_ty {
+                    Type::Array { inner, .. } => *inner.clone(),
+                    _ => Type::I32,
+                }
+            }
             _ => Type::I32,
         }
     }
@@ -2506,6 +2701,167 @@ impl<'ctx> CodeGen<'ctx> {
         Ok(())
     }
 
+    /// Get the key used for looking up array methods in impl_methods.
+    fn array_type_key(inner: &Type, len: usize) -> String {
+        let elem_name = if let Some(prim) = Self::primitive_type_name(inner) {
+            prim.to_string()
+        } else {
+            match inner {
+                Type::Struct(name) => name.clone(),
+                Type::GenericInstance(name, args) => Self::mangle_generic_instance(name, args),
+                _ => format!("{:?}", inner),
+            }
+        };
+        format!("array_{}_{}", elem_name, len)
+    }
+
+    /// Ensure Index and IndexMut implementations exist for the given array type.
+    fn ensure_array_index_impl(&mut self, elem_ty: &Type, len: usize) -> Result<(), String> {
+        let key = Self::array_type_key(elem_ty, len);
+        if self.impl_methods.contains_key(&key) {
+            return Ok(()); // already generated
+        }
+        // Register empty entry to avoid recursion
+        self.impl_methods.entry(key.clone()).or_default();
+        self.trait_impls
+            .entry(key.clone())
+            .or_default()
+            .extend(["Index".to_string(), "IndexMut".to_string()]);
+
+        let elem_llvm = self.type_to_llvm(elem_ty);
+        let array_llvm: BasicTypeEnum<'ctx> = match elem_llvm {
+            BasicTypeEnum::IntType(it) => it.array_type(len as u32).into(),
+            BasicTypeEnum::FloatType(ft) => ft.array_type(len as u32).into(),
+            BasicTypeEnum::StructType(st) => st.array_type(len as u32).into(),
+            BasicTypeEnum::ArrayType(at) => at.array_type(len as u32).into(),
+            _ => panic!("unsupported array element type: {:?}", elem_llvm),
+        };
+        let ptr_type = self.context.ptr_type(AddressSpace::default());
+
+        // Generate Index::index(&self, idx: usize) -> &T
+        let index_fn_name = format!("__builtin_Index_index_{}", key);
+        if self.module.get_function(&index_fn_name).is_none() {
+            let param_types: [BasicMetadataTypeEnum<'ctx>; 2] =
+                [ptr_type.into(), self.ptr_int_type.into()];
+            let ret_type: BasicTypeEnum<'ctx> = ptr_type.into();
+            let fn_type = ret_type.fn_type(&param_types, false);
+            let fn_val = self.module.add_function(&index_fn_name, fn_type, None);
+
+            let entry = self.context.append_basic_block(fn_val, "entry");
+            let saved_bb = self.builder.get_insert_block();
+            self.builder.position_at_end(entry);
+
+            let self_ptr = fn_val.get_first_param().unwrap().into_pointer_value();
+            let idx_val = fn_val.get_nth_param(1).unwrap().into_int_value();
+
+            // GEP: &self[idx] = gep self, 0, idx
+            let zero = self.ptr_int_type.const_zero();
+            let elem_ptr = unsafe {
+                self.builder
+                    .build_in_bounds_gep(array_llvm, self_ptr, &[zero, idx_val], "index_elem")
+                    .map_err(|e| format!("failed to build GEP for index: {}", e))?
+            };
+
+            self.builder
+                .build_return(Some(&elem_ptr))
+                .map_err(|e| format!("failed to build return for index: {}", e))?;
+
+            if let Some(bb) = saved_bb {
+                self.builder.position_at_end(bb);
+            }
+        }
+        self.impl_methods
+            .get_mut(&key)
+            .unwrap()
+            .push(("index".to_string(), index_fn_name.clone()));
+        self.fn_return_types.insert(
+            index_fn_name.clone(),
+            Type::Ptr {
+                inner: Box::new(elem_ty.clone()),
+                is_mut: false,
+            },
+        );
+        self.fn_param_types.insert(
+            index_fn_name.clone(),
+            vec![
+                Type::Ref {
+                    inner: Box::new(Type::Array {
+                        inner: Box::new(elem_ty.clone()),
+                        len,
+                    }),
+                    is_mut: false,
+                },
+                Type::Usize,
+            ],
+        );
+        // Also declare the function for MethodCall-style lookups
+        if self.module.get_function(&index_fn_name).is_none() {
+            let param_types: [BasicMetadataTypeEnum<'ctx>; 2] =
+                [ptr_type.into(), self.ptr_int_type.into()];
+            let ret_type: BasicTypeEnum<'ctx> = ptr_type.into();
+            let fn_type = ret_type.fn_type(&param_types, false);
+            self.module.add_function(&index_fn_name, fn_type, None);
+        }
+
+        // Generate IndexMut::index_mut(&mut self, idx: usize) -> &mut T
+        let index_mut_fn_name = format!("__builtin_IndexMut_index_mut_{}", key);
+        if self.module.get_function(&index_mut_fn_name).is_none() {
+            let param_types: [BasicMetadataTypeEnum<'ctx>; 2] =
+                [ptr_type.into(), self.ptr_int_type.into()];
+            let ret_type: BasicTypeEnum<'ctx> = ptr_type.into();
+            let fn_type = ret_type.fn_type(&param_types, false);
+            let fn_val = self.module.add_function(&index_mut_fn_name, fn_type, None);
+
+            let entry = self.context.append_basic_block(fn_val, "entry");
+            let saved_bb = self.builder.get_insert_block();
+            self.builder.position_at_end(entry);
+
+            let self_ptr = fn_val.get_first_param().unwrap().into_pointer_value();
+            let idx_val = fn_val.get_nth_param(1).unwrap().into_int_value();
+
+            let zero = self.ptr_int_type.const_zero();
+            let elem_ptr = unsafe {
+                self.builder
+                    .build_in_bounds_gep(array_llvm, self_ptr, &[zero, idx_val], "index_mut_elem")
+                    .map_err(|e| format!("failed to build GEP for index_mut: {}", e))?
+            };
+
+            self.builder
+                .build_return(Some(&elem_ptr))
+                .map_err(|e| format!("failed to build return for index_mut: {}", e))?;
+
+            if let Some(bb) = saved_bb {
+                self.builder.position_at_end(bb);
+            }
+        }
+        self.impl_methods
+            .get_mut(&key)
+            .unwrap()
+            .push(("index_mut".to_string(), index_mut_fn_name.clone()));
+        self.fn_return_types.insert(
+            index_mut_fn_name.clone(),
+            Type::Ptr {
+                inner: Box::new(elem_ty.clone()),
+                is_mut: true,
+            },
+        );
+        self.fn_param_types.insert(
+            index_mut_fn_name.clone(),
+            vec![
+                Type::Ref {
+                    inner: Box::new(Type::Array {
+                        inner: Box::new(elem_ty.clone()),
+                        len,
+                    }),
+                    is_mut: true,
+                },
+                Type::Usize,
+            ],
+        );
+
+        Ok(())
+    }
+
     fn compile_expr(&mut self, expr: &Expr) -> Result<BasicValueEnum<'ctx>, String> {
         match expr {
             Expr::BoolLit(val) => Ok(self
@@ -2599,16 +2955,17 @@ impl<'ctx> CodeGen<'ctx> {
                             }
                             match inner.as_ref() {
                                 Type::Struct(name) => {
-                                    let st = self.struct_types.get(name).copied().ok_or_else(|| {
-                                        format!("unknown struct type '{}'", name)
-                                    })?;
+                                    let st =
+                                        self.struct_types.get(name).copied().ok_or_else(|| {
+                                            format!("unknown struct type '{}'", name)
+                                        })?;
                                     (st, name.clone())
                                 }
                                 Type::GenericInstance(name, args) => {
                                     let mangled = Self::mangle_generic_instance(name, args);
-                                    let st = self.struct_types.get(&mangled).copied().ok_or_else(|| {
-                                        format!("unknown struct type '{}'", mangled)
-                                    })?;
+                                    let st = self.struct_types.get(&mangled).copied().ok_or_else(
+                                        || format!("unknown struct type '{}'", mangled),
+                                    )?;
                                     (st, mangled)
                                 }
                                 _ => {
@@ -2665,6 +3022,78 @@ impl<'ctx> CodeGen<'ctx> {
                         .map_err(|e| format!("failed to store field value: {}", e))?;
                     Ok(val)
                 }
+                Expr::Index { array, index } => {
+                    let array_ty = self.expr_type(array);
+                    let (elem_ty, len) = match &array_ty {
+                        Type::Array { inner, len } => (*inner.clone(), *len),
+                        Type::Ref { inner, .. } => match inner.as_ref() {
+                            Type::Array { inner: ai, len } => (*ai.clone(), *len),
+                            _ => {
+                                return Err(format!(
+                                    "cannot index into non-array type {:?}",
+                                    array_ty
+                                ));
+                            }
+                        },
+                        _ => {
+                            return Err(format!("cannot index into non-array type {:?}", array_ty));
+                        }
+                    };
+                    self.ensure_array_index_impl(&elem_ty, len)?;
+                    let key = Self::array_type_key(&elem_ty, len);
+                    let methods = self
+                        .impl_methods
+                        .get(&key)
+                        .ok_or_else(|| format!("no methods registered for array type '{}'", key))?;
+                    let fn_name = methods
+                        .iter()
+                        .find(|(name, _)| name == "index_mut")
+                        .map(|(_, mangled)| mangled.clone())
+                        .ok_or_else(|| format!("no 'index_mut' method for array type '{}'", key))?;
+                    let fn_val = self.module.get_function(&fn_name).ok_or_else(|| {
+                        format!("internal: index_mut function '{}' not found", fn_name)
+                    })?;
+                    // Compile array to a pointer — use original alloca if it's a variable
+                    let array_ptr = if let Expr::Ident(name) = array.as_ref() {
+                        if let Some((ptr, _, _)) = self.symbols.get(name) {
+                            *ptr
+                        } else {
+                            return Err(format!("undefined variable '{}'", name));
+                        }
+                    } else {
+                        let array_val = self.compile_expr(array)?;
+                        match array_val {
+                            BasicValueEnum::PointerValue(p) => p,
+                            _ => {
+                                let alloca = self
+                                    .builder
+                                    .build_alloca(array_val.get_type(), "array_mut_ref")
+                                    .map_err(|e| {
+                                        format!("failed to build alloca for array mut ref: {}", e)
+                                    })?;
+                                self.builder
+                                    .build_store(alloca, array_val)
+                                    .map_err(|e| format!("failed to store array: {}", e))?;
+                                alloca
+                            }
+                        }
+                    };
+                    let idx_val = self.compile_expr(index)?;
+                    let result = self
+                        .builder
+                        .build_call(
+                            fn_val,
+                            &[array_ptr.into(), idx_val.into()],
+                            "index_mut_call",
+                        )
+                        .map_err(|e| format!("failed to call index_mut: {}", e))?;
+                    let result_ptr = self.try_extract_result(result).into_pointer_value();
+                    let val = self.compile_expr(value)?;
+                    self.builder
+                        .build_store(result_ptr, val)
+                        .map_err(|e| format!("failed to store through index_mut: {}", e))?;
+                    Ok(val)
+                }
                 _ => Err("invalid assignment target".to_string()),
             },
             Expr::Ref { expr, .. } => {
@@ -2711,21 +3140,33 @@ impl<'ctx> CodeGen<'ctx> {
                     let llvm_ty = self.type_to_llvm(&arg_ty);
                     let size = match llvm_ty {
                         inkwell::types::BasicTypeEnum::IntType(i) => i.get_bit_width() as u64 / 8,
-                        inkwell::types::BasicTypeEnum::FloatType(f) => { if f == self.f32_type { 4 } else { 8 } }
+                        inkwell::types::BasicTypeEnum::FloatType(f) => {
+                            if f == self.f32_type {
+                                4
+                            } else {
+                                8
+                            }
+                        }
                         inkwell::types::BasicTypeEnum::PointerType(_) => 8,
                         inkwell::types::BasicTypeEnum::StructType(s) => {
                             let mut total = 0u64;
                             for i in 0..s.count_fields() {
                                 if let Some(ft) = s.get_field_type_at_index(i) {
                                     match ft {
-                                        inkwell::types::BasicTypeEnum::IntType(i) => total += i.get_bit_width() as u64 / 8,
-                                        inkwell::types::BasicTypeEnum::FloatType(f) => total += if f == self.f32_type { 4 } else { 8 },
+                                        inkwell::types::BasicTypeEnum::IntType(i) => {
+                                            total += i.get_bit_width() as u64 / 8
+                                        }
+                                        inkwell::types::BasicTypeEnum::FloatType(f) => {
+                                            total += if f == self.f32_type { 4 } else { 8 }
+                                        }
                                         inkwell::types::BasicTypeEnum::PointerType(_) => total += 8,
                                         _ => total += 4,
                                     }
                                 }
                             }
-                            if total == 0 { total = 4; }
+                            if total == 0 {
+                                total = 4;
+                            }
                             total
                         }
                         _ => 4,
@@ -2784,16 +3225,19 @@ impl<'ctx> CodeGen<'ctx> {
                 let mangled_name = format!("{}::{}/{}", module, callee, args.len());
                 let arg_types: Vec<Type> = args.iter().map(|a| self.expr_type(a)).collect();
                 // For generic structs, also try the monomorphized name
-                let monomorphized_name = self.monomorphized_names.get(module.as_str()).map(|mangled| {
-                    format!("{}::{}/{}", mangled, callee, args.len())
-                });
+                let monomorphized_name = self
+                    .monomorphized_names
+                    .get(module.as_str())
+                    .map(|mangled| format!("{}::{}/{}", mangled, callee, args.len()));
                 // Try direct lookup first, then mangled name (for impl methods), then overload map
                 let fn_val = self
                     .module
                     .get_function(&qualified_name)
                     .or_else(|| self.module.get_function(&mangled_name))
                     .or_else(|| {
-                        monomorphized_name.as_ref().and_then(|n| self.module.get_function(n))
+                        monomorphized_name
+                            .as_ref()
+                            .and_then(|n| self.module.get_function(n))
                     })
                     .or_else(|| self.resolve_function(&qualified_name, &arg_types))
                     .or_else(|| self.resolve_function(callee, &arg_types))
@@ -3029,7 +3473,9 @@ impl<'ctx> CodeGen<'ctx> {
                         let val = self.compile_expr(receiver)?;
                         match val {
                             BasicValueEnum::StructValue(sv) => {
-                                let len = self.builder.build_extract_value(sv, 1, "str_len")
+                                let len = self
+                                    .builder
+                                    .build_extract_value(sv, 1, "str_len")
                                     .map_err(|e| format!("failed to extract str length: {}", e))?;
                                 return Ok(len);
                             }
@@ -3042,10 +3488,14 @@ impl<'ctx> CodeGen<'ctx> {
                 let receiver_type = self.expr_type(receiver);
                 let (type_name, _is_ref) = match &receiver_type {
                     Type::Struct(name) => (name.clone(), false),
-                    Type::GenericInstance(name, args) => (Self::mangle_generic_instance(name, args), false),
+                    Type::GenericInstance(name, args) => {
+                        (Self::mangle_generic_instance(name, args), false)
+                    }
                     Type::Ref { inner, .. } => match inner.as_ref() {
                         Type::Struct(name) => (name.clone(), true),
-                        Type::GenericInstance(name, args) => (Self::mangle_generic_instance(name, args), true),
+                        Type::GenericInstance(name, args) => {
+                            (Self::mangle_generic_instance(name, args), true)
+                        }
                         Type::Bool => ("bool".to_string(), true),
                         Type::I8 => ("i8".to_string(), true),
                         Type::I16 => ("i16".to_string(), true),
@@ -3108,6 +3558,92 @@ impl<'ctx> CodeGen<'ctx> {
                 let receiver_ptr = match receiver_val {
                     BasicValueEnum::PointerValue(p) => p,
                     _ => {
+                        // If receiver is a named field access on a struct reference,
+                        // compute GEP to the field address (avoids copying the field)
+                        if let Expr::Member {
+                            expr: member_expr,
+                            index: _,
+                            field: Some(field_name),
+                            ..
+                        } = receiver.as_ref()
+                        {
+                            let parent_ty = self.expr_type(member_expr);
+                            if let Type::Ref { inner, .. } = &parent_ty {
+                                match inner.as_ref() {
+                                    Type::Struct(_) | Type::GenericInstance(_, _) => {
+                                        let struct_name = match inner.as_ref() {
+                                            Type::Struct(name) => name.clone(),
+                                            Type::GenericInstance(name, args) => {
+                                                Self::mangle_generic_instance(name, args)
+                                            }
+                                            _ => unreachable!(),
+                                        };
+                                        let fields =
+                                            self.struct_fields.get(&struct_name).ok_or_else(
+                                                || format!("unknown struct '{}'", struct_name),
+                                            )?;
+                                        let idx = fields
+                                            .iter()
+                                            .position(|f| f.name == *field_name)
+                                            .ok_or_else(|| {
+                                                format!(
+                                                    "struct '{}' has no field '{}'",
+                                                    struct_name, field_name
+                                                )
+                                            })?;
+                                        let llvm_ty = self.type_to_llvm(inner);
+                                        let member_ptr = self.compile_expr(member_expr)?;
+                                        let base_ptr = match member_ptr {
+                                            BasicValueEnum::PointerValue(p) => p,
+                                            ptr_val => {
+                                                let a = self
+                                                    .builder
+                                                    .build_alloca(ptr_val.get_type(), "ref_base")
+                                                    .map_err(|e| {
+                                                        format!("failed to build alloca: {}", e)
+                                                    })?;
+                                                self.builder.build_store(a, ptr_val).map_err(
+                                                    |e| format!("failed to store: {}", e),
+                                                )?;
+                                                a
+                                            }
+                                        };
+                                        let field_ptr = self
+                                            .builder
+                                            .build_struct_gep(
+                                                llvm_ty,
+                                                base_ptr,
+                                                idx as u32,
+                                                "field_ptr",
+                                            )
+                                            .map_err(|e| {
+                                                format!(
+                                                    "failed to build struct GEP for field '{}': {}",
+                                                    field_name, e
+                                                )
+                                            })?;
+
+                                        let mut all_args = vec![field_ptr.into()];
+                                        for arg in args {
+                                            let val = self.compile_expr(arg)?;
+                                            all_args.push(val.into());
+                                        }
+                                        let result = self
+                                            .builder
+                                            .build_call(fn_val, &all_args, "method_call")
+                                            .map_err(|e| {
+                                                format!(
+                                                    "failed to build method call '{}': {}",
+                                                    method, e
+                                                )
+                                            })?;
+                                        return Ok(self.try_extract_result(result));
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+
                         // If receiver is a value, store to alloca and pass pointer
                         let alloca = self
                             .builder
@@ -3141,7 +3677,11 @@ impl<'ctx> CodeGen<'ctx> {
                 fields,
                 ..
             } => {
-                let actual_name = self.monomorphized_names.get(struct_name.as_str()).cloned().unwrap_or_else(|| struct_name.clone());
+                let actual_name = self
+                    .monomorphized_names
+                    .get(struct_name.as_str())
+                    .cloned()
+                    .unwrap_or_else(|| struct_name.clone());
                 let struct_type = self
                     .struct_types
                     .get(&actual_name)
@@ -3162,7 +3702,7 @@ impl<'ctx> CodeGen<'ctx> {
                     if let Some(field_ty) = struct_def_fields.get(i) {
                         let field_llvm_ty = self.type_to_llvm(field_ty);
                         if field_val.get_type() != field_llvm_ty {
-                                                        field_val = self.emit_cast(field_val, field_ty)?;
+                            field_val = self.emit_cast(field_val, field_ty)?;
                         }
                     }
                     result = self
@@ -3176,6 +3716,163 @@ impl<'ctx> CodeGen<'ctx> {
                     inkwell::values::AggregateValueEnum::StructValue(sv) => Ok(sv.into()),
                     _ => Err(format!("expected struct value for '{}'", struct_name)),
                 }
+            }
+            Expr::Array(elems) => {
+                if elems.is_empty() {
+                    return Err("empty array literals are not supported".to_string());
+                }
+                let elem_ty = self.expr_type(&elems[0]);
+                let elem_llvm = self.type_to_llvm(&elem_ty);
+                let len = elems.len() as u32;
+                let array_llvm: BasicTypeEnum<'ctx> = match elem_llvm {
+                    BasicTypeEnum::IntType(it) => it.array_type(len).into(),
+                    BasicTypeEnum::FloatType(ft) => ft.array_type(len).into(),
+                    BasicTypeEnum::StructType(st) => st.array_type(len).into(),
+                    BasicTypeEnum::ArrayType(at) => at.array_type(len).into(),
+                    _ => panic!("unsupported array element type: {:?}", elem_llvm),
+                };
+                let alloca = self
+                    .builder
+                    .build_alloca(array_llvm, "array")
+                    .map_err(|e| format!("failed to build array alloca: {}", e))?;
+                for (i, elem_expr) in elems.iter().enumerate() {
+                    let elem_val = self.compile_expr(elem_expr)?;
+                    let zero = self.ptr_int_type.const_zero();
+                    let idx = self.ptr_int_type.const_int(i as u64, false);
+                    let elem_ptr = unsafe {
+                        self.builder
+                            .build_in_bounds_gep(
+                                array_llvm,
+                                alloca,
+                                &[zero, idx],
+                                &format!("array_elem_{}", i),
+                            )
+                            .map_err(|e| {
+                                format!("failed to build GEP for array elem {}: {}", i, e)
+                            })?
+                    };
+                    self.builder
+                        .build_store(elem_ptr, elem_val)
+                        .map_err(|e| format!("failed to store array elem {}: {}", i, e))?;
+                }
+                // Generate Index/IndexMut impls for this array type on demand
+                self.ensure_array_index_impl(&elem_ty, elems.len())?;
+                let result = self
+                    .builder
+                    .build_load(array_llvm, alloca, "array_val")
+                    .map_err(|e| format!("failed to load array: {}", e))?;
+                Ok(result.into())
+            }
+            Expr::Repeat(expr, count) => {
+                let elem_ty = self.expr_type(expr);
+                let elem_llvm = self.type_to_llvm(&elem_ty);
+                let len = *count as u32;
+                let array_llvm: BasicTypeEnum<'ctx> = match elem_llvm {
+                    BasicTypeEnum::IntType(it) => it.array_type(len).into(),
+                    BasicTypeEnum::FloatType(ft) => ft.array_type(len).into(),
+                    BasicTypeEnum::StructType(st) => st.array_type(len).into(),
+                    BasicTypeEnum::ArrayType(at) => at.array_type(len).into(),
+                    _ => panic!("unsupported array element type: {:?}", elem_llvm),
+                };
+                let alloca = self
+                    .builder
+                    .build_alloca(array_llvm, "array_repeat")
+                    .map_err(|e| format!("failed to build array repeat alloca: {}", e))?;
+                let elem_val = self.compile_expr(expr)?;
+                for i in 0..*count {
+                    let zero = self.ptr_int_type.const_zero();
+                    let idx = self.ptr_int_type.const_int(i as u64, false);
+                    let elem_ptr = unsafe {
+                        self.builder
+                            .build_in_bounds_gep(
+                                array_llvm,
+                                alloca,
+                                &[zero, idx],
+                                &format!("rep_elem_{}", i),
+                            )
+                            .map_err(|e| {
+                                format!("failed to build GEP for repeat elem {}: {}", i, e)
+                            })?
+                    };
+                    self.builder
+                        .build_store(elem_ptr, elem_val)
+                        .map_err(|e| format!("failed to store repeat elem {}: {}", i, e))?;
+                }
+                // Generate Index/IndexMut impls for this array type on demand
+                self.ensure_array_index_impl(&elem_ty, *count)?;
+                let result = self
+                    .builder
+                    .build_load(array_llvm, alloca, "array_val")
+                    .map_err(|e| format!("failed to load array: {}", e))?;
+                Ok(result.into())
+            }
+            Expr::Index { array, index } => {
+                let array_ty = self.expr_type(array);
+                let (elem_ty, len) = match &array_ty {
+                    Type::Array { inner, len } => (*inner.clone(), *len),
+                    Type::Ref { inner, .. } => match inner.as_ref() {
+                        Type::Array { inner: ai, len } => (*ai.clone(), *len),
+                        _ => {
+                            return Err(format!("cannot index into non-array type {:?}", array_ty));
+                        }
+                    },
+                    _ => {
+                        return Err(format!("cannot index into non-array type {:?}", array_ty));
+                    }
+                };
+                self.ensure_array_index_impl(&elem_ty, len)?;
+                let key = Self::array_type_key(&elem_ty, len);
+                let methods = self
+                    .impl_methods
+                    .get(&key)
+                    .ok_or_else(|| format!("no methods registered for array type '{}'", key))?;
+                let fn_name = methods
+                    .iter()
+                    .find(|(name, _)| name == "index")
+                    .map(|(_, mangled)| mangled.clone())
+                    .ok_or_else(|| format!("no 'index' method for array type '{}'", key))?;
+                let fn_val = self
+                    .module
+                    .get_function(&fn_name)
+                    .ok_or_else(|| format!("internal: index function '{}' not found", fn_name))?;
+                // Compile array to a pointer — use original alloca if it's a variable
+                let array_ptr = if let Expr::Ident(name) = array.as_ref() {
+                    if let Some((ptr, _, _)) = self.symbols.get(name) {
+                        *ptr
+                    } else {
+                        return Err(format!("undefined variable '{}'", name));
+                    }
+                } else {
+                    let array_val = self.compile_expr(array)?;
+                    match array_val {
+                        BasicValueEnum::PointerValue(p) => p,
+                        _ => {
+                            let alloca = self
+                                .builder
+                                .build_alloca(array_val.get_type(), "array_ref")
+                                .map_err(|e| {
+                                    format!("failed to build alloca for array ref: {}", e)
+                                })?;
+                            self.builder
+                                .build_store(alloca, array_val)
+                                .map_err(|e| format!("failed to store array: {}", e))?;
+                            alloca
+                        }
+                    }
+                };
+                let idx_val = self.compile_expr(index)?;
+                let result = self
+                    .builder
+                    .build_call(fn_val, &[array_ptr.into(), idx_val.into()], "index_call")
+                    .map_err(|e| format!("failed to call index: {}", e))?;
+                // The result is a pointer to the element; dereference it
+                let result_ptr = self.try_extract_result(result).into_pointer_value();
+                let elem_llvm = self.type_to_llvm(&elem_ty);
+                let loaded = self
+                    .builder
+                    .build_load(elem_llvm, result_ptr, "index_load")
+                    .map_err(|e| format!("failed to load index result: {}", e))?;
+                Ok(loaded)
             }
             Expr::Cast { expr, to_type } => {
                 let val = self.compile_expr(expr)?;
@@ -3390,42 +4087,71 @@ impl<'ctx> CodeGen<'ctx> {
             Expr::UnaryNot(inner_expr) => {
                 let val = self.compile_expr(inner_expr)?;
                 match val {
-                    BasicValueEnum::IntValue(v) => {
-                        Ok(self.builder.build_not(v, "not").map_err(|e| format!("failed to build unary not: {}", e))?.into())
-                    }
+                    BasicValueEnum::IntValue(v) => Ok(self
+                        .builder
+                        .build_not(v, "not")
+                        .map_err(|e| format!("failed to build unary not: {}", e))?
+                        .into()),
                     _ => Err("unary ! requires integer operand".to_string()),
                 }
             }
-            Expr::Deref(expr) => {
-                let ptr_val = self.compile_expr(expr)?;
-                let ptr = ptr_val.into_pointer_value();
-                let pointee_ty = Self::literal_type(expr);
-                let pointee_llvm_ty = self.type_to_llvm(match &pointee_ty {
-                    Type::Ref { inner, .. } => inner, Type::Ptr { inner, .. } => inner, _ => &pointee_ty,
-                });
-                Ok(self.builder.build_load(pointee_llvm_ty, ptr, "deref").map_err(|e| format!("failed to build deref load: {}", e))?)
-            }
-            Expr::EnumLit { enum_name, variant, payload } => {
-                let actual_name = self.monomorphized_names.get(enum_name.as_str()).cloned().unwrap_or_else(|| enum_name.clone());
-                let struct_type = self.struct_types.get(&actual_name).copied().ok_or_else(|| format!("unknown enum type '{}'", actual_name))?;
-                let fields = self.struct_fields.get(enum_name).ok_or_else(|| format!("unknown enum '{}'", enum_name))?;
+            Expr::EnumLit {
+                enum_name,
+                variant,
+                payload,
+            } => {
+                let actual_name = self
+                    .monomorphized_names
+                    .get(enum_name.as_str())
+                    .cloned()
+                    .unwrap_or_else(|| enum_name.clone());
+                let struct_type = self
+                    .struct_types
+                    .get(&actual_name)
+                    .copied()
+                    .ok_or_else(|| format!("unknown enum type '{}'", actual_name))?;
+                let fields = self
+                    .struct_fields
+                    .get(enum_name)
+                    .ok_or_else(|| format!("unknown enum '{}'", enum_name))?;
                 let payload_field_name = format!("__{}", variant);
                 let mut variant_idx = 0u32;
                 let mut payload_field_idx: Option<u32> = None;
                 for (idx, field) in fields.iter().enumerate() {
-                    if idx == 0 { continue; }
-                    if field.name == payload_field_name { variant_idx = (idx - 1) as u32; payload_field_idx = Some(idx as u32); break; }
+                    if idx == 0 {
+                        continue;
+                    }
+                    if field.name == payload_field_name {
+                        variant_idx = (idx - 1) as u32;
+                        payload_field_idx = Some(idx as u32);
+                        break;
+                    }
                 }
-                let struct_val: inkwell::values::AggregateValueEnum<'ctx> = struct_type.get_undef().into();
+                let struct_val: inkwell::values::AggregateValueEnum<'ctx> =
+                    struct_type.get_undef().into();
                 let mut result = struct_val;
-                result = self.builder.build_insert_value(result, self.context.i8_type().const_int(variant_idx as u64, false), 0, "__tag")
+                result = self
+                    .builder
+                    .build_insert_value(
+                        result,
+                        self.context.i8_type().const_int(variant_idx as u64, false),
+                        0,
+                        "__tag",
+                    )
                     .map_err(|e| format!("failed to insert enum tag: {}", e))?;
-                if let Some(payload_expr) = payload && let Some(field_idx) = payload_field_idx {
+                if let Some(payload_expr) = payload
+                    && let Some(field_idx) = payload_field_idx
+                {
                     let payload_val = self.compile_expr(payload_expr)?;
-                    result = self.builder.build_insert_value(result, payload_val, field_idx, &payload_field_name)
+                    result = self
+                        .builder
+                        .build_insert_value(result, payload_val, field_idx, &payload_field_name)
                         .map_err(|e| format!("failed to insert enum payload: {}", e))?;
                 }
-                match result { inkwell::values::AggregateValueEnum::StructValue(sv) => Ok(sv.into()), _ => Err(format!("expected struct value for enum '{}'", enum_name)) }
+                match result {
+                    inkwell::values::AggregateValueEnum::StructValue(sv) => Ok(sv.into()),
+                    _ => Err(format!("expected struct value for enum '{}'", enum_name)),
+                }
             }
         }
     }
@@ -3734,7 +4460,12 @@ impl<'ctx> CodeGen<'ctx> {
                     }
                     Type::Ref { .. } => return Err("cannot cast to reference type".to_string()),
                     Type::Ptr { .. } => unreachable!(),
-                    Type::Struct(_) | Type::GenericInstance(_, _) | Type::Alias(_, _) => return Err("cannot cast to struct type".to_string()),
+                    Type::Struct(_) | Type::GenericInstance(_, _) | Type::Alias(_, _) => {
+                        return Err("cannot cast to struct type".to_string());
+                    }
+                    Type::Array { .. } => {
+                        return Err("cannot cast to array type".to_string());
+                    }
                     Type::SelfType => return Err("cannot cast to Self type".to_string()),
                     // Bool caught by early return above, but keep for completeness
                     Type::Bool => 1,

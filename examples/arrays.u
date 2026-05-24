@@ -1,0 +1,26 @@
+// Array literals, indexing, and mutation example
+use std::io::println;
+
+fn main() {
+    // Array literal
+    let a = [10, 20, 30, 40, 50];
+    println(a[0]);  // 10
+    println(a[2]);  // 30
+    println(a[4]);  // 50
+
+    // Array mutation
+    let mut b = [1, 2, 3];
+    b[1] = 99;
+    println(b[0]);  // 1
+    println(b[1]);  // 99
+    println(b[2]);  // 3
+
+    // Repeat expression
+    let c = [0; 5];
+    println(c[0]);  // 0
+    println(c[3]);  // 0
+
+    // Single-element array
+    let d = [42];
+    println(d[0]);  // 42
+}

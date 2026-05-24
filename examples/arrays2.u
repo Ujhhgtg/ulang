@@ -1,0 +1,31 @@
+// Advanced array tests
+use std::io::println;
+
+fn main() {
+    // Type-annotated array
+    let a: [i32; 3] = [10, 20, 30];
+    println(a[0]);
+    println(a[1]);
+    println(a[2]);
+
+    // Nested array indexing
+    let b = [[1, 2], [3, 4]];
+    println(b[0][0]);  // 1
+    println(b[0][1]);  // 2
+    println(b[1][0]);  // 3
+    println(b[1][1]);  // 4
+
+    // Mutation
+    let mut c = [5, 10, 15];
+    c[0] = 100;
+    c[2] = 300;
+    println(c[0]);
+    println(c[1]);
+    println(c[2]);
+
+    // Repeat
+    let d = [7; 3];
+    println(d[0]);
+    println(d[1]);
+    println(d[2]);
+}

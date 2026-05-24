@@ -346,11 +346,15 @@ fn resolve_module_uses(
             );
             // Import all structs from this dependency
             for decl in &prog.structs {
-                all_structs.entry(decl.name.clone()).or_insert_with(|| decl.clone());
+                all_structs
+                    .entry(decl.name.clone())
+                    .or_insert_with(|| decl.clone());
             }
             // Import all enums from this dependency
             for decl in &prog.enums {
-                all_enums.entry(decl.name.clone()).or_insert_with(|| decl.clone());
+                all_enums
+                    .entry(decl.name.clone())
+                    .or_insert_with(|| decl.clone());
             }
             // Import all impls
             for decl in &prog.impls {
@@ -365,7 +369,8 @@ fn resolve_module_uses(
             // Import overloads
             if path.len() >= 3 {
                 let _target_name = &path[2];
-                let (_module_funcs, module_overloads) = process_stdlib_functions(prog.funcs.clone());
+                let (_module_funcs, module_overloads) =
+                    process_stdlib_functions(prog.funcs.clone());
                 for (base_name, overloads_list) in &module_overloads {
                     let qualified_base = format!("{}::{}", module_name, base_name);
                     let qualified_list: Vec<(String, Vec<Type>)> = overloads_list
@@ -597,8 +602,12 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
                         // Look up canonical source module for this struct
                         if let Some(mod_name) = canonical_struct_sources.get(&dep_name) {
                             if let Some(candidate_prog) = all_stdlib_progs.get(mod_name) {
-                                if let Some(dep_decl) = candidate_prog.structs.iter().find(|s| s.name == dep_name) {
-                                    all_structs.entry(dep_name.clone()).or_insert_with(|| dep_decl.clone());
+                                if let Some(dep_decl) =
+                                    candidate_prog.structs.iter().find(|s| s.name == dep_name)
+                                {
+                                    all_structs
+                                        .entry(dep_name.clone())
+                                        .or_insert_with(|| dep_decl.clone());
                                     // Add its own field deps
                                     for field in &dep_decl.fields {
                                         dep_stack.extend(collect_struct_deps(&field.ty));
@@ -624,7 +633,8 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
                                         if impl_type_name == dep_name {
                                             for method in &impl_decl.methods {
                                                 for param in &method.params {
-                                                    dep_stack.extend(collect_struct_deps(&param.ty));
+                                                    dep_stack
+                                                        .extend(collect_struct_deps(&param.ty));
                                                 }
                                                 if let Some(ref ret) = method.return_type {
                                                     dep_stack.extend(collect_struct_deps(ret));
@@ -727,8 +737,12 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
                         // Look up canonical source module for this struct
                         if let Some(mod_name) = canonical_struct_sources.get(struct_name) {
                             if let Some(prog) = all_stdlib_progs.get(mod_name) {
-                                if let Some(decl) = prog.structs.iter().find(|s| &s.name == struct_name) {
-                                    all_structs.entry(struct_name.clone()).or_insert_with(|| decl.clone());
+                                if let Some(decl) =
+                                    prog.structs.iter().find(|s| &s.name == struct_name)
+                                {
+                                    all_structs
+                                        .entry(struct_name.clone())
+                                        .or_insert_with(|| decl.clone());
                                     dep_modules.insert(mod_name.clone());
                                 }
                             }

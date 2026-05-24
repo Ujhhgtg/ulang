@@ -367,3 +367,51 @@ fn test_type_alias() {
         "type Meters = i32; fn main() { let x: Meters = 42; }\n"
     ));
 }
+
+#[test]
+fn test_array_literal() {
+    assert!(run_test(
+        "array_lit",
+        "use std::io::println;\nfn main() { let a = [1, 2, 3]; println(a[0]); println(a[1]); println(a[2]); }\n"
+    ));
+}
+
+#[test]
+fn test_array_repeat() {
+    assert!(run_test(
+        "array_rep",
+        "use std::io::println;\nfn main() { let a = [0; 4]; println(a[0]); println(a[3]); }\n"
+    ));
+}
+
+#[test]
+fn test_array_mutation() {
+    assert!(run_test(
+        "array_mut",
+        "use std::io::println;\nfn main() { let mut a = [10, 20, 30]; a[1] = 99; println(a[0]); println(a[1]); println(a[2]); }\n"
+    ));
+}
+
+#[test]
+fn test_array_typed() {
+    assert!(run_test(
+        "array_typed",
+        "use std::io::println;\nfn main() { let a: [i32; 2] = [5, 7]; println(a[0]); println(a[1]); }\n"
+    ));
+}
+
+#[test]
+fn test_nested_array() {
+    assert!(run_test(
+        "array_nested",
+        "use std::io::println;\nfn main() { let a = [[1, 2], [3, 4]]; println(a[0][0]); println(a[0][1]); println(a[1][0]); println(a[1][1]); }\n"
+    ));
+}
+
+#[test]
+fn test_single_element_array() {
+    assert!(run_test(
+        "array_single",
+        "use std::io::println;\nfn main() { let a = [42]; println(a[0]); }\n"
+    ));
+}

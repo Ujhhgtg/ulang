@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::{
-    Attribute, BinOp, Block, EnumDecl, EnumVariant, Expr, Function, ImplDecl, Param, Program,
-    Stmt, StructDecl, StructField, TraitDecl, TraitMethodDef, Type, TypeAliasDecl, Use,
+    Attribute, BinOp, Block, EnumDecl, EnumVariant, Expr, Function, ImplDecl, Param, Program, Stmt,
+    StructDecl, StructField, TraitDecl, TraitMethodDef, Type, TypeAliasDecl, Use,
 };
 use crate::token::{Span, Token};
 
@@ -658,6 +658,35 @@ impl<'a> Parser<'a> {
                 });
             }
         };
+        // Parse optional generic type parameters: <T, U, ...>
+        let type_params = if *self.peek_token() == Token::Lt {
+            self.advance(); // consume <
+            let mut params = Vec::new();
+            loop {
+                match self.peek_token() {
+                    Token::Ident(s) => {
+                        params.push(s.clone());
+                        self.advance();
+                    }
+                    _ => {
+                        let (_, span) = self.current().unwrap();
+                        return Err(ParseError {
+                            span: *span,
+                            msg: "expected type parameter name".to_string(),
+                        });
+                    }
+                }
+                if *self.peek_token() == Token::Comma {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+            self.expect(&Token::Gt)?;
+            params
+        } else {
+            Vec::new()
+        };
         self.expect(&Token::LBrace)?;
         let mut methods = Vec::new();
         while *self.peek_token() != Token::RBrace && *self.peek_token() != Token::Eof {
@@ -696,6 +725,7 @@ impl<'a> Parser<'a> {
         let hi = self.last_span_end();
         Ok(TraitDecl {
             name,
+            type_params,
             methods,
             span: Span::new(lo, hi),
         })
@@ -966,7 +996,7 @@ impl<'a> Parser<'a> {
         let lhs = self.parse_comparison()?;
         if *self.peek_token() == Token::Eq {
             match &lhs {
-                Expr::Ident(_) | Expr::Deref(_) | Expr::Member { .. } => {
+                Expr::Ident(_) | Expr::Deref(_) | Expr::Member { .. } | Expr::Index { .. } => {
                     self.advance(); // consume '='
                     let value = self.parse_assign()?; // right-associative
                     Ok(Expr::Assign {
@@ -980,7 +1010,7 @@ impl<'a> Parser<'a> {
                     Err(ParseError {
                         span: *span,
                         msg:
-                            "left-hand side of assignment must be a variable, dereference, or field"
+                            "left-hand side of assignment must be a variable, dereference, field, or index"
                                 .to_string(),
                     })
                 }
@@ -1048,54 +1078,69 @@ impl<'a> Parser<'a> {
     /// This has the highest precedence.
     fn parse_postfix(&mut self) -> Result<Expr, ParseError> {
         let mut expr = self.parse_primary()?;
-        while *self.peek_token() == Token::Dot {
-            self.advance(); // consume '.'
+        loop {
             match self.peek_token() {
-                Token::IntLit(idx) => {
-                    let idx = *idx;
-                    if idx < 0 {
-                        let default = (Token::Eof, Span::empty(0));
-                        let (_, span) = self.current().unwrap_or(&default);
-                        return Err(ParseError {
-                            span: *span,
-                            msg: "tuple member index must be non-negative".to_string(),
-                        });
-                    }
-                    self.advance();
-                    expr = Expr::Member {
-                        expr: Box::new(expr),
-                        index: idx as usize,
-                        field: None,
+                Token::LBracket => {
+                    self.advance(); // consume [
+                    let index_expr = self.parse_expr()?;
+                    self.expect(&Token::RBracket)?;
+                    expr = Expr::Index {
+                        array: Box::new(expr),
+                        index: Box::new(index_expr),
                     };
                 }
-                Token::Ident(name) => {
-                    let field = name.clone();
-                    self.advance(); // consume field/method name
-                    if *self.peek_token() == Token::LParen {
-                        let args = self.parse_call_args()?;
-                        expr = Expr::MethodCall {
-                            expr: Box::new(expr),
-                            method: field,
-                            args,
-                        };
-                    } else {
-                        // Named field access: resolve field index here
-                        // or defer to codegen with the field name
-                        expr = Expr::Member {
-                            expr: Box::new(expr),
-                            index: 0,
-                            field: Some(field),
-                        };
+                Token::Dot => {
+                    self.advance(); // consume '.'
+                    match self.peek_token() {
+                        Token::IntLit(idx) => {
+                            let idx = *idx;
+                            if idx < 0 {
+                                let default = (Token::Eof, Span::empty(0));
+                                let (_, span) = self.current().unwrap_or(&default);
+                                return Err(ParseError {
+                                    span: *span,
+                                    msg: "tuple member index must be non-negative".to_string(),
+                                });
+                            }
+                            self.advance();
+                            expr = Expr::Member {
+                                expr: Box::new(expr),
+                                index: idx as usize,
+                                field: None,
+                            };
+                        }
+                        Token::Ident(name) => {
+                            let field = name.clone();
+                            self.advance(); // consume field/method name
+                            if *self.peek_token() == Token::LParen {
+                                let args = self.parse_call_args()?;
+                                expr = Expr::MethodCall {
+                                    expr: Box::new(expr),
+                                    method: field,
+                                    args,
+                                };
+                            } else {
+                                // Named field access: resolve field index here
+                                // or defer to codegen with the field name
+                                expr = Expr::Member {
+                                    expr: Box::new(expr),
+                                    index: 0,
+                                    field: Some(field),
+                                };
+                            }
+                        }
+                        _ => {
+                            let default = (Token::Eof, Span::empty(0));
+                            let (_, span) = self.current().unwrap_or(&default);
+                            return Err(ParseError {
+                                span: *span,
+                                msg: "expected tuple member index or method name after '.'"
+                                    .to_string(),
+                            });
+                        }
                     }
                 }
-                _ => {
-                    let default = (Token::Eof, Span::empty(0));
-                    let (_, span) = self.current().unwrap_or(&default);
-                    return Err(ParseError {
-                        span: *span,
-                        msg: "expected tuple member index or method name after '.'".to_string(),
-                    });
-                }
+                _ => break,
             }
         }
         Ok(expr)
@@ -1192,6 +1237,32 @@ impl<'a> Parser<'a> {
         // Handle tuple / unit types: (Type1, Type2) or ()
         if *self.peek_token() == Token::LParen {
             return self.parse_tuple_type();
+        }
+        // Handle array type: [Type; IntLit]
+        if *self.peek_token() == Token::LBracket {
+            self.advance(); // consume [
+            let inner = self.parse_type()?;
+            self.expect(&Token::Semicolon)?;
+            let len = match self.peek_token() {
+                Token::IntLit(n) => {
+                    let n = *n;
+                    self.advance();
+                    n as usize
+                }
+                _ => {
+                    let default = (Token::Eof, Span::empty(0));
+                    let (_, span) = self.current().unwrap_or(&default);
+                    return Err(ParseError {
+                        span: *span,
+                        msg: "expected integer literal for array length".to_string(),
+                    });
+                }
+            };
+            self.expect(&Token::RBracket)?;
+            return Ok(Type::Array {
+                inner: Box::new(inner),
+                len,
+            });
         }
         let token = self.peek_token().clone();
         self.advance();
@@ -1508,6 +1579,57 @@ impl<'a> Parser<'a> {
                 }
                 Ok(Expr::Ident(name))
             }
+            Token::LBracket => {
+                self.advance(); // consume [
+                // Check for empty array → error (ulang doesn't support zero-length arrays)
+                if *self.peek_token() == Token::RBracket {
+                    let (_, span) = self.current().unwrap();
+                    return Err(ParseError {
+                        span: *span,
+                        msg: "empty array literals are not supported".to_string(),
+                    });
+                }
+                let first = self.parse_expr()?;
+                // Check for repeat: [expr; count]
+                if *self.peek_token() == Token::Semicolon {
+                    self.advance(); // consume ;
+                    let count = match self.peek_token() {
+                        Token::IntLit(n) => {
+                            let n = *n;
+                            self.advance();
+                            n as usize
+                        }
+                        _ => {
+                            let default = (Token::Eof, Span::empty(0));
+                            let (_, span) = self.current().unwrap_or(&default);
+                            return Err(ParseError {
+                                span: *span,
+                                msg: "expected integer literal for repeat count".to_string(),
+                            });
+                        }
+                    };
+                    self.expect(&Token::RBracket)?;
+                    return Ok(Expr::Repeat(Box::new(first), count));
+                }
+                // Comma → array literal
+                if *self.peek_token() == Token::Comma {
+                    self.advance();
+                    let mut exprs = vec![first];
+                    while *self.peek_token() != Token::RBracket {
+                        exprs.push(self.parse_expr()?);
+                        if *self.peek_token() == Token::Comma {
+                            self.advance();
+                        } else {
+                            break;
+                        }
+                    }
+                    self.expect(&Token::RBracket)?;
+                    return Ok(Expr::Array(exprs));
+                }
+                // [expr] — single element array
+                self.expect(&Token::RBracket)?;
+                Ok(Expr::Array(vec![first]))
+            }
             Token::LParen => {
                 self.advance();
                 // Check for empty parens → unit
@@ -1773,7 +1895,7 @@ impl<'a> Parser<'a> {
                 }
                 Ok(())
             }
-            Type::Ref { inner, .. } | Type::Ptr { inner, .. } => {
+            Type::Ref { inner, .. } | Type::Ptr { inner, .. } | Type::Array { inner, .. } => {
                 self.resolve_type_in_place_owned(inner, aliases, visiting)
             }
             Type::Tuple(types) => {
@@ -1802,7 +1924,7 @@ impl<'a> Parser<'a> {
                 }
                 // If the base name itself is a type param, it would have been caught by Type::Struct above
             }
-            Type::Ref { inner, .. } | Type::Ptr { inner, .. } => {
+            Type::Ref { inner, .. } | Type::Ptr { inner, .. } | Type::Array { inner, .. } => {
                 Self::substitute_type_params(inner, params, args);
             }
             Type::Tuple(types) => {
@@ -2367,7 +2489,8 @@ mod tests {
 
     #[test]
     fn test_enum_lit_with_payload() {
-        let prog = parse("enum Option<T> { Some(T), None } fn f() { let x = Option::Some(42); }").unwrap();
+        let prog =
+            parse("enum Option<T> { Some(T), None } fn f() { let x = Option::Some(42); }").unwrap();
         match &prog.funcs[0].body.stmts[0] {
             Stmt::Let { init, .. } => match init {
                 Expr::EnumLit {
@@ -2387,7 +2510,8 @@ mod tests {
 
     #[test]
     fn test_enum_lit_unit_variant() {
-        let prog = parse("enum Option<T> { Some(T), None } fn f() { let x = Option::None; }").unwrap();
+        let prog =
+            parse("enum Option<T> { Some(T), None } fn f() { let x = Option::None; }").unwrap();
         match &prog.funcs[0].body.stmts[0] {
             Stmt::Let { init, .. } => match init {
                 Expr::EnumLit {
@@ -3259,5 +3383,112 @@ mod tests {
         // Alias in function parameter should be resolved
         let prog = parse("type Meters = i32; fn foo(x: Meters) {}").unwrap();
         assert_eq!(prog.funcs[0].params[0].ty, Type::I32);
+    }
+
+    #[test]
+    fn test_array_type() {
+        let prog = parse("fn main() { let a: [i32; 5] = [1, 2, 3, 4, 5]; }").unwrap();
+        match &prog.funcs[0].body.stmts[0] {
+            Stmt::Let {
+                type_ann: Some(ty), ..
+            } => {
+                assert_eq!(
+                    *ty,
+                    Type::Array {
+                        inner: Box::new(Type::I32),
+                        len: 5
+                    }
+                );
+            }
+            _ => panic!("expected Let with type annotation"),
+        }
+    }
+
+    #[test]
+    fn test_array_literal_parsing() {
+        let prog = parse("fn main() { let a = [1, 2, 3]; }").unwrap();
+        match &prog.funcs[0].body.stmts[0] {
+            Stmt::Let { init, .. } => match init {
+                Expr::Array(elems) => {
+                    assert_eq!(elems.len(), 3);
+                    assert!(matches!(elems[0], Expr::IntLit(1)));
+                    assert!(matches!(elems[1], Expr::IntLit(2)));
+                    assert!(matches!(elems[2], Expr::IntLit(3)));
+                }
+                _ => panic!("expected Array expression"),
+            },
+            _ => panic!("expected Let"),
+        }
+    }
+
+    #[test]
+    fn test_array_repeat_parsing() {
+        let prog = parse("fn main() { let a = [0; 4]; }").unwrap();
+        match &prog.funcs[0].body.stmts[0] {
+            Stmt::Let { init, .. } => match init {
+                Expr::Repeat(expr, count) => {
+                    assert_eq!(*count, 4);
+                    assert!(matches!(expr.as_ref(), Expr::IntLit(0)));
+                }
+                _ => panic!("expected Repeat expression"),
+            },
+            _ => panic!("expected Let"),
+        }
+    }
+
+    #[test]
+    fn test_array_index_parsing() {
+        let prog = parse("fn main() { let a = [1, 2]; a[0]; }").unwrap();
+        match &prog.funcs[0].body.stmts[1] {
+            Stmt::Expr(expr) => match expr {
+                Expr::Index { array, index } => {
+                    assert!(matches!(array.as_ref(), Expr::Ident(_)));
+                    assert!(matches!(index.as_ref(), Expr::IntLit(0)));
+                }
+                _ => panic!("expected Index expression"),
+            },
+            _ => panic!("expected Expr stmt"),
+        }
+    }
+
+    #[test]
+    fn test_array_index_assign_parsing() {
+        let prog = parse("fn main() { let mut a = [1, 2]; a[0] = 99; }").unwrap();
+        match &prog.funcs[0].body.stmts[1] {
+            Stmt::Expr(expr) => match expr {
+                Expr::Assign { target, value } => {
+                    assert!(matches!(target.as_ref(), Expr::Index { .. }));
+                    assert!(matches!(value.as_ref(), Expr::IntLit(99)));
+                }
+                _ => panic!("expected Assign expression"),
+            },
+            _ => panic!("expected Expr stmt"),
+        }
+    }
+
+    #[test]
+    fn test_nested_array_index_parsing() {
+        let prog = parse("fn main() { let a = [[1, 2], [3, 4]]; a[0][1]; }").unwrap();
+        match &prog.funcs[0].body.stmts[1] {
+            Stmt::Expr(expr) => match expr {
+                Expr::Index { array, index } => {
+                    assert!(matches!(index.as_ref(), Expr::IntLit(1)));
+                    assert!(matches!(array.as_ref(), Expr::Index { .. }));
+                }
+                _ => panic!("expected nested Index expression"),
+            },
+            _ => panic!("expected Expr stmt"),
+        }
+    }
+
+    #[test]
+    fn test_trait_with_type_params() {
+        let prog = parse("trait Index<Idx, T> { fn index(&self, idx: Idx) -> &T; }").unwrap();
+        assert_eq!(prog.traits.len(), 1);
+        let t = &prog.traits[0];
+        assert_eq!(t.name, "Index");
+        assert_eq!(t.type_params, vec!["Idx".to_string(), "T".to_string()]);
+        assert_eq!(t.methods.len(), 1);
+        assert_eq!(t.methods[0].name, "index");
     }
 }

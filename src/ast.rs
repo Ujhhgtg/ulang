@@ -103,6 +103,7 @@ pub enum Type {
     Str,
     Ptr { inner: Box<Type>, is_mut: bool },
     Ref { inner: Box<Type>, is_mut: bool },
+    Array { inner: Box<Type>, len: usize },
     Struct(String),
     GenericInstance(String, Vec<Type>),
     Alias(String, Vec<Type>),
@@ -178,6 +179,12 @@ pub enum Expr {
         cond: Box<Expr>,
         body: Block,
     },
+    Array(Vec<Expr>),
+    Repeat(Box<Expr>, usize),
+    Index {
+        array: Box<Expr>,
+        index: Box<Expr>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -216,6 +223,7 @@ pub struct StructField {
 #[derive(Debug, Clone)]
 pub struct TraitDecl {
     pub name: String,
+    pub type_params: Vec<String>,
     pub methods: Vec<TraitMethodDef>,
     pub span: Span,
 }

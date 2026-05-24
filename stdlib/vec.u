@@ -47,12 +47,12 @@ impl<T> Vec<T> {
 
     fn pop(&mut self) -> Option<T> {
         if self.len == 0 {
-            Option { is_some: false, val: 0 as T }
+            Option::None
         } else {
             self.len = self.len - 1;
             let elem_size = __builtin_size_of(*(0 as *const T));
             let src = (self.ptr as usize + self.len * elem_size) as *const T;
-            Option { is_some: true, val: *src }
+            Option::Some(*src)
         }
     }
 

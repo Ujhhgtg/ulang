@@ -1092,7 +1092,7 @@ impl<'ctx> CodeGen<'ctx> {
     fn is_type_param(ty: &Type) -> bool {
         match ty {
             Type::Struct(name) => {
-                name.len() == 1 && name.chars().next().map_or(false, |c| c.is_uppercase())
+                name.len() == 1 && name.chars().next().is_some_and(|c| c.is_uppercase())
             }
             _ => false,
         }
@@ -1177,11 +1177,10 @@ impl<'ctx> CodeGen<'ctx> {
                 if let Some(pos) = params.iter().position(|p| p == enum_name) {
                     if let Some(Type::GenericInstance(base, _)) = args.get(pos) {
                         *enum_name = base.clone();
-                    } else if let Some(arg) = args.get(pos) {
-                        if let Some(name) = Self::primitive_type_name(arg) {
+                    } else if let Some(arg) = args.get(pos)
+                        && let Some(name) = Self::primitive_type_name(arg) {
                             *enum_name = name.to_string();
                         }
-                    }
                 }
                 if let Some(inner) = payload {
                     let mut boxed = Box::new((**inner).clone());
@@ -1265,11 +1264,10 @@ impl<'ctx> CodeGen<'ctx> {
                 if let Some(pos) = params.iter().position(|p| p == struct_name) {
                     if let Some(Type::GenericInstance(base, _)) = args.get(pos) {
                         *struct_name = base.clone();
-                    } else if let Some(arg) = args.get(pos) {
-                        if let Some(name) = Self::primitive_type_name(arg) {
+                    } else if let Some(arg) = args.get(pos)
+                        && let Some(name) = Self::primitive_type_name(arg) {
                             *struct_name = name.to_string();
                         }
-                    }
                 }
                 for (_, expr) in fields.iter_mut() {
                     let mut inner = Box::new(expr.clone());
@@ -1375,10 +1373,10 @@ impl<'ctx> CodeGen<'ctx> {
         let mut seen = HashSet::new();
 
         for param in &func.params {
-            Self::collect_from_types(&[param.ty.clone()], &mut instances, &mut seen);
+            Self::collect_from_types(std::slice::from_ref(&param.ty), &mut instances, &mut seen);
         }
         if let Some(ref ret) = func.return_type {
-            Self::collect_from_types(&[ret.clone()], &mut instances, &mut seen);
+            Self::collect_from_types(std::slice::from_ref(ret), &mut instances, &mut seen);
         }
         Self::collect_from_block(&func.body, &mut instances, &mut seen);
 
@@ -1399,7 +1397,7 @@ impl<'ctx> CodeGen<'ctx> {
                 | Stmt::Const {
                     type_ann: Some(ty), ..
                 } => {
-                    Self::collect_from_types(&[ty.clone()], instances, seen);
+                    Self::collect_from_types(std::slice::from_ref(ty), instances, seen);
                 }
                 _ => {}
             }
@@ -1416,7 +1414,7 @@ impl<'ctx> CodeGen<'ctx> {
             match ty {
                 Type::GenericInstance(name, args) => {
                     // Skip instances with unresolved type params
-                    if args.iter().any(|a| Self::is_type_param(a)) {
+                    if args.iter().any(Self::is_type_param) {
                         continue;
                     }
                     let key = Self::mangle_generic_instance(name, args);
@@ -1448,7 +1446,7 @@ impl<'ctx> CodeGen<'ctx> {
                 &mut seen,
             );
             if let Some(ref ret) = func.return_type {
-                Self::collect_from_types(&[ret.clone()], &mut instances, &mut seen);
+                Self::collect_from_types(std::slice::from_ref(ret), &mut instances, &mut seen);
             }
             Self::collect_from_block(&func.body, &mut instances, &mut seen);
         }
@@ -1468,7 +1466,7 @@ impl<'ctx> CodeGen<'ctx> {
 
         // Scan impls
         for decl in &program.impls {
-            Self::collect_from_types(&[decl.impl_type.clone()], &mut instances, &mut seen);
+            Self::collect_from_types(std::slice::from_ref(&decl.impl_type), &mut instances, &mut seen);
             for method in &decl.methods {
                 Self::collect_from_types(
                     &method
@@ -1480,7 +1478,7 @@ impl<'ctx> CodeGen<'ctx> {
                     &mut seen,
                 );
                 if let Some(ref ret) = method.return_type {
-                    Self::collect_from_types(&[ret.clone()], &mut instances, &mut seen);
+                    Self::collect_from_types(std::slice::from_ref(ret), &mut instances, &mut seen);
                 }
                 Self::collect_from_block(&method.body, &mut instances, &mut seen);
             }
@@ -2207,7 +2205,14 @@ impl<'ctx> CodeGen<'ctx> {
                     rhs_ty
                 }
             }
-            Expr::EnumLit { enum_name, .. } => Type::Struct(enum_name.clone()),
+            Expr::EnumLit { enum_name, .. } => {
+                let actual_name = self
+                    .monomorphized_names
+                    .get(enum_name.as_str())
+                    .cloned()
+                    .unwrap_or_else(|| enum_name.clone());
+                Type::Struct(actual_name)
+            }
             Expr::Index { array, .. } => {
                 let array_ty = self.expr_type(array);
                 match &array_ty {
@@ -2450,14 +2455,13 @@ impl<'ctx> CodeGen<'ctx> {
                 let mut value = self.compile_expr(init)?;
                 // Only attempt type coercion when the LLVM types differ,
                 // to handle cases like StructLit vs GenericInstance types
-                if value.get_type() != llvm_ty {
-                    if let Some(ann_ty) = type_ann {
+                if value.get_type() != llvm_ty
+                    && let Some(ann_ty) = type_ann {
                         let inferred = self.expr_type(init);
                         if ann_ty != &inferred {
                             value = self.emit_cast(value, ann_ty)?;
                         }
                     }
-                }
                 self.builder
                     .build_store(alloca, value)
                     .map_err(|e| format!("failed to build store: {}", e))?;
@@ -3761,7 +3765,7 @@ impl<'ctx> CodeGen<'ctx> {
                     .builder
                     .build_load(array_llvm, alloca, "array_val")
                     .map_err(|e| format!("failed to load array: {}", e))?;
-                Ok(result.into())
+                Ok(result)
             }
             Expr::Repeat(expr, count) => {
                 let elem_ty = self.expr_type(expr);
@@ -3804,7 +3808,7 @@ impl<'ctx> CodeGen<'ctx> {
                     .builder
                     .build_load(array_llvm, alloca, "array_val")
                     .map_err(|e| format!("failed to load array: {}", e))?;
-                Ok(result.into())
+                Ok(result)
             }
             Expr::Index { array, index } => {
                 let array_ty = self.expr_type(array);
@@ -4110,19 +4114,25 @@ impl<'ctx> CodeGen<'ctx> {
                     .get(&actual_name)
                     .copied()
                     .ok_or_else(|| format!("unknown enum type '{}'", actual_name))?;
+                let decl = self
+                    .enum_defs
+                    .get(&actual_name)
+                    .ok_or_else(|| format!("unknown enum '{}'", actual_name))?;
+                let variant_idx = decl
+                    .variants
+                    .iter()
+                    .position(|v| v.name == *variant)
+                    .ok_or_else(|| {
+                        format!("unknown variant '{}' in enum '{}'", variant, actual_name)
+                    })? as u32;
                 let fields = self
                     .struct_fields
-                    .get(enum_name)
-                    .ok_or_else(|| format!("unknown enum '{}'", enum_name))?;
+                    .get(&actual_name)
+                    .ok_or_else(|| format!("unknown enum '{}'", actual_name))?;
                 let payload_field_name = format!("__{}", variant);
-                let mut variant_idx = 0u32;
                 let mut payload_field_idx: Option<u32> = None;
                 for (idx, field) in fields.iter().enumerate() {
-                    if idx == 0 {
-                        continue;
-                    }
                     if field.name == payload_field_name {
-                        variant_idx = (idx - 1) as u32;
                         payload_field_idx = Some(idx as u32);
                         break;
                     }

@@ -1535,9 +1535,16 @@ impl<'a> Parser<'a> {
                             });
                         }
                     };
-                    // If followed by `(`, check if it's a known enum (enum literal) or not (qualified call)
+                    // Disambiguate enum lit vs qualified call:
+                    // Enum variants are PascalCase, functions/modules are snake_case.
+                    let is_enum_variant = variant_or_fn
+                        .chars()
+                        .next()
+                        .map(|c| c.is_uppercase())
+                        .unwrap_or(false);
+                    // If followed by `(`, check if it's an enum literal or qualified call
                     if *self.peek_token() == Token::LParen {
-                        if self.enum_names.contains(&name) {
+                        if is_enum_variant {
                             self.advance(); // consume '('
                             if *self.peek_token() == Token::RParen {
                                 // Empty parens → unit variant with no payload
@@ -1564,7 +1571,8 @@ impl<'a> Parser<'a> {
                             });
                         }
                     } else {
-                        // No parens → unit enum variant
+                        // No parens → unit enum variant (if PascalCase) or forward reference
+                        // Always treat as enum lit; codegen will error if name is not an enum.
                         return Ok(Expr::EnumLit {
                             enum_name: name,
                             variant: variant_or_fn,

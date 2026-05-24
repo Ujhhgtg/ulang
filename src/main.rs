@@ -444,19 +444,18 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
     if let Ok(entries) = std::fs::read_dir("stdlib") {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().map_or(false, |e| e == "u") {
-                if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
-                    if let Ok(src) = std::fs::read_to_string(&path) {
-                        let prog = lex_and_parse(&src, &path.to_string_lossy());
-                        // Register canonical struct sources
-                        for decl in &prog.structs {
-                            canonical_struct_sources
-                                .entry(decl.name.clone())
-                                .or_insert_with(|| name.to_string());
-                        }
-                        all_stdlib_progs.entry(name.to_string()).or_insert(prog);
-                    }
+            if path.extension().is_some_and(|e| e == "u")
+                && let Some(name) = path.file_stem().and_then(|s| s.to_str())
+                && let Ok(src) = std::fs::read_to_string(&path)
+            {
+                let prog = lex_and_parse(&src, &path.to_string_lossy());
+                // Register canonical struct sources
+                for decl in &prog.structs {
+                    canonical_struct_sources
+                        .entry(decl.name.clone())
+                        .or_insert_with(|| name.to_string());
                 }
+                all_stdlib_progs.entry(name.to_string()).or_insert(prog);
             }
         }
     }
@@ -600,57 +599,54 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
                             continue;
                         }
                         // Look up canonical source module for this struct
-                        if let Some(mod_name) = canonical_struct_sources.get(&dep_name) {
-                            if let Some(candidate_prog) = all_stdlib_progs.get(mod_name) {
-                                if let Some(dep_decl) =
-                                    candidate_prog.structs.iter().find(|s| s.name == dep_name)
-                                {
-                                    all_structs
-                                        .entry(dep_name.clone())
-                                        .or_insert_with(|| dep_decl.clone());
-                                    // Add its own field deps
-                                    for field in &dep_decl.fields {
-                                        dep_stack.extend(collect_struct_deps(&field.ty));
-                                    }
-                                    // Import impls for this dependency
-                                    for impl_decl in &candidate_prog.impls {
-                                        let impl_type_name = match &impl_decl.impl_type {
-                                            Type::Struct(name) => name.clone(),
-                                            Type::GenericInstance(name, _) => name.clone(),
-                                            _ => continue,
-                                        };
-                                        if impl_type_name == dep_name {
-                                            all_impls.push(impl_decl.clone());
-                                        }
-                                    }
-                                    // Also scan the dependency's impl methods for further deps
-                                    for impl_decl in &candidate_prog.impls {
-                                        let impl_type_name = match &impl_decl.impl_type {
-                                            Type::Struct(name) => name.clone(),
-                                            Type::GenericInstance(name, _) => name.clone(),
-                                            _ => continue,
-                                        };
-                                        if impl_type_name == dep_name {
-                                            for method in &impl_decl.methods {
-                                                for param in &method.params {
-                                                    dep_stack
-                                                        .extend(collect_struct_deps(&param.ty));
-                                                }
-                                                if let Some(ref ret) = method.return_type {
-                                                    dep_stack.extend(collect_struct_deps(ret));
-                                                }
-                                            }
-                                        }
-                                    }
-                                    // Import ALL functions from the dependency module
-                                    for func in &candidate_prog.funcs {
-                                        if func.is_extern && !all_funcs.contains_key(&func.name) {
-                                            all_funcs.insert(func.name.clone(), func.clone());
-                                        }
-                                    }
-                                    break;
+                        if let Some(mod_name) = canonical_struct_sources.get(&dep_name)
+                            && let Some(candidate_prog) = all_stdlib_progs.get(mod_name)
+                            && let Some(dep_decl) =
+                                candidate_prog.structs.iter().find(|s| s.name == dep_name)
+                        {
+                            all_structs
+                                .entry(dep_name.clone())
+                                .or_insert_with(|| dep_decl.clone());
+                            // Add its own field deps
+                            for field in &dep_decl.fields {
+                                dep_stack.extend(collect_struct_deps(&field.ty));
+                            }
+                            // Import impls for this dependency
+                            for impl_decl in &candidate_prog.impls {
+                                let impl_type_name = match &impl_decl.impl_type {
+                                    Type::Struct(name) => name.clone(),
+                                    Type::GenericInstance(name, _) => name.clone(),
+                                    _ => continue,
+                                };
+                                if impl_type_name == dep_name {
+                                    all_impls.push(impl_decl.clone());
                                 }
                             }
+                            // Also scan the dependency's impl methods for further deps
+                            for impl_decl in &candidate_prog.impls {
+                                let impl_type_name = match &impl_decl.impl_type {
+                                    Type::Struct(name) => name.clone(),
+                                    Type::GenericInstance(name, _) => name.clone(),
+                                    _ => continue,
+                                };
+                                if impl_type_name == dep_name {
+                                    for method in &impl_decl.methods {
+                                        for param in &method.params {
+                                            dep_stack.extend(collect_struct_deps(&param.ty));
+                                        }
+                                        if let Some(ref ret) = method.return_type {
+                                            dep_stack.extend(collect_struct_deps(ret));
+                                        }
+                                    }
+                                }
+                            }
+                            // Import ALL functions from the dependency module
+                            for func in &candidate_prog.funcs {
+                                if func.is_extern && !all_funcs.contains_key(&func.name) {
+                                    all_funcs.insert(func.name.clone(), func.clone());
+                                }
+                            }
+                            break;
                         }
                     }
                     // Import all impl blocks for this struct
@@ -735,17 +731,14 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
                             continue;
                         }
                         // Look up canonical source module for this struct
-                        if let Some(mod_name) = canonical_struct_sources.get(struct_name) {
-                            if let Some(prog) = all_stdlib_progs.get(mod_name) {
-                                if let Some(decl) =
-                                    prog.structs.iter().find(|s| &s.name == struct_name)
-                                {
-                                    all_structs
-                                        .entry(struct_name.clone())
-                                        .or_insert_with(|| decl.clone());
-                                    dep_modules.insert(mod_name.clone());
-                                }
-                            }
+                        if let Some(mod_name) = canonical_struct_sources.get(struct_name)
+                            && let Some(prog) = all_stdlib_progs.get(mod_name)
+                            && let Some(decl) = prog.structs.iter().find(|s| &s.name == struct_name)
+                        {
+                            all_structs
+                                .entry(struct_name.clone())
+                                .or_insert_with(|| decl.clone());
+                            dep_modules.insert(mod_name.clone());
                         }
                     }
                     // Import extern "C" functions and impl blocks from dependency modules

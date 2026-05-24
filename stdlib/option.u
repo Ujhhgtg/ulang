@@ -1,18 +1,18 @@
 use std::panic::panic;
 
-struct Option<T> {
-    is_some: bool,
-    val: T,
+enum Option<T> {
+    Some(T),
+    None,
 }
 
 impl<T> Option<T> {
-    fn is_some(&self) -> bool { self.is_some }
-    fn is_none(&self) -> bool { !self.is_some }
+    fn is_some(&self) -> bool { self.__tag == 0 as i8 }
+    fn is_none(&self) -> bool { self.__tag != 0 as i8 }
     fn unwrap(&self) -> T {
-        if !self.is_some { panic("called `Option::unwrap()` on a `None` value"); };
-        self.val
+        if self.__tag != 0 as i8 { panic("called `Option::unwrap()` on a `None` value"); };
+        self.__Some
     }
     fn unwrap_or(&self, default: T) -> T {
-        if self.is_some { self.val } else { default }
+        if self.__tag == 0 as i8 { self.__Some } else { default }
     }
 }

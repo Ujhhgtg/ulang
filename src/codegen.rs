@@ -16,8 +16,8 @@ use inkwell::values::{AnyValue, BasicMetadataValueEnum, BasicValueEnum, PointerV
 use inkwell::attributes::Attribute;
 
 use crate::ast::{
-    BinOp, Block, EnumDecl, Expr, Function, ImplDecl, MatchArm, Pattern, Program, Stmt,
-    StructDecl, StructField, Type,
+    BinOp, Block, EnumDecl, Expr, Function, ImplDecl, MatchArm, Pattern, Program, Stmt, StructDecl,
+    StructField, Type,
 };
 
 use crate::token::Span;
@@ -1179,9 +1179,10 @@ impl<'ctx> CodeGen<'ctx> {
                     if let Some(Type::GenericInstance(base, _)) = args.get(pos) {
                         *enum_name = base.clone();
                     } else if let Some(arg) = args.get(pos)
-                        && let Some(name) = Self::primitive_type_name(arg) {
-                            *enum_name = name.to_string();
-                        }
+                        && let Some(name) = Self::primitive_type_name(arg)
+                    {
+                        *enum_name = name.to_string();
+                    }
                 }
                 if let Some(inner) = payload {
                     let mut boxed = Box::new((**inner).clone());
@@ -1287,9 +1288,10 @@ impl<'ctx> CodeGen<'ctx> {
                     if let Some(Type::GenericInstance(base, _)) = args.get(pos) {
                         *struct_name = base.clone();
                     } else if let Some(arg) = args.get(pos)
-                        && let Some(name) = Self::primitive_type_name(arg) {
-                            *struct_name = name.to_string();
-                        }
+                        && let Some(name) = Self::primitive_type_name(arg)
+                    {
+                        *struct_name = name.to_string();
+                    }
                 }
                 for (_, expr) in fields.iter_mut() {
                     let mut inner = Box::new(expr.clone());
@@ -1494,7 +1496,11 @@ impl<'ctx> CodeGen<'ctx> {
 
         // Scan impls
         for decl in &program.impls {
-            Self::collect_from_types(std::slice::from_ref(&decl.impl_type), &mut instances, &mut seen);
+            Self::collect_from_types(
+                std::slice::from_ref(&decl.impl_type),
+                &mut instances,
+                &mut seen,
+            );
             for method in &decl.methods {
                 Self::collect_from_types(
                     &method
@@ -1572,8 +1578,7 @@ impl<'ctx> CodeGen<'ctx> {
                     let payload_ty = Self::literal_type(payload_expr);
                     // Only for primitive payloads (skip type params like T)
                     if Self::is_concrete_type(&payload_ty) {
-                        let key =
-                            Self::mangle_generic_instance(enum_name, &[payload_ty.clone()]);
+                        let key = Self::mangle_generic_instance(enum_name, &[payload_ty.clone()]);
                         if seen.insert(key) {
                             instances.push((enum_name.clone(), vec![payload_ty]));
                         }
@@ -2375,17 +2380,14 @@ impl<'ctx> CodeGen<'ctx> {
                 }
             }
             Expr::EnumLit {
-                enum_name,
-                payload,
-                ..
+                enum_name, payload, ..
             } => {
                 let actual_name: String;
                 if let Some(payload_expr) = payload {
                     if self.generic_enum_defs.contains_key(enum_name.as_str()) {
                         let payload_ty = self.expr_type(payload_expr);
                         if Self::is_concrete_type(&payload_ty) {
-                            let mangled =
-                                Self::mangle_generic_instance(enum_name, &[payload_ty]);
+                            let mangled = Self::mangle_generic_instance(enum_name, &[payload_ty]);
                             if self.struct_types.contains_key(&mangled) {
                                 actual_name = mangled;
                             } else {
@@ -2657,12 +2659,13 @@ impl<'ctx> CodeGen<'ctx> {
                 // Only attempt type coercion when the LLVM types differ,
                 // to handle cases like StructLit vs GenericInstance types
                 if value.get_type() != llvm_ty
-                    && let Some(ann_ty) = type_ann {
-                        let inferred = self.expr_type(init);
-                        if ann_ty != &inferred {
-                            value = self.emit_cast(value, ann_ty)?;
-                        }
+                    && let Some(ann_ty) = type_ann
+                {
+                    let inferred = self.expr_type(init);
+                    if ann_ty != &inferred {
+                        value = self.emit_cast(value, ann_ty)?;
                     }
+                }
                 self.builder
                     .build_store(alloca, value)
                     .map_err(|e| format!("failed to build store: {}", e))?;
@@ -4313,8 +4316,7 @@ impl<'ctx> CodeGen<'ctx> {
                     if self.generic_enum_defs.contains_key(enum_name.as_str()) {
                         let payload_ty = self.expr_type(payload_expr);
                         if Self::is_concrete_type(&payload_ty) {
-                            let mangled =
-                                Self::mangle_generic_instance(enum_name, &[payload_ty]);
+                            let mangled = Self::mangle_generic_instance(enum_name, &[payload_ty]);
                             // If the mangled type exists, use it.
                             // Otherwise fall back to monomorphized_names
                             // (recursive monomorphization hasn't run yet).
@@ -4457,8 +4459,7 @@ impl<'ctx> CodeGen<'ctx> {
         // === Then block: bind variables, execute body ===
         self.builder.position_at_end(then_bb);
         for (name, ptr, ty) in &bindings {
-            self.symbols
-                .insert(name.clone(), (*ptr, false, ty.clone()));
+            self.symbols.insert(name.clone(), (*ptr, false, ty.clone()));
         }
         if let Some(val) = self.compile_block_get_value(then_block)? {
             self.builder
@@ -4544,23 +4545,40 @@ impl<'ctx> CodeGen<'ctx> {
             .map_err(|e| format!("failed to build match result alloca: {}", e))?;
 
         let merge_bb = self.context.append_basic_block(parent_fn, "match_merge");
-        let mut prev_bb: Option<inkwell::basic_block::BasicBlock<'ctx>> = None;
+
+        // Handle empty match (shouldn't happen but be safe)
+        if arms.is_empty() {
+            self.builder
+                .build_unconditional_branch(merge_bb)
+                .map_err(|e| format!("failed to branch to merge: {}", e))?;
+            self.builder.position_at_end(merge_bb);
+            let unit_ty = self.context.struct_type(&[], false);
+            return Ok(unit_ty.get_undef().into());
+        }
+
+        // Pre-allocate all check blocks so we can branch to the first one
+        let mut check_bbs: Vec<inkwell::basic_block::BasicBlock<'ctx>> = Vec::new();
+        let mut body_bbs: Vec<inkwell::basic_block::BasicBlock<'ctx>> = Vec::new();
+        for i in 0..arms.len() {
+            check_bbs.push(
+                self.context
+                    .append_basic_block(parent_fn, &format!("match_check_{}", i)),
+            );
+            body_bbs.push(
+                self.context
+                    .append_basic_block(parent_fn, &format!("match_body_{}", i)),
+            );
+        }
+
+        // Branch from current block to first check block
+        self.builder
+            .build_unconditional_branch(check_bbs[0])
+            .map_err(|e| format!("failed to branch to match entry: {}", e))?;
 
         for (i, arm) in arms.iter().enumerate() {
             let is_last = i == arms.len() - 1;
-
-            // Create basic blocks for this arm
-            let check_bb = self.context.append_basic_block(parent_fn, &format!("match_check_{}", i));
-            let body_bb = self.context.append_basic_block(parent_fn, &format!("match_body_{}", i));
-
-            // If previous arm didn't branch here, branch from previous fallthrough
-            if let Some(_bb) = prev_bb {
-                if self.builder.get_insert_block().unwrap().get_terminator().is_none() {
-                    self.builder
-                        .build_unconditional_branch(check_bb)
-                        .map_err(|e| format!("failed to branch to match_check_{}: {}", i, e))?;
-                }
-            }
+            let check_bb = check_bbs[i];
+            let body_bb = body_bbs[i];
 
             // Position at check block
             self.builder.position_at_end(check_bb);
@@ -4598,9 +4616,7 @@ impl<'ctx> CodeGen<'ctx> {
                     .build_conditional_branch(matches_val, body_bb, merge_bb)
                     .map_err(|e| format!("failed to build last match branch: {}", e))?;
             } else {
-                let next_check =
-                    self.context
-                        .append_basic_block(parent_fn, &format!("match_check_{}", i + 1));
+                let next_check = check_bbs[i + 1];
                 self.builder
                     .build_conditional_branch(matches_val, body_bb, next_check)
                     .map_err(|e| format!("failed to build match branch: {}", e))?;
@@ -4609,8 +4625,7 @@ impl<'ctx> CodeGen<'ctx> {
             // Compile arm body
             self.builder.position_at_end(body_bb);
             for (name, ptr, ty) in &bindings {
-                self.symbols
-                    .insert(name.clone(), (*ptr, false, ty.clone()));
+                self.symbols.insert(name.clone(), (*ptr, false, ty.clone()));
             }
             if let Some(val) = self.compile_block_get_value(&arm.body)? {
                 self.builder
@@ -4631,8 +4646,6 @@ impl<'ctx> CodeGen<'ctx> {
                     .build_unconditional_branch(merge_bb)
                     .map_err(|e| format!("failed to branch from match arm: {}", e))?;
             }
-
-            prev_bb = Some(body_bb);
         }
 
         // === Merge ===
@@ -4659,19 +4672,12 @@ impl<'ctx> CodeGen<'ctx> {
     ) -> Result<
         (
             inkwell::values::IntValue<'ctx>,
-            Vec<(
-                String,
-                inkwell::values::PointerValue<'ctx>,
-                Type,
-            )>,
+            Vec<(String, inkwell::values::PointerValue<'ctx>, Type)>,
         ),
         String,
     > {
         match pattern {
-            Pattern::Wildcard => Ok((
-                self.bool_type.const_int(1, false),
-                Vec::new(),
-            )),
+            Pattern::Wildcard => Ok((self.bool_type.const_int(1, false), Vec::new())),
             Pattern::Binding(name) => {
                 // Create alloca for the binding and store the scrutinee value
                 let llvm_ty = self.type_to_llvm(scrutinee_ty);
@@ -4693,9 +4699,7 @@ impl<'ctx> CodeGen<'ctx> {
                     BasicValueEnum::IntValue(v) => v,
                     _ => return Err("integer pattern requires integer scrutinee".to_string()),
                 };
-                let lit_val = scrutinee_int
-                    .get_type()
-                    .const_int(*n as u64, true);
+                let lit_val = scrutinee_int.get_type().const_int(*n as u64, true);
                 let cmp = self
                     .builder
                     .build_int_compare(
@@ -4740,9 +4744,7 @@ impl<'ctx> CodeGen<'ctx> {
                             .cloned()
                             .unwrap_or_else(|| name.clone())
                     }
-                    Type::GenericInstance(name, args) => {
-                        Self::mangle_generic_instance(name, args)
-                    }
+                    Type::GenericInstance(name, args) => Self::mangle_generic_instance(name, args),
                     Type::Ref { inner, .. } => match inner.as_ref() {
                         Type::Struct(name) => self
                             .monomorphized_names
@@ -4753,17 +4755,11 @@ impl<'ctx> CodeGen<'ctx> {
                             Self::mangle_generic_instance(name, args)
                         }
                         _ => {
-                            return Err(format!(
-                                "cannot pattern-match on type {:?}",
-                                scrutinee_ty
-                            ));
+                            return Err(format!("cannot pattern-match on type {:?}", scrutinee_ty));
                         }
                     },
                     _ => {
-                        return Err(format!(
-                            "cannot pattern-match on type {:?}",
-                            scrutinee_ty
-                        ));
+                        return Err(format!("cannot pattern-match on type {:?}", scrutinee_ty));
                     }
                 };
 
@@ -4777,19 +4773,14 @@ impl<'ctx> CodeGen<'ctx> {
                     .iter()
                     .position(|v| v.name == *variant)
                     .ok_or_else(|| {
-                        format!(
-                            "unknown variant '{}' in enum '{}'",
-                            variant, enum_type_name
-                        )
+                        format!("unknown variant '{}' in enum '{}'", variant, enum_type_name)
                     })? as u64;
 
                 // Extract the tag field from the scrutinee
                 let scrutinee_struct = match scrutinee_val {
                     BasicValueEnum::StructValue(sv) => sv,
                     _ => {
-                        return Err(
-                            "enum pattern matching requires struct scrutinee".to_string()
-                        );
+                        return Err("enum pattern matching requires struct scrutinee".to_string());
                     }
                 };
                 let tag_val = self

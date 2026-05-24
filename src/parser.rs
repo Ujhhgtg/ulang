@@ -1,8 +1,9 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::{
-    Attribute, BinOp, Block, EnumDecl, EnumVariant, Expr, Function, ImplDecl, Param, Program, Stmt,
-    StructDecl, StructField, TraitDecl, TraitMethodDef, Type, TypeAliasDecl, Use,
+    Attribute, BinOp, Block, EnumDecl, EnumVariant, Expr, Function, ImplDecl, MatchArm, Param,
+    Pattern, Program, Stmt, StructDecl, StructField, TraitDecl, TraitMethodDef, Type,
+    TypeAliasDecl, Use,
 };
 use crate::token::{Span, Token};
 
@@ -19,6 +20,8 @@ pub struct Parser<'a> {
     type_aliases: HashMap<String, (Vec<String>, Type)>,
     struct_names: HashSet<String>,
     enum_names: HashSet<String>,
+    /// When true, `Ident { ... }` is NOT parsed as a struct literal.
+    suppress_struct_lit: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -30,6 +33,7 @@ impl<'a> Parser<'a> {
             type_aliases: HashMap::new(),
             struct_names: HashSet::new(),
             enum_names: HashSet::new(),
+            suppress_struct_lit: false,
         }
     }
 
@@ -1515,7 +1519,7 @@ impl<'a> Parser<'a> {
                 let name = name.clone();
                 self.advance();
                 // Check for struct literal: Name { field: expr, ... }
-                if *self.peek_token() == Token::LBrace {
+                if *self.peek_token() == Token::LBrace && !self.suppress_struct_lit {
                     return self.parse_struct_lit(&name);
                 }
                 // Check for qualified path: ident :: ident
@@ -1668,6 +1672,7 @@ impl<'a> Parser<'a> {
             Token::If => self.parse_if_expr(),
             Token::Loop => self.parse_loop_expr(),
             Token::While => self.parse_while_expr(),
+            Token::Match => self.parse_match_expr(),
             _ => {
                 let default = (Token::Eof, Span::empty(0));
                 let (_, span) = self.current().unwrap_or(&default);
@@ -1681,6 +1686,40 @@ impl<'a> Parser<'a> {
 
     fn parse_if_expr(&mut self) -> Result<Expr, ParseError> {
         self.expect(&Token::If)?;
+
+        // Check for `if let` pattern matching
+        if *self.peek_token() == Token::Let {
+            self.advance(); // consume `let`
+            let pattern = self.parse_pattern()?;
+            self.expect(&Token::Eq)?;
+            self.suppress_struct_lit = true;
+            let scrutinee = self.parse_expr()?;
+            self.suppress_struct_lit = false;
+            let then_block = self.parse_block()?;
+            let mut else_block = None;
+            if *self.peek_token() == Token::Else {
+                self.advance();
+                if *self.peek_token() == Token::If {
+                    // `else if` / `else if let` — recursively parse
+                    let elif = self.parse_if_expr()?;
+                    else_block = Some(Block {
+                        stmts: vec![Stmt::Expr(elif)],
+                        tail_expr: None,
+                        span: Span::empty(0),
+                    });
+                } else {
+                    else_block = Some(self.parse_block()?);
+                }
+            }
+            return Ok(Expr::IfLet {
+                pattern,
+                scrutinee: Box::new(scrutinee),
+                then_block,
+                else_block,
+            });
+        }
+
+        // Regular `if` expression
         let cond = self.parse_expr()?;
         let then_block = self.parse_block()?;
         let mut else_ifs = Vec::new();
@@ -1730,6 +1769,165 @@ impl<'a> Parser<'a> {
             cond: Box::new(cond),
             body,
         })
+    }
+
+    /// Parse a `match` expression: `match expr { arm, ... }`
+    fn parse_match_expr(&mut self) -> Result<Expr, ParseError> {
+        self.expect(&Token::Match)?;
+        self.suppress_struct_lit = true;
+        let scrutinee = self.parse_expr()?;
+        self.suppress_struct_lit = false;
+        self.expect(&Token::LBrace)?;
+        let mut arms = Vec::new();
+        while *self.peek_token() != Token::RBrace && *self.peek_token() != Token::Eof {
+            arms.push(self.parse_match_arm()?);
+            // Optional trailing comma
+            if *self.peek_token() == Token::Comma {
+                self.advance();
+            }
+        }
+        self.expect(&Token::RBrace)?;
+        Ok(Expr::Match {
+            scrutinee: Box::new(scrutinee),
+            arms,
+        })
+    }
+
+    /// Parse one match arm: `Pattern (if guard)? => (expr | block)`
+    fn parse_match_arm(&mut self) -> Result<MatchArm, ParseError> {
+        let pattern = self.parse_pattern()?;
+        // Optional `if` guard
+        let guard = if *self.peek_token() == Token::If {
+            self.advance();
+            let cond = self.parse_expr()?;
+            Some(Box::new(cond))
+        } else {
+            None
+        };
+        self.expect(&Token::FatArrow)?;
+        // Body can be a block or a single expression
+        let body = if *self.peek_token() == Token::LBrace {
+            self.parse_block()?
+        } else {
+            let expr = self.parse_expr()?;
+            // Require trailing comma after expression body
+            if *self.peek_token() == Token::Comma {
+                self.advance();
+            }
+            Block {
+                stmts: vec![],
+                tail_expr: Some(Box::new(expr)),
+                span: Span::empty(0),
+            }
+        };
+        Ok(MatchArm {
+            pattern,
+            guard,
+            body,
+        })
+    }
+
+    /// Parse a pattern for `if let` and `match` arms.
+    fn parse_pattern(&mut self) -> Result<Pattern, ParseError> {
+        match self.peek_token() {
+            Token::Underscore => {
+                self.advance();
+                Ok(Pattern::Wildcard)
+            }
+            Token::True => {
+                self.advance();
+                Ok(Pattern::BoolLit(true))
+            }
+            Token::False => {
+                self.advance();
+                Ok(Pattern::BoolLit(false))
+            }
+            Token::IntLit(n) => {
+                let n = *n;
+                self.advance();
+                Ok(Pattern::IntLit(n))
+            }
+            Token::IntSuffixLit(n, _) => {
+                let n = *n;
+                self.advance();
+                Ok(Pattern::IntLit(n))
+            }
+            Token::Ident(name) => {
+                let name = name.clone();
+                self.advance();
+                self.parse_pattern_ident_rest(name)
+            }
+            _ => {
+                let default = (Token::Eof, Span::empty(0));
+                let (_, span) = self.current().unwrap_or(&default);
+                Err(ParseError {
+                    span: *span,
+                    msg: format!("expected pattern, found {:?}", self.peek_token()),
+                })
+            }
+        }
+    }
+
+    /// Continue parsing a pattern after seeing an identifier.
+    fn parse_pattern_ident_rest(&mut self, name: String) -> Result<Pattern, ParseError> {
+        // Check for `::` — qualified enum variant: `Option::Some(x)`
+        if *self.peek_token() == Token::DoubleColon {
+            self.advance();
+            let variant = match self.peek_token() {
+                Token::Ident(s) => {
+                    let s = s.clone();
+                    self.advance();
+                    s
+                }
+                _ => {
+                    let default = (Token::Eof, Span::empty(0));
+                    let (_, span) = self.current().unwrap_or(&default);
+                    return Err(ParseError {
+                        span: *span,
+                        msg: "expected variant name after '::'".to_string(),
+                    });
+                }
+            };
+            let payload = if *self.peek_token() == Token::LParen {
+                self.advance();
+                if *self.peek_token() == Token::RParen {
+                    self.advance();
+                    None
+                } else {
+                    let inner = self.parse_pattern()?;
+                    self.expect(&Token::RParen)?;
+                    Some(Box::new(inner))
+                }
+            } else {
+                None
+            };
+            return Ok(Pattern::EnumVariant {
+                enum_name: Some(name),
+                variant,
+                payload,
+            });
+        }
+        // Check for `(` — unqualified tuple-like enum variant: `Some(x)`
+        if *self.peek_token() == Token::LParen {
+            self.advance();
+            if *self.peek_token() == Token::RParen {
+                self.advance();
+                return Ok(Pattern::EnumVariant {
+                    enum_name: None,
+                    variant: name,
+                    payload: None,
+                });
+            }
+            let inner = self.parse_pattern()?;
+            self.expect(&Token::RParen)?;
+            return Ok(Pattern::EnumVariant {
+                enum_name: None,
+                variant: name,
+                payload: Some(Box::new(inner)),
+            });
+        }
+        // Simple binding: `x`
+        Ok(Pattern::Binding(name))
     }
 
     fn peek_token(&self) -> &Token {

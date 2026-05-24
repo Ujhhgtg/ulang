@@ -1,0 +1,11 @@
+enum Color {
+    Red,
+}
+
+fn main() {
+    let c = Color::Red;
+    let code = match c {
+        Color::Red => { 1 },
+    };
+    let _x = code;
+}

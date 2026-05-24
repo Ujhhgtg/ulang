@@ -1,0 +1,51 @@
+use std::io::println;
+use std::option::Option;
+
+enum Color {
+    Red,
+    Green,
+    Blue,
+}
+
+fn main() {
+    // Test 1: if let with Option::Some
+    let opt = Option::Some(42);
+    if let Option::Some(x) = opt {
+        println(x);
+    } else {
+        println(0);
+    };
+
+    // Test 2: if let with Option::None
+    let none: Option<i32> = Option::None;
+    if let Option::Some(x) = none {
+        println(99);
+    } else {
+        println(1);
+    };
+
+    // Test 3: match on Option with both arms
+    let val = Option::Some(100);
+    let result = match val {
+        Option::Some(v) => { v + 1 },
+        Option::None => { 0 },
+    };
+    println(result);
+
+    // Test 4: match on simple enum (unit variants)
+    let c = Color::Green;
+    let code = match c {
+        Color::Red => { 1 },
+        Color::Green => { 2 },
+        Color::Blue => { 3 },
+    };
+    println(code);
+
+    // Test 5: wildcard in match
+    let n = 5;
+    match n {
+        1 => { println(100); },
+        5 => { println(200); },
+        _ => { println(300); },
+    };
+}

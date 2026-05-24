@@ -71,6 +71,9 @@ impl<'a> Lexer<'a> {
                 if self.current_char() == Some('=') {
                     self.advance();
                     Token::EqEq
+                } else if self.current_char() == Some('>') {
+                    self.advance();
+                    Token::FatArrow
                 } else {
                     Token::Eq
                 }
@@ -193,6 +196,7 @@ impl<'a> Lexer<'a> {
                     "else" => Token::Else,
                     "loop" => Token::Loop,
                     "while" => Token::While,
+                    "match" => Token::Match,
                     "return" => Token::Return,
                     "enum" => Token::Enum,
                     "struct" => Token::Struct,

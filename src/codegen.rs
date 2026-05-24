@@ -16,7 +16,8 @@ use inkwell::values::{AnyValue, BasicMetadataValueEnum, BasicValueEnum, PointerV
 use inkwell::attributes::Attribute;
 
 use crate::ast::{
-    BinOp, Block, EnumDecl, Expr, Function, ImplDecl, Program, Stmt, StructDecl, StructField, Type,
+    BinOp, Block, EnumDecl, Expr, Function, ImplDecl, MatchArm, Pattern, Program, Stmt,
+    StructDecl, StructField, Type,
 };
 
 use crate::token::Span;
@@ -1224,6 +1225,27 @@ impl<'ctx> CodeGen<'ctx> {
                 *cond = cond_box;
                 Self::m_substitute_block(body, params, args);
             }
+            Expr::IfLet {
+                scrutinee,
+                then_block,
+                else_block,
+                ..
+            } => {
+                Self::m_substitute_types_in_expr(scrutinee, params, args);
+                Self::m_substitute_block(then_block, params, args);
+                if let Some(eb) = else_block {
+                    Self::m_substitute_block(eb, params, args);
+                }
+            }
+            Expr::Match { scrutinee, arms } => {
+                Self::m_substitute_types_in_expr(scrutinee, params, args);
+                for arm in arms.iter_mut() {
+                    if let Some(ref mut guard) = arm.guard {
+                        Self::m_substitute_types_in_expr(guard, params, args);
+                    }
+                    Self::m_substitute_block(&mut arm.body, params, args);
+                }
+            }
             Expr::Assign { target, value } => {
                 Self::m_substitute_types_in_expr(target, params, args);
                 Self::m_substitute_types_in_expr(value, params, args);
@@ -1379,6 +1401,7 @@ impl<'ctx> CodeGen<'ctx> {
             Self::collect_from_types(std::slice::from_ref(ret), &mut instances, &mut seen);
         }
         Self::collect_from_block(&func.body, &mut instances, &mut seen);
+        Self::collect_enum_lits_from_block(&func.body, &mut instances, &mut seen);
 
         instances
     }
@@ -1451,6 +1474,11 @@ impl<'ctx> CodeGen<'ctx> {
             Self::collect_from_block(&func.body, &mut instances, &mut seen);
         }
 
+        // Scan for generic enum literals (e.g., Option::Some(42) needs Option<i32>)
+        for func in &program.funcs {
+            Self::collect_enum_lits_from_block(&func.body, &mut instances, &mut seen);
+        }
+
         // Scan structs
         for decl in &program.structs {
             let field_types: Vec<Type> = decl.fields.iter().map(|f| f.ty.clone()).collect();
@@ -1502,6 +1530,116 @@ impl<'ctx> CodeGen<'ctx> {
         }
         Self::resolve_self_type(func, self_type);
         Self::m_substitute_block(&mut func.body, impl_params, args);
+    }
+
+    /// Scan a block for generic enum literals that need monomorphization.
+    fn collect_enum_lits_from_block(
+        block: &Block,
+        instances: &mut Vec<(String, Vec<Type>)>,
+        seen: &mut HashSet<String>,
+    ) {
+        for stmt in &block.stmts {
+            match stmt {
+                Stmt::Let { init, .. } | Stmt::Const { init, .. } => {
+                    Self::collect_enum_lits_from_expr(init, instances, seen);
+                }
+                Stmt::Expr(expr) => {
+                    Self::collect_enum_lits_from_expr(expr, instances, seen);
+                }
+                Stmt::Return { value, .. } => {
+                    if let Some(expr) = value {
+                        Self::collect_enum_lits_from_expr(expr, instances, seen);
+                    }
+                }
+            }
+        }
+        if let Some(ref tail) = block.tail_expr {
+            Self::collect_enum_lits_from_expr(tail, instances, seen);
+        }
+    }
+
+    /// Recursively scan an expression for generic enum literals.
+    fn collect_enum_lits_from_expr(
+        expr: &Expr,
+        instances: &mut Vec<(String, Vec<Type>)>,
+        seen: &mut HashSet<String>,
+    ) {
+        match expr {
+            Expr::EnumLit {
+                enum_name, payload, ..
+            } => {
+                if let Some(payload_expr) = payload {
+                    let payload_ty = Self::literal_type(payload_expr);
+                    // Only for primitive payloads (skip type params like T)
+                    if Self::is_concrete_type(&payload_ty) {
+                        let key =
+                            Self::mangle_generic_instance(enum_name, &[payload_ty.clone()]);
+                        if seen.insert(key) {
+                            instances.push((enum_name.clone(), vec![payload_ty]));
+                        }
+                    }
+                }
+            }
+            Expr::If {
+                cond,
+                then_block,
+                else_ifs,
+                else_block,
+            } => {
+                Self::collect_enum_lits_from_expr(cond, instances, seen);
+                Self::collect_enum_lits_from_block(then_block, instances, seen);
+                for (econd, eblock) in else_ifs {
+                    Self::collect_enum_lits_from_expr(econd, instances, seen);
+                    Self::collect_enum_lits_from_block(eblock, instances, seen);
+                }
+                if let Some(eb) = else_block {
+                    Self::collect_enum_lits_from_block(eb, instances, seen);
+                }
+            }
+            Expr::IfLet {
+                scrutinee,
+                then_block,
+                else_block,
+                ..
+            } => {
+                Self::collect_enum_lits_from_expr(scrutinee, instances, seen);
+                Self::collect_enum_lits_from_block(then_block, instances, seen);
+                if let Some(eb) = else_block {
+                    Self::collect_enum_lits_from_block(eb, instances, seen);
+                }
+            }
+            Expr::Match { scrutinee, arms } => {
+                Self::collect_enum_lits_from_expr(scrutinee, instances, seen);
+                for arm in arms {
+                    if let Some(guard) = &arm.guard {
+                        Self::collect_enum_lits_from_expr(guard, instances, seen);
+                    }
+                    Self::collect_enum_lits_from_block(&arm.body, instances, seen);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Check if a type is concrete (not a type parameter).
+    fn is_concrete_type(ty: &Type) -> bool {
+        matches!(
+            ty,
+            Type::Bool
+                | Type::I8
+                | Type::I16
+                | Type::I32
+                | Type::I64
+                | Type::U8
+                | Type::U16
+                | Type::U32
+                | Type::U64
+                | Type::Usize
+                | Type::Isize
+                | Type::F32
+                | Type::F64
+                | Type::Str
+        )
     }
 
     /// Ensure a generic struct/enum instance is monomorphized.
@@ -1609,12 +1747,19 @@ impl<'ctx> CodeGen<'ctx> {
 
                 // Recursively monomorphize any GenericInstance types
                 let body_instances = Self::collect_generic_instances_from_method(&method_func);
+                // Save our monomorphized_names entry — recursive calls may overwrite it
+                let saved_name = self.monomorphized_names.get(base_name).cloned();
                 for (sub_base, sub_args) in &body_instances {
                     if self.generic_struct_defs.contains_key(sub_base)
                         || self.generic_enum_defs.contains_key(sub_base)
                     {
                         self.ensure_monomorphized(sub_base, sub_args)?;
                     }
+                }
+                // Restore our own monomorphized_names entry
+                if let Some(ref saved) = saved_name {
+                    self.monomorphized_names
+                        .insert(base_name.to_string(), saved.clone());
                 }
 
                 // Declare and compile
@@ -2138,6 +2283,30 @@ impl<'ctx> CodeGen<'ctx> {
                     })
                     .unwrap_or(Type::I32)
             }
+            Expr::IfLet {
+                then_block,
+                else_block,
+                ..
+            } => {
+                // Result type from then/else blocks
+                then_block
+                    .tail_expr
+                    .as_ref()
+                    .map(|e| self.expr_type(e))
+                    .or_else(|| {
+                        else_block
+                            .as_ref()
+                            .and_then(|b| b.tail_expr.as_ref().map(|e| self.expr_type(e)))
+                    })
+                    .unwrap_or(Type::Unit)
+            }
+            Expr::Match { arms, .. } => {
+                // Result type from first arm (all arms must have same type)
+                arms.first()
+                    .and_then(|arm| arm.body.tail_expr.as_ref())
+                    .map(|e| self.expr_type(e))
+                    .unwrap_or(Type::Unit)
+            }
             Expr::Call { callee, args } => {
                 // Handle __builtin_size_of intrinsic
                 if callee == "__builtin_size_of" && args.len() == 1 {
@@ -2205,12 +2374,44 @@ impl<'ctx> CodeGen<'ctx> {
                     rhs_ty
                 }
             }
-            Expr::EnumLit { enum_name, .. } => {
-                let actual_name = self
-                    .monomorphized_names
-                    .get(enum_name.as_str())
-                    .cloned()
-                    .unwrap_or_else(|| enum_name.clone());
+            Expr::EnumLit {
+                enum_name,
+                payload,
+                ..
+            } => {
+                let actual_name: String;
+                if let Some(payload_expr) = payload {
+                    if self.generic_enum_defs.contains_key(enum_name.as_str()) {
+                        let payload_ty = self.expr_type(payload_expr);
+                        if Self::is_concrete_type(&payload_ty) {
+                            let mangled =
+                                Self::mangle_generic_instance(enum_name, &[payload_ty]);
+                            if self.struct_types.contains_key(&mangled) {
+                                actual_name = mangled;
+                            } else {
+                                actual_name = self
+                                    .monomorphized_names
+                                    .get(enum_name.as_str())
+                                    .cloned()
+                                    .unwrap_or(mangled);
+                            }
+                        } else {
+                            actual_name = self
+                                .monomorphized_names
+                                .get(enum_name.as_str())
+                                .cloned()
+                                .unwrap_or_else(|| enum_name.clone());
+                        }
+                    } else {
+                        actual_name = enum_name.clone();
+                    }
+                } else {
+                    actual_name = self
+                        .monomorphized_names
+                        .get(enum_name.as_str())
+                        .cloned()
+                        .unwrap_or_else(|| enum_name.clone());
+                }
                 Type::Struct(actual_name)
             }
             Expr::Index { array, .. } => {
@@ -4104,11 +4305,44 @@ impl<'ctx> CodeGen<'ctx> {
                 variant,
                 payload,
             } => {
-                let actual_name = self
-                    .monomorphized_names
-                    .get(enum_name.as_str())
-                    .cloned()
-                    .unwrap_or_else(|| enum_name.clone());
+                // Compute the actual type name. For generic enums with a payload,
+                // derive from the payload type (e.g., Option::Some(42) → Option__i32).
+                // Avoid monomorphized_names because it's a global map that gets
+                // overwritten by recursive monomorphization.
+                let actual_name = if let Some(payload_expr) = payload {
+                    if self.generic_enum_defs.contains_key(enum_name.as_str()) {
+                        let payload_ty = self.expr_type(payload_expr);
+                        if Self::is_concrete_type(&payload_ty) {
+                            let mangled =
+                                Self::mangle_generic_instance(enum_name, &[payload_ty]);
+                            // If the mangled type exists, use it.
+                            // Otherwise fall back to monomorphized_names
+                            // (recursive monomorphization hasn't run yet).
+                            if self.struct_types.contains_key(&mangled) {
+                                mangled
+                            } else {
+                                self.monomorphized_names
+                                    .get(enum_name.as_str())
+                                    .cloned()
+                                    .unwrap_or(mangled)
+                            }
+                        } else {
+                            // Non-concrete payload (e.g., type param in generic fn).
+                            // Fall back to monomorphized_names.
+                            self.monomorphized_names
+                                .get(enum_name.as_str())
+                                .cloned()
+                                .unwrap_or_else(|| enum_name.clone())
+                        }
+                    } else {
+                        enum_name.clone()
+                    }
+                } else {
+                    self.monomorphized_names
+                        .get(enum_name.as_str())
+                        .cloned()
+                        .unwrap_or_else(|| enum_name.clone())
+                };
                 let struct_type = self
                     .struct_types
                     .get(&actual_name)
@@ -4161,6 +4395,471 @@ impl<'ctx> CodeGen<'ctx> {
                 match result {
                     inkwell::values::AggregateValueEnum::StructValue(sv) => Ok(sv.into()),
                     _ => Err(format!("expected struct value for enum '{}'", enum_name)),
+                }
+            }
+            Expr::IfLet {
+                pattern,
+                scrutinee,
+                then_block,
+                else_block,
+            } => self.compile_if_let(pattern, scrutinee, then_block, else_block),
+            Expr::Match { scrutinee, arms } => self.compile_match(scrutinee, arms),
+        }
+    }
+
+    /// Compile `if let` pattern matching.
+    fn compile_if_let(
+        &mut self,
+        pattern: &Pattern,
+        scrutinee: &Expr,
+        then_block: &Block,
+        else_block: &Option<Block>,
+    ) -> Result<BasicValueEnum<'ctx>, String> {
+        let scrutinee_val = self.compile_expr(scrutinee)?;
+        let scrutinee_ty = self.expr_type(scrutinee);
+        let result_type = then_block
+            .tail_expr
+            .as_ref()
+            .map(|e| self.expr_type(e))
+            .or_else(|| {
+                else_block
+                    .as_ref()
+                    .and_then(|b| b.tail_expr.as_ref().map(|e| self.expr_type(e)))
+            })
+            .unwrap_or(Type::Unit);
+        let result_llvm_ty = self.type_to_llvm(&result_type);
+
+        let parent_fn = self
+            .builder
+            .get_insert_block()
+            .unwrap()
+            .get_parent()
+            .unwrap();
+
+        // Allocate result slot
+        let result_alloca = self
+            .builder
+            .build_alloca(result_llvm_ty, "if_let_result")
+            .map_err(|e| format!("failed to build if_let result alloca: {}", e))?;
+
+        // Generate pattern match check
+        let (matches_val, bindings) =
+            self.gen_pattern_check(pattern, scrutinee_val, &scrutinee_ty)?;
+
+        let then_bb = self.context.append_basic_block(parent_fn, "if_let_then");
+        let else_bb = self.context.append_basic_block(parent_fn, "if_let_else");
+        let merge_bb = self.context.append_basic_block(parent_fn, "if_let_merge");
+
+        self.builder
+            .build_conditional_branch(matches_val, then_bb, else_bb)
+            .map_err(|e| format!("failed to build if_let branch: {}", e))?;
+
+        // === Then block: bind variables, execute body ===
+        self.builder.position_at_end(then_bb);
+        for (name, ptr, ty) in &bindings {
+            self.symbols
+                .insert(name.clone(), (*ptr, false, ty.clone()));
+        }
+        if let Some(val) = self.compile_block_get_value(then_block)? {
+            self.builder
+                .build_store(result_alloca, val)
+                .map_err(|e| format!("failed to store if_let then result: {}", e))?;
+        }
+        // Remove bindings after then block (they're scoped)
+        for (name, _, _) in &bindings {
+            self.symbols.remove(name);
+        }
+        if self
+            .builder
+            .get_insert_block()
+            .unwrap()
+            .get_terminator()
+            .is_none()
+        {
+            self.builder
+                .build_unconditional_branch(merge_bb)
+                .map_err(|e| format!("failed to branch from if_let then: {}", e))?;
+        }
+
+        // === Else block ===
+        self.builder.position_at_end(else_bb);
+        if let Some(el_block) = else_block {
+            if let Some(val) = self.compile_block_get_value(el_block)? {
+                self.builder
+                    .build_store(result_alloca, val)
+                    .map_err(|e| format!("failed to store if_let else result: {}", e))?;
+            }
+        }
+        if self
+            .builder
+            .get_insert_block()
+            .unwrap()
+            .get_terminator()
+            .is_none()
+        {
+            self.builder
+                .build_unconditional_branch(merge_bb)
+                .map_err(|e| format!("failed to branch from if_let else: {}", e))?;
+        }
+
+        // === Merge ===
+        self.builder.position_at_end(merge_bb);
+        if result_type == Type::Unit {
+            let unit_ty = self.context.struct_type(&[], false);
+            Ok(unit_ty.get_undef().into())
+        } else {
+            let result = self
+                .builder
+                .build_load(result_llvm_ty, result_alloca, "if_let_result")
+                .map_err(|e| format!("failed to load if_let result: {}", e))?;
+            Ok(result)
+        }
+    }
+
+    /// Compile `match` expression with sequential arm checking.
+    fn compile_match(
+        &mut self,
+        scrutinee: &Expr,
+        arms: &[MatchArm],
+    ) -> Result<BasicValueEnum<'ctx>, String> {
+        let scrutinee_val = self.compile_expr(scrutinee)?;
+        let scrutinee_ty = self.expr_type(scrutinee);
+        let result_type = arms
+            .first()
+            .and_then(|arm| arm.body.tail_expr.as_ref())
+            .map(|e| self.expr_type(e))
+            .unwrap_or(Type::Unit);
+        let result_llvm_ty = self.type_to_llvm(&result_type);
+
+        let parent_fn = self
+            .builder
+            .get_insert_block()
+            .unwrap()
+            .get_parent()
+            .unwrap();
+
+        let result_alloca = self
+            .builder
+            .build_alloca(result_llvm_ty, "match_result")
+            .map_err(|e| format!("failed to build match result alloca: {}", e))?;
+
+        let merge_bb = self.context.append_basic_block(parent_fn, "match_merge");
+        let mut prev_bb: Option<inkwell::basic_block::BasicBlock<'ctx>> = None;
+
+        for (i, arm) in arms.iter().enumerate() {
+            let is_last = i == arms.len() - 1;
+
+            // Create basic blocks for this arm
+            let check_bb = self.context.append_basic_block(parent_fn, &format!("match_check_{}", i));
+            let body_bb = self.context.append_basic_block(parent_fn, &format!("match_body_{}", i));
+
+            // If previous arm didn't branch here, branch from previous fallthrough
+            if let Some(_bb) = prev_bb {
+                if self.builder.get_insert_block().unwrap().get_terminator().is_none() {
+                    self.builder
+                        .build_unconditional_branch(check_bb)
+                        .map_err(|e| format!("failed to branch to match_check_{}: {}", i, e))?;
+                }
+            }
+
+            // Position at check block
+            self.builder.position_at_end(check_bb);
+
+            // Generate pattern match check
+            let (mut matches_val, bindings) =
+                self.gen_pattern_check(&arm.pattern, scrutinee_val, &scrutinee_ty)?;
+
+            // Apply guard if present
+            if let Some(ref guard) = arm.guard {
+                let guard_val = self.compile_expr(guard)?;
+                let guard_i1 = match guard_val {
+                    BasicValueEnum::IntValue(v) => {
+                        if v.get_type().get_bit_width() != 1 {
+                            self.builder
+                                .build_int_truncate(v, self.bool_type, "guard_i1")
+                                .map_err(|e| format!("failed to trunc guard: {}", e))?
+                        } else {
+                            v
+                        }
+                    }
+                    _ => {
+                        return Err("match guard must be a boolean".to_string());
+                    }
+                };
+                matches_val = self
+                    .builder
+                    .build_and(matches_val, guard_i1, "guard_and_match")
+                    .map_err(|e| format!("failed to build guard and: {}", e))?;
+            }
+
+            if is_last {
+                // Last arm: if matches → body, else → merge (no match = no value)
+                self.builder
+                    .build_conditional_branch(matches_val, body_bb, merge_bb)
+                    .map_err(|e| format!("failed to build last match branch: {}", e))?;
+            } else {
+                let next_check =
+                    self.context
+                        .append_basic_block(parent_fn, &format!("match_check_{}", i + 1));
+                self.builder
+                    .build_conditional_branch(matches_val, body_bb, next_check)
+                    .map_err(|e| format!("failed to build match branch: {}", e))?;
+            }
+
+            // Compile arm body
+            self.builder.position_at_end(body_bb);
+            for (name, ptr, ty) in &bindings {
+                self.symbols
+                    .insert(name.clone(), (*ptr, false, ty.clone()));
+            }
+            if let Some(val) = self.compile_block_get_value(&arm.body)? {
+                self.builder
+                    .build_store(result_alloca, val)
+                    .map_err(|e| format!("failed to store match arm result: {}", e))?;
+            }
+            for (name, _, _) in &bindings {
+                self.symbols.remove(name);
+            }
+            if self
+                .builder
+                .get_insert_block()
+                .unwrap()
+                .get_terminator()
+                .is_none()
+            {
+                self.builder
+                    .build_unconditional_branch(merge_bb)
+                    .map_err(|e| format!("failed to branch from match arm: {}", e))?;
+            }
+
+            prev_bb = Some(body_bb);
+        }
+
+        // === Merge ===
+        self.builder.position_at_end(merge_bb);
+        if result_type == Type::Unit {
+            let unit_ty = self.context.struct_type(&[], false);
+            Ok(unit_ty.get_undef().into())
+        } else {
+            let result = self
+                .builder
+                .build_load(result_llvm_ty, result_alloca, "match_result")
+                .map_err(|e| format!("failed to load match result: {}", e))?;
+            Ok(result)
+        }
+    }
+
+    /// Generate LLVM IR for pattern matching against a value.
+    /// Returns (matches: i1, bindings: Vec<(name, alloca_ptr, type)>).
+    fn gen_pattern_check(
+        &mut self,
+        pattern: &Pattern,
+        scrutinee_val: BasicValueEnum<'ctx>,
+        scrutinee_ty: &Type,
+    ) -> Result<
+        (
+            inkwell::values::IntValue<'ctx>,
+            Vec<(
+                String,
+                inkwell::values::PointerValue<'ctx>,
+                Type,
+            )>,
+        ),
+        String,
+    > {
+        match pattern {
+            Pattern::Wildcard => Ok((
+                self.bool_type.const_int(1, false),
+                Vec::new(),
+            )),
+            Pattern::Binding(name) => {
+                // Create alloca for the binding and store the scrutinee value
+                let llvm_ty = self.type_to_llvm(scrutinee_ty);
+                let alloca = self
+                    .builder
+                    .build_alloca(llvm_ty, &format!("bind_{}", name))
+                    .map_err(|e| format!("failed to build binding alloca: {}", e))?;
+                self.builder
+                    .build_store(alloca, scrutinee_val)
+                    .map_err(|e| format!("failed to store binding: {}", e))?;
+                Ok((
+                    self.bool_type.const_int(1, false),
+                    vec![(name.clone(), alloca, scrutinee_ty.clone())],
+                ))
+            }
+            Pattern::IntLit(n) => {
+                // Compare scrutinee (must be integer) with literal
+                let scrutinee_int = match scrutinee_val {
+                    BasicValueEnum::IntValue(v) => v,
+                    _ => return Err("integer pattern requires integer scrutinee".to_string()),
+                };
+                let lit_val = scrutinee_int
+                    .get_type()
+                    .const_int(*n as u64, true);
+                let cmp = self
+                    .builder
+                    .build_int_compare(
+                        inkwell::IntPredicate::EQ,
+                        scrutinee_int,
+                        lit_val,
+                        "pat_lit_cmp",
+                    )
+                    .map_err(|e| format!("failed to build literal pattern cmp: {}", e))?;
+                Ok((cmp, Vec::new()))
+            }
+            Pattern::BoolLit(b) => {
+                let scrutinee_int = match scrutinee_val {
+                    BasicValueEnum::IntValue(v) => v,
+                    _ => return Err("bool pattern requires integer scrutinee".to_string()),
+                };
+                let lit_val = scrutinee_int
+                    .get_type()
+                    .const_int(if *b { 1 } else { 0 }, false);
+                let cmp = self
+                    .builder
+                    .build_int_compare(
+                        inkwell::IntPredicate::EQ,
+                        scrutinee_int,
+                        lit_val,
+                        "pat_bool_cmp",
+                    )
+                    .map_err(|e| format!("failed to build bool pattern cmp: {}", e))?;
+                Ok((cmp, Vec::new()))
+            }
+            Pattern::EnumVariant {
+                enum_name: _,
+                variant,
+                payload,
+            } => {
+                // Derive the concrete enum type name from the scrutinee type.
+                let enum_type_name = match scrutinee_ty {
+                    Type::Struct(name) => {
+                        // For generic enums, the base name may need monomorphized lookup
+                        self.monomorphized_names
+                            .get(name.as_str())
+                            .cloned()
+                            .unwrap_or_else(|| name.clone())
+                    }
+                    Type::GenericInstance(name, args) => {
+                        Self::mangle_generic_instance(name, args)
+                    }
+                    Type::Ref { inner, .. } => match inner.as_ref() {
+                        Type::Struct(name) => self
+                            .monomorphized_names
+                            .get(name.as_str())
+                            .cloned()
+                            .unwrap_or_else(|| name.clone()),
+                        Type::GenericInstance(name, args) => {
+                            Self::mangle_generic_instance(name, args)
+                        }
+                        _ => {
+                            return Err(format!(
+                                "cannot pattern-match on type {:?}",
+                                scrutinee_ty
+                            ));
+                        }
+                    },
+                    _ => {
+                        return Err(format!(
+                            "cannot pattern-match on type {:?}",
+                            scrutinee_ty
+                        ));
+                    }
+                };
+
+                // Look up variant index from enum definition
+                let decl = self
+                    .enum_defs
+                    .get(&enum_type_name)
+                    .ok_or_else(|| format!("unknown enum '{}'", enum_type_name))?;
+                let variant_idx = decl
+                    .variants
+                    .iter()
+                    .position(|v| v.name == *variant)
+                    .ok_or_else(|| {
+                        format!(
+                            "unknown variant '{}' in enum '{}'",
+                            variant, enum_type_name
+                        )
+                    })? as u64;
+
+                // Extract the tag field from the scrutinee
+                let scrutinee_struct = match scrutinee_val {
+                    BasicValueEnum::StructValue(sv) => sv,
+                    _ => {
+                        return Err(
+                            "enum pattern matching requires struct scrutinee".to_string()
+                        );
+                    }
+                };
+                let tag_val = self
+                    .builder
+                    .build_extract_value(scrutinee_struct, 0, "enum_tag")
+                    .map_err(|e| format!("failed to extract enum tag: {}", e))?;
+                let tag_int = match tag_val {
+                    BasicValueEnum::IntValue(v) => v,
+                    _ => return Err("enum tag is not an integer".to_string()),
+                };
+
+                // Compare tag with variant index
+                let tag_matches = self
+                    .builder
+                    .build_int_compare(
+                        inkwell::IntPredicate::EQ,
+                        tag_int,
+                        self.context.i8_type().const_int(variant_idx, false),
+                        "tag_cmp",
+                    )
+                    .map_err(|e| format!("failed to build tag compare: {}", e))?;
+
+                let mut bindings = Vec::new();
+
+                // If variant has payload, extract it and match inner pattern
+                if let Some(inner_pattern) = payload {
+                    // Find the payload field index and type (clone to end immutable borrow)
+                    let (payload_field_idx, payload_ty) = {
+                        let fields = self
+                            .struct_fields
+                            .get(&enum_type_name)
+                            .ok_or_else(|| format!("unknown enum '{}'", enum_type_name))?;
+                        let payload_field_name = format!("__{}", variant);
+                        let idx = fields
+                            .iter()
+                            .position(|f| f.name == payload_field_name)
+                            .ok_or_else(|| {
+                                format!(
+                                    "payload field '{}' not found in enum '{}'",
+                                    payload_field_name, enum_type_name
+                                )
+                            })? as u32;
+                        (idx, fields[idx as usize].ty.clone())
+                    };
+
+                    // Extract the payload value
+                    let payload_val = self
+                        .builder
+                        .build_extract_value(
+                            scrutinee_struct,
+                            payload_field_idx,
+                            &format!("__{}", variant),
+                        )
+                        .map_err(|e| format!("failed to extract enum payload: {}", e))?;
+
+                    // Recursively match inner pattern against the payload
+                    let (inner_matches, inner_bindings) =
+                        self.gen_pattern_check(inner_pattern, payload_val, &payload_ty)?;
+
+                    // Combine: tag matches AND inner pattern matches
+                    let combined = self
+                        .builder
+                        .build_and(tag_matches, inner_matches, "pat_and")
+                        .map_err(|e| format!("failed to build pattern and: {}", e))?;
+
+                    bindings.extend(inner_bindings);
+                    Ok((combined, bindings))
+                } else {
+                    // Unit variant: just tag comparison
+                    Ok((tag_matches, bindings))
                 }
             }
         }

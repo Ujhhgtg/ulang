@@ -189,6 +189,9 @@ pub enum Token {
     Gt,   // >
     Le,   // <=
     Ge,   // >=
+    // Pattern matching
+    Match,
+    FatArrow, // =>
     // Special
     Eof,
 }

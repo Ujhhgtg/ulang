@@ -185,6 +185,16 @@ pub enum Expr {
         array: Box<Expr>,
         index: Box<Expr>,
     },
+    IfLet {
+        pattern: Pattern,
+        scrutinee: Box<Expr>,
+        then_block: Block,
+        else_block: Option<Block>,
+    },
+    Match {
+        scrutinee: Box<Expr>,
+        arms: Vec<MatchArm>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -270,4 +280,34 @@ pub struct ImplDecl {
     pub trait_name: Option<String>,
     pub type_params: Vec<String>,
     pub methods: Vec<Function>,
+}
+
+/// A pattern for destructuring in `if let` and `match`.
+#[derive(Debug, Clone)]
+pub enum Pattern {
+    /// `_` — matches anything, binds nothing
+    Wildcard,
+    /// `x` — matches anything, binds value to `x`
+    Binding(String),
+    /// `VariantName` or `VariantName(inner)` — matches an enum variant
+    EnumVariant {
+        /// Optional enum name qualifier: `Option` in `Option::Some(x)`, `None` when inferred
+        enum_name: Option<String>,
+        variant: String,
+        /// Payload pattern; `None` for unit variants
+        payload: Option<Box<Pattern>>,
+    },
+    /// Integer literal pattern: `42`
+    IntLit(i64),
+    /// Boolean literal pattern: `true`, `false`
+    BoolLit(bool),
+}
+
+/// An arm of a `match` expression.
+#[derive(Debug, Clone)]
+pub struct MatchArm {
+    pub pattern: Pattern,
+    /// Optional `if` guard condition
+    pub guard: Option<Box<Expr>>,
+    pub body: Block,
 }

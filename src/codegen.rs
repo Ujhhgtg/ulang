@@ -15,7 +15,9 @@ use inkwell::values::{AnyValue, BasicMetadataValueEnum, BasicValueEnum, PointerV
 
 use inkwell::attributes::Attribute;
 
-use crate::ast::{BinOp, Block, Expr, Function, Program, Stmt, StructDecl, StructField, Type};
+use crate::ast::{BinOp, Block, EnumDecl, Expr, Function, ImplDecl, Program, Stmt, StructDecl, StructField, Type};
+
+use crate::token::Span;
 
 type OverloadMap = HashMap<String, Vec<(String, Vec<Type>)>>;
 
@@ -49,6 +51,20 @@ pub struct CodeGen<'ctx> {
     fn_return_types: HashMap<String, Type>,
     // Maps function name -> declared parameter types
     fn_param_types: HashMap<String, Vec<Type>>,
+    // Generic struct definitions: base name -> StructDecl
+    generic_struct_defs: HashMap<String, StructDecl>,
+    // Generic enum definitions: base name -> EnumDecl
+    generic_enum_defs: HashMap<String, EnumDecl>,
+    // Enum definitions: name -> EnumDecl
+    enum_defs: HashMap<String, EnumDecl>,
+    // Generic impl blocks: base name -> Vec<(type_params, ImplDecl)>
+    generic_impls: HashMap<String, Vec<(Vec<String>, ImplDecl)>>,
+    // Set of already-monomorphized concrete instance names
+    monomorphized: HashSet<String>,
+    // Current monomorphization context: (base_name, mangled_name)
+    current_monomorphization: Option<(String, String)>,
+    // Maps base_name -> mangled_name for all monomorphized instances
+    monomorphized_names: HashMap<String, String>,
 }
 
 impl<'ctx> CodeGen<'ctx> {
@@ -82,6 +98,13 @@ impl<'ctx> CodeGen<'ctx> {
             trait_impls: HashMap::new(),
             fn_return_types: HashMap::new(),
             fn_param_types: HashMap::new(),
+            enum_defs: HashMap::new(),
+            generic_enum_defs: HashMap::new(),
+            generic_struct_defs: HashMap::new(),
+            generic_impls: HashMap::new(),
+            monomorphized: HashSet::new(),
+            current_monomorphization: None,
+            monomorphized_names: HashMap::new(),
             opt_level: opt,
         })
     }
@@ -113,11 +136,18 @@ impl<'ctx> CodeGen<'ctx> {
             trait_impls: HashMap::new(),
             fn_return_types: HashMap::new(),
             fn_param_types: HashMap::new(),
+            enum_defs: HashMap::new(),
+            generic_enum_defs: HashMap::new(),
+            generic_struct_defs: HashMap::new(),
+            generic_impls: HashMap::new(),
+            monomorphized: HashSet::new(),
+            current_monomorphization: None,
+            monomorphized_names: HashMap::new(),
             opt_level: opt,
         }
     }
 
-    /// Resolve `SelfType` to the actual struct type in a function's params and return type.
+    /// Resolve
     fn resolve_self_type(func: &mut Function, actual_type: &Type) {
         for param in &mut func.params {
             Self::resolve_type_self(&mut param.ty, actual_type);
@@ -447,6 +477,7 @@ impl<'ctx> CodeGen<'ctx> {
         }
         match ty {
             Type::Struct(name) => name.clone(),
+            Type::GenericInstance(name, _) => name.clone(),
             Type::Ref { inner, .. } => Self::type_to_mangled_name(inner),
             _ => panic!("unsupported type for trait method: {:?}", ty),
         }
@@ -1047,79 +1078,627 @@ impl<'ctx> CodeGen<'ctx> {
         Ok(())
     }
 
-    pub fn compile_module(&mut self, program: &Program) -> Result<(), String> {
-        // Phase 0: Declare struct types (opaque → set body)
+    /// Check if a type is a type parameter (single uppercase letter name).
+    fn is_type_param(ty: &Type) -> bool {
+        match ty {
+            Type::Struct(name) => {
+                name.len() == 1 && name.chars().next().map_or(false, |c| c.is_uppercase())
+            }
+            _ => false,
+        }
+    }
+
+    /// Mangle a generic instance name: BaseName__Arg1_Arg2_...
+    fn mangle_generic_instance(base_name: &str, args: &[Type]) -> String {
+        if args.is_empty() {
+            return format!("{}__", base_name);
+        }
+        let arg_strs: Vec<String> = args
+            .iter()
+            .map(|a| {
+                if let Some(prim) = Self::primitive_type_name(a) {
+                    prim.to_string()
+                } else {
+                    match a {
+                        Type::Struct(name) => name.clone(),
+                        Type::GenericInstance(name, inner_args) => {
+                            Self::mangle_generic_instance(name, inner_args)
+                        }
+                        Type::Ref { inner, .. } => format!("ref_{}", Self::mangle_generic_instance_inner(inner)),
+                        Type::Ptr { inner, .. } => format!("ptr_{}", Self::mangle_generic_instance_inner(inner)),
+                        _ => format!("{:?}", a),
+                    }
+                }
+            })
+            .collect();
+        format!("{}__{}", base_name, arg_strs.join("_"))
+    }
+
+    fn mangle_generic_instance_inner(ty: &Type) -> String {
+        if let Some(prim) = Self::primitive_type_name(ty) {
+            return prim.to_string();
+        }
+        match ty {
+            Type::Struct(name) => name.clone(),
+            Type::GenericInstance(name, args) => Self::mangle_generic_instance(name, args),
+            _ => format!("{:?}", ty),
+        }
+    }
+
+    /// Recursively substitute type params in an expression's Cast types.
+    fn m_substitute_types_in_expr(expr: &mut Box<Expr>, params: &[String], args: &[Type]) {
+        match expr.as_mut() {
+            Expr::Cast { to_type, .. } => {
+                // substitute_type_params is on Parser, need to call it via our own method
+            }
+            Expr::Call { args: call_args, .. }
+            | Expr::QualifiedCall { args: call_args, .. } => {
+                for arg in call_args.iter_mut() {
+                    let mut inner = Box::new(arg.clone());
+                    Self::m_substitute_types_in_expr(&mut inner, params, args);
+                    *arg = *inner;
+                }
+            }
+            Expr::EnumLit {
+                enum_name,
+                payload,
+                ..
+            } => {
+                if let Some(pos) = params.iter().position(|p| p == enum_name) {
+                    if let Some(Type::GenericInstance(base, _)) = args.get(pos) {
+                        *enum_name = base.clone();
+                    } else if let Some(arg) = args.get(pos) {
+                        if let Some(name) = Self::primitive_type_name(arg) {
+                            *enum_name = name.to_string();
+                        }
+                    }
+                }
+                if let Some(inner) = payload {
+                    let mut boxed = Box::new((**inner).clone());
+                    Self::m_substitute_types_in_expr(&mut boxed, params, args);
+                    **inner = *boxed;
+                }
+            }
+            Expr::Binary { lhs, rhs, .. } => {
+                Self::m_substitute_types_in_expr(lhs, params, args);
+                Self::m_substitute_types_in_expr(rhs, params, args);
+            }
+            Expr::UnaryNot(inner) => {
+                Self::m_substitute_types_in_expr(inner, params, args);
+            }
+            Expr::If {
+                cond,
+                then_block,
+                else_ifs,
+                else_block,
+            } => {
+                let mut cond_box = Box::new((**cond).clone());
+                Self::m_substitute_types_in_expr(&mut cond_box, params, args);
+                *cond = cond_box;
+                Self::m_substitute_block(then_block, params, args);
+                for (elif_cond, elif_block) in else_ifs.iter_mut() {
+                    let mut ec = Box::new(elif_cond.clone());
+                    Self::m_substitute_types_in_expr(&mut ec, params, args);
+                    *elif_cond = *ec;
+                    Self::m_substitute_block(elif_block, params, args);
+                }
+                if let Some(eb) = else_block {
+                    Self::m_substitute_block(eb, params, args);
+                }
+            }
+            Expr::Loop { body } => {
+                Self::m_substitute_block(body, params, args);
+            }
+            Expr::While { cond, body } => {
+                let mut cond_box = Box::new((**cond).clone());
+                Self::m_substitute_types_in_expr(&mut cond_box, params, args);
+                *cond = cond_box;
+                Self::m_substitute_block(body, params, args);
+            }
+            Expr::Assign { target, value } => {
+                Self::m_substitute_types_in_expr(target, params, args);
+                Self::m_substitute_types_in_expr(value, params, args);
+            }
+            Expr::Ref { expr: inner, .. } => {
+                Self::m_substitute_types_in_expr(inner, params, args);
+            }
+            Expr::Deref(inner) => {
+                Self::m_substitute_types_in_expr(inner, params, args);
+            }
+            Expr::Member { expr: inner, .. } => {
+                Self::m_substitute_types_in_expr(inner, params, args);
+            }
+            Expr::MethodCall {
+                expr: receiver,
+                args: call_args,
+                ..
+            } => {
+                Self::m_substitute_types_in_expr(receiver, params, args);
+                for arg in call_args.iter_mut() {
+                    let mut inner = Box::new(arg.clone());
+                    Self::m_substitute_types_in_expr(&mut inner, params, args);
+                    *arg = *inner;
+                }
+            }
+            Expr::Tuple(elems) => {
+                for elem in elems.iter_mut() {
+                    let mut inner = Box::new(elem.clone());
+                    Self::m_substitute_types_in_expr(&mut inner, params, args);
+                    *elem = *inner;
+                }
+            }
+            Expr::StructLit {
+                struct_name,
+                fields,
+                ..
+            } => {
+                if let Some(pos) = params.iter().position(|p| p == struct_name) {
+                    if let Some(Type::GenericInstance(base, _)) = args.get(pos) {
+                        *struct_name = base.clone();
+                    } else if let Some(arg) = args.get(pos) {
+                        if let Some(name) = Self::primitive_type_name(arg) {
+                            *struct_name = name.to_string();
+                        }
+                    }
+                }
+                for (_, expr) in fields.iter_mut() {
+                    let mut inner = Box::new(expr.clone());
+                    Self::m_substitute_types_in_expr(&mut inner, params, args);
+                    *expr = *inner;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Substitute type params in a block (let type annotations, expression casts).
+    fn m_substitute_block(block: &mut Block, params: &[String], args: &[Type]) {
+        for stmt in &mut block.stmts {
+            match stmt {
+                Stmt::Let {
+                    type_ann, init, ..
+                } => {
+                    if let Some(ty) = type_ann {
+                        Self::substitute_type_params(ty, params, args);
+                    }
+                    let mut expr_box = Box::new(init.clone());
+                    Self::m_substitute_types_in_expr(&mut expr_box, params, args);
+                    *init = *expr_box;
+                }
+                Stmt::Const {
+                    type_ann, init, ..
+                } => {
+                    if let Some(ty) = type_ann {
+                        Self::substitute_type_params(ty, params, args);
+                    }
+                    let mut expr_box = Box::new(init.clone());
+                    Self::m_substitute_types_in_expr(&mut expr_box, params, args);
+                    *init = *expr_box;
+                }
+                Stmt::Expr(expr) => {
+                    let mut expr_box = Box::new(expr.clone());
+                    Self::m_substitute_types_in_expr(&mut expr_box, params, args);
+                    *expr = *expr_box;
+                }
+                Stmt::Return { value, .. } => {
+                    if let Some(inner) = value {
+                        let mut expr_box = Box::new((**inner).clone());
+                        Self::m_substitute_types_in_expr(&mut expr_box, params, args);
+                        **inner = *expr_box;
+                    }
+                }
+            }
+        }
+        if let Some(tail) = &mut block.tail_expr {
+            let mut expr_box = Box::new((**tail).clone());
+            Self::m_substitute_types_in_expr(&mut expr_box, params, args);
+            **tail = *expr_box;
+        }
+    }
+
+    /// Substitute type params in a Type value.
+    fn substitute_type_params(ty: &mut Type, params: &[String], args: &[Type]) {
+        match ty {
+            Type::Struct(name) => {
+                if let Some(pos) = params.iter().position(|p| p == name)
+                    && let Some(arg) = args.get(pos)
+                {
+                    *ty = arg.clone();
+                }
+            }
+            Type::Ref { inner, .. } | Type::Ptr { inner, .. } => {
+                Self::substitute_type_params(inner, params, args);
+            }
+            Type::Tuple(elems) => {
+                for elem in elems.iter_mut() {
+                    Self::substitute_type_params(elem, params, args);
+                }
+            }
+            Type::GenericInstance(name, gen_args) => {
+                // Substitute in the args
+                for arg in gen_args.iter_mut() {
+                    Self::substitute_type_params(arg, params, args);
+                }
+            }
+            Type::Alias(_, alias_args) => {
+                for arg in alias_args.iter_mut() {
+                    Self::substitute_type_params(arg, params, args);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Collect GenericInstance from a method's params, return type, and body.
+    fn collect_generic_instances_from_method(
+        func: &Function,
+    ) -> Vec<(String, Vec<Type>)> {
+        let mut instances = Vec::new();
+        let mut seen = HashSet::new();
+
+        for param in &func.params {
+            Self::collect_from_types(&[param.ty.clone()], &mut instances, &mut seen);
+        }
+        if let Some(ref ret) = func.return_type {
+            Self::collect_from_types(&[ret.clone()], &mut instances, &mut seen);
+        }
+        Self::collect_from_block(&func.body, &mut instances, &mut seen);
+
+        instances
+    }
+
+    /// Collect GenericInstance from a block's expressions.
+    fn collect_from_block(
+        block: &Block,
+        instances: &mut Vec<(String, Vec<Type>)>,
+        seen: &mut HashSet<String>,
+    ) {
+        for stmt in &block.stmts {
+            match stmt {
+                Stmt::Let {
+                    type_ann: Some(ty), ..
+                }
+                | Stmt::Const {
+                    type_ann: Some(ty), ..
+                } => {
+                    Self::collect_from_types(&[ty.clone()], instances, seen);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Collect GenericInstance from a slice of types.
+    fn collect_from_types(
+        types: &[Type],
+        instances: &mut Vec<(String, Vec<Type>)>,
+        seen: &mut HashSet<String>,
+    ) {
+        for ty in types {
+            match ty {
+                Type::GenericInstance(name, args) => {
+                    // Skip instances with unresolved type params
+                    if args.iter().any(|a| Self::is_type_param(a)) {
+                        continue;
+                    }
+                    let key = Self::mangle_generic_instance(name, args);
+                    if seen.insert(key) {
+                        instances.push((name.clone(), args.clone()));
+                    }
+                }
+                Type::Ref { inner, .. } | Type::Ptr { inner, .. } => {
+                    Self::collect_from_types(&[inner.as_ref().clone()], instances, seen);
+                }
+                Type::Tuple(elems) => {
+                    Self::collect_from_types(elems, instances, seen);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Collect all Type::GenericInstance references from a program.
+    fn collect_generic_instances(program: &Program) -> Vec<(String, Vec<Type>)> {
+        let mut instances = Vec::new();
+        let mut seen = HashSet::new();
+
+        // Scan functions
+        for func in &program.funcs {
+            Self::collect_from_types(
+                &func.params.iter().map(|p| p.ty.clone()).collect::<Vec<_>>(),
+                &mut instances,
+                &mut seen,
+            );
+            if let Some(ref ret) = func.return_type {
+                Self::collect_from_types(&[ret.clone()], &mut instances, &mut seen);
+            }
+            Self::collect_from_block(&func.body, &mut instances, &mut seen);
+        }
+
+        // Scan structs
         for decl in &program.structs {
-            let struct_type = self.context.opaque_struct_type(&decl.name);
-            let field_types: Vec<BasicTypeEnum<'ctx>> = decl
+            let field_types: Vec<Type> = decl.fields.iter().map(|f| f.ty.clone()).collect();
+            Self::collect_from_types(&field_types, &mut instances, &mut seen);
+        }
+
+        // Scan enums
+        for decl in &program.enums {
+            let variant_types: Vec<Type> = decl.variants.iter().filter_map(|v| v.ty.clone()).collect();
+            Self::collect_from_types(&variant_types, &mut instances, &mut seen);
+        }
+
+        // Scan impls
+        for decl in &program.impls {
+            Self::collect_from_types(&[decl.impl_type.clone()], &mut instances, &mut seen);
+            for method in &decl.methods {
+                Self::collect_from_types(
+                    &method.params.iter().map(|p| p.ty.clone()).collect::<Vec<_>>(),
+                    &mut instances,
+                    &mut seen,
+                );
+                if let Some(ref ret) = method.return_type {
+                    Self::collect_from_types(&[ret.clone()], &mut instances, &mut seen);
+                }
+                Self::collect_from_block(&method.body, &mut instances, &mut seen);
+            }
+        }
+
+        instances
+    }
+
+    /// Monomorphize a generic method by substituting type params and resolving SelfType.
+    fn monomorphize_method(
+        func: &mut Function,
+        impl_params: &[String],
+        args: &[Type],
+        self_type: &Type,
+    ) {
+        for param in &mut func.params {
+            Self::substitute_type_params(&mut param.ty, impl_params, args);
+        }
+        if let Some(ref mut ret_ty) = func.return_type {
+            Self::substitute_type_params(ret_ty, impl_params, args);
+        }
+        Self::resolve_self_type(func, self_type);
+        Self::m_substitute_block(&mut func.body, impl_params, args);
+    }
+
+    /// Ensure a generic struct/enum instance is monomorphized.
+    fn ensure_monomorphized(&mut self, base_name: &str, args: &[Type]) -> Result<(), String> {
+        let mangled = Self::mangle_generic_instance(base_name, args);
+        if self.monomorphized.contains(&mangled) {
+            return Ok(());
+        }
+        self.monomorphized.insert(mangled.clone());
+        self.monomorphized_names.insert(base_name.to_string(), mangled.clone());
+
+        // 1a. Create concrete LLVM struct type (generic struct)
+        if let Some(decl) = self.generic_struct_defs.get(base_name) {
+            let param_names: Vec<String> = decl.type_params.clone();
+            let substituted_fields: Vec<StructField> = decl
                 .fields
+                .iter()
+                .map(|f| {
+                    let mut ty = f.ty.clone();
+                    Self::substitute_type_params(&mut ty, &param_names, args);
+                    StructField {
+                        name: f.name.clone(),
+                        ty,
+                        span: f.span,
+                    }
+                })
+                .collect();
+
+            let struct_type = self.context.opaque_struct_type(&mangled);
+            let field_types: Vec<BasicTypeEnum<'ctx>> = substituted_fields
                 .iter()
                 .map(|f| self.type_to_llvm(&f.ty))
                 .collect();
             struct_type.set_body(&field_types, false);
-            self.struct_fields
-                .insert(decl.name.clone(), decl.fields.clone());
-            self.struct_types.insert(decl.name.clone(), struct_type);
+            self.struct_fields.insert(mangled.clone(), substituted_fields);
+            self.struct_types.insert(mangled.clone(), struct_type);
         }
 
+        // 1b. Create concrete LLVM struct type (generic enum)
+        if let Some(decl) = self.generic_enum_defs.get(base_name) {
+            let param_names: Vec<String> = decl.type_params.clone();
+            let mut substituted_fields: Vec<StructField> = vec![StructField {
+                name: "__tag".to_string(),
+                ty: Type::I8,
+                span: Span::empty(0),
+            }];
+            for variant in &decl.variants {
+                if let Some(ref payload_ty) = variant.ty {
+                    let mut ty = payload_ty.clone();
+                    Self::substitute_type_params(&mut ty, &param_names, args);
+                    substituted_fields.push(StructField {
+                        name: format!("__{}", variant.name),
+                        ty,
+                        span: Span::empty(0),
+                    });
+                }
+            }
+            let struct_type = self.context.opaque_struct_type(&mangled);
+            let field_types: Vec<BasicTypeEnum<'ctx>> = substituted_fields
+                .iter()
+                .map(|f| self.type_to_llvm(&f.ty))
+                .collect();
+            struct_type.set_body(&field_types, false);
+            self.struct_fields.insert(mangled.clone(), substituted_fields);
+            self.struct_types.insert(mangled.clone(), struct_type);
+            // Register concrete enum in enum_defs for variant lookup
+            let mut concrete_decl = decl.clone();
+            concrete_decl.name = mangled.clone();
+            for variant in &mut concrete_decl.variants {
+                if let Some(ref mut payload_ty) = variant.ty {
+                    Self::substitute_type_params(payload_ty, &param_names, args);
+                }
+            }
+            self.enum_defs.insert(mangled.clone(), concrete_decl);
+        }
+
+        // 2. Compile generic impl methods for this concrete instance
+        let impl_blocks: Vec<(Vec<String>, ImplDecl)> = self
+            .generic_impls
+            .get(base_name)
+            .cloned()
+            .unwrap_or_default();
+        let self_type = Type::GenericInstance(base_name.to_string(), args.to_vec());
+
+        self.current_monomorphization = Some((base_name.to_string(), mangled.clone()));
+
+        for (impl_params, impl_decl) in &impl_blocks {
+            for method in &impl_decl.methods {
+                let mut method_func = method.clone();
+
+                // Substitute type params in the method
+                Self::monomorphize_method(
+                    &mut method_func,
+                    impl_params,
+                    args,
+                    &self_type,
+                );
+
+                // Compute mangled name
+                let mangled_method = format!(
+                    "{}::{}/{}",
+                    mangled,
+                    method_func.name,
+                    method_func.params.len()
+                );
+                method_func.name = mangled_method.clone();
+
+                // Recursively monomorphize any GenericInstance types
+                let body_instances = Self::collect_generic_instances_from_method(
+                    &method_func,
+                );
+                for (sub_base, sub_args) in &body_instances {
+                    if self.generic_struct_defs.contains_key(sub_base)
+                        || self.generic_enum_defs.contains_key(sub_base)
+                    {
+                        self.ensure_monomorphized(sub_base, sub_args)?;
+                    }
+                }
+
+                // Declare and compile
+                self.declare_function(&method_func)?;
+                self.compile_function_body(&method_func)?;
+
+                // Register in impl_methods
+                self.impl_methods
+                    .entry(mangled.clone())
+                    .or_default()
+                    .push((method.name.clone(), mangled_method));
+            }
+        }
+
+        self.current_monomorphization = None;
+        Ok(())
+    }
+
+
+    pub fn compile_module(&mut self, program: &Program) -> Result<(), String> {
+        // Phase 0: Create opaque struct types for ALL structs/enums
+        for decl in &program.structs {
+            if !decl.type_params.is_empty() {
+                self.generic_struct_defs.insert(decl.name.clone(), decl.clone());
+                self.impl_methods.entry(decl.name.clone()).or_default();
+            }
+            let struct_type = self.context.opaque_struct_type(&decl.name);
+            self.struct_fields.insert(decl.name.clone(), decl.fields.clone());
+            self.struct_types.insert(decl.name.clone(), struct_type);
+        }
+        for decl in &program.enums {
+            if !decl.type_params.is_empty() {
+                self.generic_enum_defs.insert(decl.name.clone(), decl.clone());
+                self.impl_methods.entry(decl.name.clone()).or_default();
+            }
+            let mut fields: Vec<StructField> = vec![StructField {
+                name: "__tag".to_string(), ty: Type::I8, span: Span::empty(0),
+            }];
+            for variant in &decl.variants {
+                if let Some(ref payload_ty) = variant.ty {
+                    fields.push(StructField {
+                        name: format!("__{}", variant.name), ty: payload_ty.clone(), span: Span::empty(0),
+                    });
+                }
+            }
+            self.enum_defs.insert(decl.name.clone(), decl.clone());
+            let struct_type = self.context.opaque_struct_type(&decl.name);
+            self.struct_fields.insert(decl.name.clone(), fields);
+            self.struct_types.insert(decl.name.clone(), struct_type);
+        }
         // Phase 0.25: Generate builtin trait implementations for primitives
         self.generate_primitive_trait_impls()?;
-
-        // Phase 0.5: Process impl blocks and declare impl methods
+        // Phase 0.5: Separate generic impls, process non-generic ones
         for decl in &program.impls {
             let type_name = match &decl.impl_type {
                 Type::Struct(name) => name.clone(),
+                Type::GenericInstance(name, _) => name.clone(),
                 Type::SelfType => "Self".to_string(),
-                _ => {
-                    return Err(format!(
-                        "impl target must be a struct type or Self, got {:?}",
-                        decl.impl_type
-                    ));
-                }
+                _ => return Err(format!("impl target must be a struct type or Self, got {:?}", decl.impl_type)),
             };
+            if !decl.type_params.is_empty() {
+                self.generic_impls.entry(type_name).or_default().push((decl.type_params.clone(), decl.clone()));
+                continue;
+            }
             for method in &decl.methods {
                 let mangled_name = if let Some(ref trait_name) = decl.trait_name {
                     format!("__trait_{}_{}_{}", trait_name, method.name, type_name)
                 } else {
                     format!("{}::{}/{}", type_name, method.name, method.params.len())
                 };
-
-                // Declare the method function
                 let mut method_func = method.clone();
                 method_func.name = mangled_name.clone();
                 self.declare_function(&method_func)?;
-
-                // Register in impl_methods
-                self.impl_methods
-                    .entry(type_name.clone())
-                    .or_default()
-                    .push((method.name.clone(), mangled_name));
+                self.impl_methods.entry(type_name.clone()).or_default().push((method.name.clone(), mangled_name));
             }
         }
-
-        // Phase 0.75: Process #[derive(...)] on structs
-        for decl in &program.structs {
-            self.process_struct_derives(decl, program)?;
-        }
-
         // Phase 1: Declare all functions
-        for func in &program.funcs {
-            self.declare_function(func)?;
+        for func in &program.funcs { self.declare_function(func)?; }
+        // Phase 0.6: Discover and monomorphize all needed generic instances
+        let generic_instances = Self::collect_generic_instances(program);
+        for (base_name, args) in &generic_instances {
+            if self.generic_struct_defs.contains_key(base_name) || self.generic_enum_defs.contains_key(base_name) {
+                self.ensure_monomorphized(base_name, args)?;
+            }
         }
-
+        // Phase 0.65: Set struct bodies for non-generic structs/enums
+        for decl in &program.structs {
+            if !decl.type_params.is_empty() { continue; }
+            if let Some(st) = self.struct_types.get(&decl.name) {
+                let ft: Vec<BasicTypeEnum<'ctx>> = decl.fields.iter().map(|f| self.type_to_llvm(&f.ty)).collect();
+                st.set_body(&ft, false);
+            }
+        }
+        for decl in &program.enums {
+            if !decl.type_params.is_empty() { continue; }
+            if let Some(st) = self.struct_types.get(&decl.name) {
+                let fields = self.struct_fields.get(&decl.name).unwrap();
+                let ft: Vec<BasicTypeEnum<'ctx>> = fields.iter().map(|f| self.type_to_llvm(&f.ty)).collect();
+                st.set_body(&ft, false);
+            }
+        }
+        // Phase 0.75: Process #[derive(...)] (non-generic only)
+        for decl in &program.structs {
+            if decl.type_params.is_empty() { self.process_struct_derives(decl, program)?; }
+        }
+        for decl in &program.enums {
+            if decl.type_params.is_empty() {
+                let f = self.struct_fields.get(&decl.name).cloned().unwrap_or_default();
+                let sd = StructDecl { name: decl.name.clone(), fields: f, type_params: vec![], attribs: decl.attribs.clone(), span: decl.span };
+                self.process_struct_derives(&sd, program)?;
+            }
+        }
         // Phase 2: Compile bodies for non-extern functions
         for func in &program.funcs {
-            if !func.is_extern {
-                self.compile_function_body(func)?;
-            }
+            if !func.is_extern { self.compile_function_body(func)?; }
         }
-
-        // Phase 2b: Compile impl method bodies
+        // Phase 2b: Compile non-generic impl method bodies
         for decl in &program.impls {
+            if !decl.type_params.is_empty() { continue; }
             let type_name = match &decl.impl_type {
-                Type::Struct(name) => name.clone(),
-                Type::SelfType => "Self".to_string(),
-                _ => continue,
+                Type::Struct(name) => name.clone(), Type::SelfType => "Self".to_string(), _ => continue,
             };
             let self_type = Type::Struct(type_name.clone());
             for method in &decl.methods {
@@ -1128,18 +1707,14 @@ impl<'ctx> CodeGen<'ctx> {
                 } else {
                     format!("{}::{}/{}", type_name, method.name, method.params.len())
                 };
-
                 let mut method_func = method.clone();
                 method_func.name = mangled_name;
-                // Resolve SelfType to the actual struct type
                 Self::resolve_self_type(&mut method_func, &self_type);
                 self.compile_function_body(&method_func)?;
             }
         }
-
         Ok(())
     }
-
     pub fn jit_run(&mut self, program: &Program) -> Result<i32, String> {
         self.compile_module(program)?;
 
@@ -1256,9 +1831,17 @@ impl<'ctx> CodeGen<'ctx> {
                     )
                 })
                 .into(),
-            Type::SelfType => {
-                panic!("SelfType used outside of impl context");
+            Type::GenericInstance(name, args) => {
+                let mangled = Self::mangle_generic_instance(name, args);
+                self.struct_types.get(&mangled).copied().unwrap_or_else(|| {
+                    self.struct_types.get(name).copied().unwrap_or_else(|| {
+                        panic!("unknown generic struct instance '{}' — known types: {:?}",
+                            mangled, self.struct_types.keys().collect::<Vec<_>>())
+                    })
+                }).into()
             }
+            Type::Alias(_, _) => { panic!("Type::Alias should have been resolved before codegen"); }
+            Type::SelfType => { panic!("SelfType used outside of impl context"); }
         }
     }
 
@@ -1475,6 +2058,7 @@ impl<'ctx> CodeGen<'ctx> {
                     rhs_ty
                 }
             }
+            Expr::EnumLit { enum_name, .. } => Type::Struct(enum_name.clone()),
             _ => Self::literal_type(expr),
         }
     }
@@ -1525,6 +2109,7 @@ impl<'ctx> CodeGen<'ctx> {
                 Type::Usize
             }
             Expr::StructLit { struct_name, .. } => Type::Struct(struct_name.clone()),
+            Expr::EnumLit { enum_name, .. } => Type::Struct(enum_name.clone()),
             Expr::Binary {
                 op: BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge,
                 ..
@@ -2748,6 +3333,46 @@ impl<'ctx> CodeGen<'ctx> {
                 let unit_ty = self.context.struct_type(&[], false);
                 Ok(unit_ty.get_undef().into())
             }
+            Expr::UnaryNot(inner_expr) => {
+                let val = self.compile_expr(inner_expr)?;
+                match val {
+                    BasicValueEnum::IntValue(v) => {
+                        Ok(self.builder.build_not(v, "not").map_err(|e| format!("failed to build unary not: {}", e))?.into())
+                    }
+                    _ => Err("unary ! requires integer operand".to_string()),
+                }
+            }
+            Expr::Deref(expr) => {
+                let ptr_val = self.compile_expr(expr)?;
+                let ptr = ptr_val.into_pointer_value();
+                let pointee_ty = Self::literal_type(expr);
+                let pointee_llvm_ty = self.type_to_llvm(match &pointee_ty {
+                    Type::Ref { inner, .. } => inner, Type::Ptr { inner, .. } => inner, _ => &pointee_ty,
+                });
+                Ok(self.builder.build_load(pointee_llvm_ty, ptr, "deref").map_err(|e| format!("failed to build deref load: {}", e))?)
+            }
+            Expr::EnumLit { enum_name, variant, payload } => {
+                let actual_name = self.monomorphized_names.get(enum_name.as_str()).cloned().unwrap_or_else(|| enum_name.clone());
+                let struct_type = self.struct_types.get(&actual_name).copied().ok_or_else(|| format!("unknown enum type '{}'", actual_name))?;
+                let fields = self.struct_fields.get(enum_name).ok_or_else(|| format!("unknown enum '{}'", enum_name))?;
+                let payload_field_name = format!("__{}", variant);
+                let mut variant_idx = 0u32;
+                let mut payload_field_idx: Option<u32> = None;
+                for (idx, field) in fields.iter().enumerate() {
+                    if idx == 0 { continue; }
+                    if field.name == payload_field_name { variant_idx = (idx - 1) as u32; payload_field_idx = Some(idx as u32); break; }
+                }
+                let struct_val: inkwell::values::AggregateValueEnum<'ctx> = struct_type.get_undef().into();
+                let mut result = struct_val;
+                result = self.builder.build_insert_value(result, self.context.i8_type().const_int(variant_idx as u64, false), 0, "__tag")
+                    .map_err(|e| format!("failed to insert enum tag: {}", e))?;
+                if let Some(payload_expr) = payload && let Some(field_idx) = payload_field_idx {
+                    let payload_val = self.compile_expr(payload_expr)?;
+                    result = self.builder.build_insert_value(result, payload_val, field_idx, &payload_field_name)
+                        .map_err(|e| format!("failed to insert enum payload: {}", e))?;
+                }
+                match result { inkwell::values::AggregateValueEnum::StructValue(sv) => Ok(sv.into()), _ => Err(format!("expected struct value for enum '{}'", enum_name)) }
+            }
         }
     }
 
@@ -3055,7 +3680,7 @@ impl<'ctx> CodeGen<'ctx> {
                     }
                     Type::Ref { .. } => return Err("cannot cast to reference type".to_string()),
                     Type::Ptr { .. } => unreachable!(),
-                    Type::Struct(_) => return Err("cannot cast to struct type".to_string()),
+                    Type::Struct(_) | Type::GenericInstance(_, _) | Type::Alias(_, _) => return Err("cannot cast to struct type".to_string()),
                     Type::SelfType => return Err("cannot cast to Self type".to_string()),
                     // Bool caught by early return above, but keep for completeness
                     Type::Bool => 1,

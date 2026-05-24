@@ -1,38 +1,61 @@
-use std::vec::Vec;
+extern "C" {
+    fn malloc(size: usize) -> *mut u8;
+    fn realloc(ptr: *mut u8, new_size: usize) -> *mut u8;
+    fn free(ptr: *mut u8);
+    fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut u8;
+}
 
 struct String {
-    vec: Vec<u8>,
+    ptr: *mut u8,
+    len: usize,
+    cap: usize,
 }
 
 impl String {
     fn new() -> String {
-        String { vec: Vec::new() }
+        String { ptr: 0 as *mut u8, len: 0, cap: 0 }
     }
 
     fn with_capacity(cap: usize) -> String {
-        String { vec: Vec::with_capacity(cap) }
+        let ptr = if cap == 0 { 0 as *mut u8 } else { malloc(cap) };
+        String { ptr: ptr, len: 0, cap: cap }
     }
 
-    fn len(&self) -> usize { self.vec.len() }
-    fn capacity(&self) -> usize { self.vec.capacity() }
-    fn is_empty(&self) -> bool { self.vec.is_empty() }
+    fn len(&self) -> usize { self.len }
+    fn capacity(&self) -> usize { self.cap }
+    fn is_empty(&self) -> bool { self.len == 0 }
 
     fn clear(&mut self) {
-        self.vec.clear();
+        self.len = 0;
     }
 
     fn push_str(&mut self, s: &str) {
-        let mut i = 0;
-        while i < s.1 {
-            let byte = *((s.0 as usize + i) as *const u8);
-            self.vec.push(byte);
-            i = i + 1;
-        }
+        let new_len = self.len + s.1;
+        if new_len > self.cap {
+            let mut new_cap = if self.cap == 0 { 1 } else { self.cap * 2 };
+            if new_len > new_cap {
+                new_cap = new_len;
+            };
+            let new_ptr = if self.cap == 0 {
+                malloc(new_cap)
+            } else {
+                realloc(self.ptr, new_cap)
+            };
+            self.ptr = new_ptr;
+            self.cap = new_cap;
+        };
+        memcpy((self.ptr as usize + self.len) as *mut u8, s.0, s.1);
+        self.len = new_len;
     }
 
-    fn as_ptr(&self) -> *const u8 { self.vec.as_ptr() }
+    fn as_ptr(&self) -> *const u8 { self.ptr }
 
     fn drop(&mut self) {
-        // Vec::drop handles deallocation
+        if self.cap > 0 {
+            free(self.ptr);
+            self.ptr = 0 as *mut u8;
+            self.len = 0;
+            self.cap = 0;
+        };
     }
 }

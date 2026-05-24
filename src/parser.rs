@@ -1491,6 +1491,78 @@ impl<'a> Parser<'a> {
             let expr = self.parse_primary()?;
             return Ok(Expr::Deref(Box::new(expr)));
         }
+        let is_primitive_type = match self.peek_token() {
+            Token::Bool
+            | Token::I8
+            | Token::I16
+            | Token::I32
+            | Token::I64
+            | Token::U8
+            | Token::U16
+            | Token::U32
+            | Token::U64
+            | Token::Usize
+            | Token::Isize
+            | Token::F32
+            | Token::F64
+            | Token::Str => true,
+            _ => false,
+        };
+        if is_primitive_type
+            && self.tokens.get(self.pos + 1).map(|(t, _)| t) == Some(&Token::DoubleColon)
+        {
+            let type_token = self.peek_token().clone();
+            self.advance(); // consume the type keyword (e.g. i32)
+            self.advance(); // consume ::
+            let callee = match self.peek_token() {
+                Token::Ident(s) => {
+                    let s = s.clone();
+                    self.advance();
+                    s
+                }
+                _ => {
+                    let default = (Token::Eof, Span::empty(0));
+                    let (_, span) = self.current().unwrap_or(&default);
+                    return Err(ParseError {
+                        span: *span,
+                        msg: "expected identifier after '::'".to_string(),
+                    });
+                }
+            };
+            let type_str = match type_token {
+                Token::Bool => "bool",
+                Token::I8 => "i8",
+                Token::I16 => "i16",
+                Token::I32 => "i32",
+                Token::I64 => "i64",
+                Token::U8 => "u8",
+                Token::U16 => "u16",
+                Token::U32 => "u32",
+                Token::U64 => "u64",
+                Token::Usize => "usize",
+                Token::Isize => "isize",
+                Token::F32 => "f32",
+                Token::F64 => "f64",
+                Token::Str => "str",
+                _ => unreachable!(),
+            }
+            .to_string();
+
+            if *self.peek_token() == Token::LParen {
+                let args = self.parse_call_args()?;
+                return Ok(Expr::QualifiedCall {
+                    module: type_str,
+                    callee,
+                    args,
+                });
+            } else {
+                return Ok(Expr::QualifiedCall {
+                    module: type_str,
+                    callee,
+                    args: vec![],
+                });
+            }
+        }
         match self.peek_token() {
             Token::IntLit(val) => {
                 let val = *val;

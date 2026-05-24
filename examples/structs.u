@@ -26,7 +26,7 @@ trait Drawable {
 // Implement the trait for Point
 impl Drawable for Point {
     fn draw(&self) {
-        let _bg: i32 = 0i32.default();
+        let _bg: i32 = i32::default();
     }
 }
 
@@ -50,7 +50,7 @@ fn main() {
     println(cloned);
 
     // Builtin Default::default
-    let zero: i32 = 0i32.default();
+    let zero: i32 = i32::default();
     println(zero);
 
     // Trait method dispatch — calls Drawable::draw for Point

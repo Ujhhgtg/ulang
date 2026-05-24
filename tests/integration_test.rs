@@ -206,7 +206,7 @@ fn test_struct_method_call() {
 fn test_builtin_trait_methods() {
     assert!(run_test(
         "builtin_traits",
-        "fn main() {\n    let a: i32 = 42;\n    let b: i32 = 42;\n    a.eq(&b);\n    a.ne(&b);\n    a.cmp(&b);\n    a.clone();\n    a.default();\n}\n"
+        "fn main() {\n    let a: i32 = 42;\n    let b: i32 = 42;\n    a.eq(&b);\n    a.ne(&b);\n    a.cmp(&b);\n    a.clone();\n    i32::default();\n}\n"
     ));
 }
 
@@ -467,6 +467,66 @@ fn test_logical_and_or() {
             let a = x < 15 && y > 15;
             let b = x > 15 || y > 15;
             if a && b {
+                return 0;
+            };
+            return 1;
+        }"#
+    ));
+}
+
+#[test]
+fn test_command_stdlib() {
+    assert!(run_test(
+        "command_test",
+        r#"use std::process::Command;
+        fn main() -> i32 {
+            let mut cmd = Command::new("true");
+            let status = cmd.status();
+            if status == 0 {
+                let mut cmd_fail = Command::new("false");
+                let status_fail = cmd_fail.status();
+                if status_fail == 1 {
+                    let mut cmd_args = Command::new("ls");
+                    cmd_args.args(["-l", "-a"]);
+                    let status_args = cmd_args.status();
+                    if status_args == 0 {
+                        let mut cmd_spawn = Command::new("true");
+                        cmd_spawn.spawn();
+                        return 0;
+                    }
+                }
+            };
+            return 1;
+        }"#
+    ));
+}
+
+#[test]
+fn test_command_args_chaining() {
+    assert!(run_test(
+        "command_chaining",
+        r#"use std::process::Command;
+        fn main() -> i32 {
+            let mut cmd = Command::new("ls");
+            cmd.arg("-l").arg("-a");
+            let status = cmd.status();
+            if status == 0 {
+                return 0;
+            };
+            return 1;
+        }"#
+    ));
+}
+
+#[test]
+fn test_command_invalid_path() {
+    assert!(run_test(
+        "command_invalid",
+        r#"use std::process::Command;
+        fn main() -> i32 {
+            let mut cmd = Command::new("this_binary_does_not_exist_12345");
+            let status = cmd.status();
+            if status == 127 {
                 return 0;
             };
             return 1;

@@ -1,0 +1,22 @@
+use std::process::Command;
+use std::io::println;
+
+fn main() {
+    println("Running 'ls -l -a' using Command...");
+    
+    // Create a Command to run "ls -l -a"
+    let mut cmd = Command::new("ls");
+    cmd.args(["-l", "-a"]);
+
+    // Run the command and print its exit status (0 for success)
+    let status = cmd.status();
+    println("Exit status:");
+    println(status);
+
+    println("Spawning 'echo' in the background...");
+    
+    // Run another command in the background
+    let mut cmd2 = Command::new("echo");
+    cmd2.arg("Hello from spawned process!");
+    cmd2.spawn();
+}

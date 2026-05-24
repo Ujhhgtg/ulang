@@ -2179,8 +2179,12 @@ impl<'ctx> CodeGen<'ctx> {
                 };
                 if let Some(type_name) = type_name
                     && let Some(methods) = self.impl_methods.get(&type_name)
-                    && methods.iter().any(|(name, _)| name == method)
                 {
+                    if let Some((_, mangled)) = methods.iter().find(|(name, _)| name == method)
+                        && let Some(ret_ty) = self.fn_return_types.get(mangled)
+                    {
+                        return ret_ty.clone();
+                    }
                     // clone/default return Self, eq/ne return bool, cmp returns i32
                     if method == "clone" || method == "default" {
                         return receiver_type;
@@ -2188,7 +2192,9 @@ impl<'ctx> CodeGen<'ctx> {
                     if method == "eq" || method == "ne" {
                         return Type::Bool;
                     }
-                    return Type::I32;
+                    if methods.iter().any(|(name, _)| name == method) {
+                        return Type::I32;
+                    }
                 }
                 Self::literal_type(expr)
             }
@@ -2362,13 +2368,18 @@ impl<'ctx> CodeGen<'ctx> {
             } => {
                 let qualified_name = format!("{}::{}", module, callee);
                 let mangled_name = format!("{}::{}/{}", module, callee, args.len());
-                let name = if self.module.get_function(&qualified_name).is_some() {
+                let mut name = if self.module.get_function(&qualified_name).is_some() {
                     qualified_name
                 } else if self.module.get_function(&mangled_name).is_some() {
                     mangled_name
                 } else {
                     qualified_name
                 };
+                if let Some(methods) = self.impl_methods.get(module) {
+                    if let Some((_, mangled)) = methods.iter().find(|(name, _)| name == callee) {
+                        name = mangled.clone();
+                    }
+                }
                 self.fn_return_types
                     .get(&name)
                     .cloned()
@@ -3488,7 +3499,7 @@ impl<'ctx> CodeGen<'ctx> {
                     .get(module.as_str())
                     .map(|mangled| format!("{}::{}/{}", mangled, callee, args.len()));
                 // Try direct lookup first, then mangled name (for impl methods), then overload map
-                let fn_val = self
+                let mut resolved_fn_val = self
                     .module
                     .get_function(&qualified_name)
                     .or_else(|| self.module.get_function(&mangled_name))
@@ -3499,7 +3510,19 @@ impl<'ctx> CodeGen<'ctx> {
                     })
                     .or_else(|| self.resolve_function(&qualified_name, &arg_types))
                     .or_else(|| self.resolve_function(callee, &arg_types))
-                    .or_else(|| self.resolve_function(&mangled_name, &arg_types))
+                    .or_else(|| self.resolve_function(&mangled_name, &arg_types));
+
+                // If not resolved directly, try looking up in impl_methods
+                if resolved_fn_val.is_none() {
+                    if let Some(methods) = self.impl_methods.get(module) {
+                        if let Some((_, mangled)) = methods.iter().find(|(name, _)| name == callee)
+                        {
+                            resolved_fn_val = self.module.get_function(mangled);
+                        }
+                    }
+                }
+
+                let fn_val = resolved_fn_val
                     .ok_or_else(|| format!("unknown function '{}'", qualified_name))?;
                 let mut arg_values = self.compile_args_vec(args)?;
                 // Coerce arguments to match declared parameter types
@@ -6109,8 +6132,13 @@ mod tests {
 
     #[test]
     fn test_jit_builtin_default() {
+        assert_eq!(jit("fn main() { i32::default(); }").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_jit_static_method() {
         assert_eq!(
-            jit("fn main() { let x: i32 = 0i32; x.default(); }").unwrap(),
+            jit("fn main() { let x: i32 = i32::default(); }").unwrap(),
             0
         );
     }

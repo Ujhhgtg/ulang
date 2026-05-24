@@ -311,3 +311,59 @@ fn test_string_is_empty() {
         "use std::string::String;\nfn main() { let s = String::new(); s.is_empty(); }\n"
     ));
 }
+
+#[test]
+fn test_print_str() {
+    assert!(run_test(
+        "print_str",
+        "use std::io::println;\nfn main() { println(\"hello world\"); }\n"
+    ));
+}
+
+#[test]
+fn test_print_string() {
+    assert!(run_test(
+        "print_string",
+        "use std::io::println;\nuse std::string::String;\nfn main() { let mut s = String::new(); s.push_str(\"hello from String\"); println(s); }\n"
+    ));
+}
+
+#[test]
+fn test_print_string_utf8() {
+    assert!(run_test(
+        "print_string_utf8",
+        "use std::io::println;\nuse std::string::String;\nfn main() { let mut s = String::new(); s.push_str(\"héllo wörld 🌍\"); println(s); }\n"
+    ));
+}
+
+#[test]
+fn test_print_str_utf8() {
+    assert!(run_test(
+        "print_str_utf8",
+        "use std::io::println;\nfn main() { println(\"héllo wörld 🌍\"); }\n"
+    ));
+}
+
+#[test]
+fn test_panic_str() {
+    assert!(run_test_expect_error(
+        "panic_str",
+        "use std::panic::panic;\nfn main() { panic(\"something went wrong\"); }\n"
+    ));
+}
+
+#[test]
+fn test_panic_string() {
+    assert!(run_test_expect_error(
+        "panic_string",
+        "use std::string::String;\nuse std::panic::panic;\nfn main() { let mut s = String::new(); s.push_str(\"error occurred\"); panic(s); }\n"
+    ));
+}
+
+#[test]
+fn test_type_alias() {
+    assert!(run_test(
+        "type_alias",
+        "type Meters = i32; fn main() { let x: Meters = 42; }\n"
+    ));
+}

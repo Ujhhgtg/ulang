@@ -1,0 +1,71 @@
+extern "C" {
+    fn malloc(size: usize) -> *mut u8;
+    fn realloc(ptr: *mut u8, new_size: usize) -> *mut u8;
+    fn free(ptr: *mut u8);
+    fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut u8;
+}
+
+use std::option::Option;
+
+struct Vec<T> {
+    ptr: *mut u8,
+    len: usize,
+    cap: usize,
+}
+
+impl<T> Vec<T> {
+    fn new() -> Vec<T> {
+        Vec { ptr: 0 as *mut u8, len: 0, cap: 0 }
+    }
+
+    fn with_capacity(cap: usize) -> Vec<T> {
+        let ptr = if cap == 0 { 0 as *mut u8 } else { malloc(cap) };
+        Vec { ptr: ptr, len: 0, cap: cap }
+    }
+
+    fn len(&self) -> usize { self.len }
+    fn capacity(&self) -> usize { self.cap }
+    fn is_empty(&self) -> bool { self.len == 0 }
+
+    fn push(&mut self, elem: T) {
+        let elem_size = __builtin_size_of(elem);
+        if self.len == self.cap {
+            let new_cap = if self.cap == 0 { 1 } else { self.cap * 2 };
+            let new_size = new_cap * elem_size;
+            let new_ptr = if self.cap == 0 {
+                malloc(new_size)
+            } else {
+                realloc(self.ptr, new_size)
+            };
+            self.ptr = new_ptr;
+            self.cap = new_cap;
+        };
+        let dest = (self.ptr as usize + self.len * elem_size) as *mut T;
+        *dest = elem;
+        self.len = self.len + 1;
+    }
+
+    fn pop(&mut self) -> Option<T> {
+        if self.len == 0 {
+            Option { is_some: false, val: 0 as T }
+        } else {
+            self.len = self.len - 1;
+            let elem_size = __builtin_size_of(*(0 as *const T));
+            let src = (self.ptr as usize + self.len * elem_size) as *const T;
+            Option { is_some: true, val: *src }
+        }
+    }
+
+    fn clear(&mut self) { self.len = 0; }
+
+    fn as_ptr(&self) -> *const u8 { self.ptr }
+
+    fn drop(&mut self) {
+        if self.cap > 0 {
+            free(self.ptr);
+            self.ptr = 0 as *mut u8;
+            self.len = 0;
+            self.cap = 0;
+        };
+    }
+}

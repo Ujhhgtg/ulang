@@ -1,9 +1,16 @@
+use std::string::String;
+
 extern "C" {
     fn printf(fmt: *const i8, ...) -> i32;
     fn abort() -> !;
 }
 
-fn panic(msg: *const i8) -> ! {
-    printf("panicked: %s\n".0, msg);
+fn panic(msg: &str) -> ! {
+    printf("panicked: %.*s\n".0, msg.1 as i32, msg.0);
+    abort();
+}
+
+fn panic(s: String) -> ! {
+    printf("panicked: %.*s\n".0, s.len() as i32, s.as_ptr());
     abort();
 }

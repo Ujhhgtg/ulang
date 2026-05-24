@@ -1,63 +1,38 @@
-extern "C" {
-    fn malloc(size: usize) -> *mut u8;
-    fn realloc(ptr: *mut u8, new_size: usize) -> *mut u8;
-    fn free(ptr: *mut u8);
-    fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut u8;
-}
+use std::vec::Vec;
 
 struct String {
-    ptr: *mut u8,
-    len: usize,
-    cap: usize,
+    vec: Vec<u8>,
 }
 
 impl String {
     fn new() -> String {
-        String { ptr: 0 as *mut u8, len: 0, cap: 0 }
+        String { vec: Vec::new() }
     }
 
     fn with_capacity(cap: usize) -> String {
-        let ptr = if cap == 0 { 0 as *mut u8 } else { malloc(cap) };
-        String { ptr: ptr, len: 0, cap: cap }
+        String { vec: Vec::with_capacity(cap) }
     }
 
-    fn len(&self) -> usize {
-        self.len
-    }
-
-    fn capacity(&self) -> usize {
-        self.cap
-    }
-
-    fn is_empty(&self) -> bool {
-        self.len == 0
-    }
+    fn len(&self) -> usize { self.vec.len() }
+    fn capacity(&self) -> usize { self.vec.capacity() }
+    fn is_empty(&self) -> bool { self.vec.is_empty() }
 
     fn clear(&mut self) {
-        self.len = 0;
+        self.vec.clear();
     }
 
     fn push_str(&mut self, s: &str) {
-        let new_len = self.len + s.1;
-        if new_len > self.cap {
-            let ptr = malloc(new_len);
-            memcpy(ptr, self.ptr, self.len);
-            if self.cap > 0 {
-                free(self.ptr);
-            };
-            self.ptr = ptr;
-            self.cap = new_len;
-        };
-        memcpy((self.ptr as usize + self.len) as *mut u8, s.0, s.1);
-        self.len = new_len;
+        let mut i = 0;
+        while i < s.1 {
+            let byte = *((s.0 as usize + i) as *const u8);
+            self.vec.push(byte);
+            i = i + 1;
+        }
     }
 
+    fn as_ptr(&self) -> *const u8 { self.vec.as_ptr() }
+
     fn drop(&mut self) {
-        if self.cap > 0 {
-            free(self.ptr);
-            self.ptr = 0 as *mut u8;
-            self.len = 0;
-            self.cap = 0;
-        };
+        // Vec::drop handles deallocation
     }
 }

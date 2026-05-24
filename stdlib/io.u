@@ -1,3 +1,6 @@
+use std::string::String;
+use std::vec::Vec;
+
 extern "C" {
     fn printf(fmt: *const i8, ...) -> i32;
 }
@@ -11,9 +14,17 @@ fn println(x: i32) {
 }
 
 fn print(s: &str) {
-    printf("%s".0, s.0);
+    printf("%.*s".0, s.1 as i32, s.0);
 }
 
 fn println(s: &str) {
-    printf("%s\n".0, s.0);
+    printf("%.*s\n".0, s.1 as i32, s.0);
+}
+
+fn print(s: String) {
+    printf("%.*s".0, s.len() as i32, s.as_ptr());
+}
+
+fn println(s: String) {
+    printf("%.*s\n".0, s.len() as i32, s.as_ptr());
 }

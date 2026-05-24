@@ -1,0 +1,18 @@
+use std::panic::panic;
+
+struct Option<T> {
+    is_some: bool,
+    val: T,
+}
+
+impl<T> Option<T> {
+    fn is_some(&self) -> bool { self.is_some }
+    fn is_none(&self) -> bool { !self.is_some }
+    fn unwrap(&self) -> T {
+        if !self.is_some { panic("called `Option::unwrap()` on a `None` value"); };
+        self.val
+    }
+    fn unwrap_or(&self, default: T) -> T {
+        if self.is_some { self.val } else { default }
+    }
+}

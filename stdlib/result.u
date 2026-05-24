@@ -1,0 +1,20 @@
+use std::panic::panic;
+
+struct Result<T, E> {
+    is_ok: bool,
+    val: T,
+    err: E,
+}
+
+impl<T, E> Result<T, E> {
+    fn is_ok(&self) -> bool { self.is_ok }
+    fn is_err(&self) -> bool { !self.is_ok }
+    fn unwrap(&self) -> T {
+        if !self.is_ok { panic("called `Result::unwrap()` on an `Err` value"); };
+        self.val
+    }
+    fn unwrap_err(&self) -> E {
+        if self.is_ok { panic("called `Result::unwrap_err()` on an `Ok` value"); };
+        self.err
+    }
+}

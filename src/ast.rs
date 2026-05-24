@@ -14,8 +14,10 @@ pub struct Program {
     pub uses: Vec<Use>,
     pub funcs: Vec<Function>,
     pub structs: Vec<StructDecl>,
+    pub enums: Vec<EnumDecl>,
     pub traits: Vec<TraitDecl>,
     pub impls: Vec<ImplDecl>,
+    pub type_aliases: Vec<TypeAliasDecl>,
 }
 
 #[allow(dead_code)]
@@ -102,6 +104,8 @@ pub enum Type {
     Ptr { inner: Box<Type>, is_mut: bool },
     Ref { inner: Box<Type>, is_mut: bool },
     Struct(String),
+    GenericInstance(String, Vec<Type>),
+    Alias(String, Vec<Type>),
     SelfType,
 }
 
@@ -134,6 +138,7 @@ pub enum Expr {
         expr: Box<Expr>,
         is_mut: bool,
     },
+    UnaryNot(Box<Expr>),
     Deref(Box<Expr>),
     Cast {
         expr: Box<Expr>,
@@ -154,6 +159,11 @@ pub enum Expr {
     StructLit {
         struct_name: String,
         fields: Vec<(String, Expr)>,
+    },
+    EnumLit {
+        enum_name: String,
+        variant: String,
+        payload: Option<Box<Expr>>,
     },
     If {
         cond: Box<Expr>,
@@ -189,6 +199,7 @@ pub enum BinOp {
 pub struct StructDecl {
     pub name: String,
     pub fields: Vec<StructField>,
+    pub type_params: Vec<String>,
     pub attribs: Vec<Attribute>,
     pub span: Span,
 }
@@ -219,8 +230,36 @@ pub struct TraitMethodDef {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
+pub struct TypeAliasDecl {
+    pub name: String,
+    pub type_params: Vec<String>,
+    pub aliased_type: Type,
+    pub span: Span,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct EnumDecl {
+    pub name: String,
+    pub variants: Vec<EnumVariant>,
+    pub type_params: Vec<String>,
+    pub attribs: Vec<Attribute>,
+    pub span: Span,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct EnumVariant {
+    pub name: String,
+    pub ty: Option<Type>,
+    pub span: Span,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
 pub struct ImplDecl {
     pub impl_type: Type,
     pub trait_name: Option<String>,
+    pub type_params: Vec<String>,
     pub methods: Vec<Function>,
 }

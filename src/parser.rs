@@ -1,8 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::ast::{
-    Attribute, BinOp, Block, Expr, Function, ImplDecl, Param, Program, Stmt, StructDecl,
-    StructField, TraitDecl, TraitMethodDef, Type, Use,
+    Attribute, BinOp, Block, EnumDecl, EnumVariant, Expr, Function, ImplDecl, Param, Program,
+    Stmt, StructDecl, StructField, TraitDecl, TraitMethodDef, Type, TypeAliasDecl, Use,
 };
 use crate::token::{Span, Token};
 
@@ -16,6 +16,9 @@ pub struct Parser<'a> {
     tokens: &'a [(Token, Span)],
     pos: usize,
     struct_defs: HashMap<String, Vec<StructField>>,
+    type_aliases: HashMap<String, (Vec<String>, Type)>,
+    struct_names: HashSet<String>,
+    enum_names: HashSet<String>,
 }
 
 impl<'a> Parser<'a> {
@@ -24,6 +27,9 @@ impl<'a> Parser<'a> {
             tokens,
             pos: 0,
             struct_defs: HashMap::new(),
+            type_aliases: HashMap::new(),
+            struct_names: HashSet::new(),
+            enum_names: HashSet::new(),
         }
     }
 
@@ -31,8 +37,10 @@ impl<'a> Parser<'a> {
         let mut uses = Vec::new();
         let mut funcs = Vec::new();
         let mut structs = Vec::new();
+        let mut enums = Vec::new();
         let mut traits = Vec::new();
         let mut impls = Vec::new();
+        let mut type_aliases = Vec::new();
 
         loop {
             let attribs = self.parse_attrs()?;
@@ -45,10 +53,38 @@ impl<'a> Parser<'a> {
                 Token::Extern => {
                     self.parse_extern_block(&mut funcs)?;
                 }
+                Token::Enum => {
+                    let decl = self.parse_enum_decl(attribs)?;
+                    // Check for duplicate name
+                    if self.struct_names.contains(&decl.name)
+                        || self.type_aliases.contains_key(&decl.name)
+                    {
+                        return Err(ParseError {
+                            span: decl.span,
+                            msg: format!(
+                                "enum `{}` conflicts with existing declaration",
+                                decl.name
+                            ),
+                        });
+                    }
+                    self.enum_names.insert(decl.name.clone());
+                    enums.push(decl);
+                }
                 Token::Struct => {
                     let decl = self.parse_struct_decl(attribs)?;
+                    // Check for duplicate name with existing type alias
+                    if self.type_aliases.contains_key(&decl.name) {
+                        return Err(ParseError {
+                            span: decl.span,
+                            msg: format!(
+                                "struct `{}` conflicts with existing type alias",
+                                decl.name
+                            ),
+                        });
+                    }
                     self.struct_defs
                         .insert(decl.name.clone(), decl.fields.clone());
+                    self.struct_names.insert(decl.name.clone());
                     structs.push(decl);
                 }
                 Token::Impl => {
@@ -57,18 +93,46 @@ impl<'a> Parser<'a> {
                 Token::Trait => {
                     traits.push(self.parse_trait_decl()?);
                 }
+                Token::Type => {
+                    let decl = self.parse_type_alias()?;
+                    // Check for duplicate name with existing struct
+                    if self.struct_names.contains(&decl.name)
+                        || funcs.iter().any(|f| f.name == decl.name)
+                        || traits.iter().any(|t| t.name == decl.name)
+                    {
+                        return Err(ParseError {
+                            span: decl.span,
+                            msg: format!(
+                                "type alias `{}` conflicts with existing declaration",
+                                decl.name
+                            ),
+                        });
+                    }
+                    let params = decl.type_params.clone();
+                    let aliased = decl.aliased_type.clone();
+                    self.type_aliases
+                        .insert(decl.name.clone(), (params, aliased));
+                    type_aliases.push(decl);
+                }
                 _ => {
                     funcs.push(self.parse_function(attribs)?);
                 }
             }
         }
-        Ok(Program {
+
+        let mut program = Program {
             uses,
             funcs,
             structs,
+            enums,
             traits,
             impls,
-        })
+            type_aliases,
+        };
+
+        self.resolve_type_aliases(&mut program)?;
+
+        Ok(program)
     }
 
     fn parse_attrs(&mut self) -> Result<Vec<Attribute>, ParseError> {
@@ -285,7 +349,37 @@ impl<'a> Parser<'a> {
                 });
             }
         };
+        // Parse optional generic type parameters: <T, U, ...>
+        let type_params = if *self.peek_token() == Token::Lt {
+            self.advance(); // consume <
+            let mut params = Vec::new();
+            loop {
+                match self.peek_token() {
+                    Token::Ident(s) => {
+                        params.push(s.clone());
+                        self.advance();
+                    }
+                    _ => {
+                        let (_, span) = self.current().unwrap();
+                        return Err(ParseError {
+                            span: *span,
+                            msg: "expected type parameter name".to_string(),
+                        });
+                    }
+                }
+                if *self.peek_token() == Token::Comma {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+            self.expect(&Token::Gt)?;
+            params
+        } else {
+            Vec::new()
+        };
         self.expect(&Token::LBrace)?;
+        // ... rest of the fields parsing
         let mut fields = Vec::new();
         while *self.peek_token() != Token::RBrace && *self.peek_token() != Token::Eof {
             let field_lo = self.current_span_lo();
@@ -320,13 +414,195 @@ impl<'a> Parser<'a> {
         Ok(StructDecl {
             name,
             fields,
+            type_params,
             attribs,
+            span: Span::new(lo, hi),
+        })
+    }
+
+    fn parse_enum_decl(&mut self, attribs: Vec<Attribute>) -> Result<EnumDecl, ParseError> {
+        let lo = self.current_span_lo();
+        self.expect(&Token::Enum)?;
+        let name = match self.peek_token() {
+            Token::Ident(s) => {
+                let s = s.clone();
+                self.advance();
+                s
+            }
+            _ => {
+                let (_, span) = self.current().unwrap();
+                return Err(ParseError {
+                    span: *span,
+                    msg: "expected enum name".to_string(),
+                });
+            }
+        };
+        // Parse optional generic type parameters: <T, U, ...>
+        let type_params = if *self.peek_token() == Token::Lt {
+            self.advance(); // consume <
+            let mut params = Vec::new();
+            loop {
+                match self.peek_token() {
+                    Token::Ident(s) => {
+                        params.push(s.clone());
+                        self.advance();
+                    }
+                    _ => {
+                        let (_, span) = self.current().unwrap();
+                        return Err(ParseError {
+                            span: *span,
+                            msg: "expected type parameter name".to_string(),
+                        });
+                    }
+                }
+                if *self.peek_token() == Token::Comma {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+            self.expect(&Token::Gt)?;
+            params
+        } else {
+            Vec::new()
+        };
+        self.expect(&Token::LBrace)?;
+        let mut variants = Vec::new();
+        while *self.peek_token() != Token::RBrace && *self.peek_token() != Token::Eof {
+            let var_lo = self.current_span_lo();
+            let var_name = match self.peek_token() {
+                Token::Ident(s) => {
+                    let s = s.clone();
+                    self.advance();
+                    s
+                }
+                _ => {
+                    let (_, span) = self.current().unwrap();
+                    return Err(ParseError {
+                        span: *span,
+                        msg: "expected variant name".to_string(),
+                    });
+                }
+            };
+            // Check for optional payload type: VarName(Type) or VarName
+            let ty = if *self.peek_token() == Token::LParen {
+                self.advance(); // consume (
+                let t = self.parse_type()?;
+                self.expect(&Token::RParen)?;
+                Some(t)
+            } else {
+                None
+            };
+            let var_span = Span::new(var_lo, self.last_span_end());
+            variants.push(EnumVariant {
+                name: var_name,
+                ty,
+                span: var_span,
+            });
+            if *self.peek_token() == Token::Comma {
+                self.advance();
+            }
+        }
+        self.expect(&Token::RBrace)?;
+        let hi = self.last_span_end();
+        Ok(EnumDecl {
+            name,
+            variants,
+            type_params,
+            attribs,
+            span: Span::new(lo, hi),
+        })
+    }
+
+    fn parse_type_alias(&mut self) -> Result<TypeAliasDecl, ParseError> {
+        let lo = self.current_span_lo();
+        self.expect(&Token::Type)?;
+        let name = match self.peek_token() {
+            Token::Ident(s) => {
+                let s = s.clone();
+                self.advance();
+                s
+            }
+            _ => {
+                let (_, span) = self.current().unwrap();
+                return Err(ParseError {
+                    span: *span,
+                    msg: "expected type alias name after 'type'".to_string(),
+                });
+            }
+        };
+        // Parse optional generic type parameters: <T, U, ...>
+        let type_params = if *self.peek_token() == Token::Lt {
+            self.advance(); // consume <
+            let mut params = Vec::new();
+            loop {
+                match self.peek_token() {
+                    Token::Ident(s) => {
+                        params.push(s.clone());
+                        self.advance();
+                    }
+                    _ => {
+                        let (_, span) = self.current().unwrap();
+                        return Err(ParseError {
+                            span: *span,
+                            msg: "expected type parameter name".to_string(),
+                        });
+                    }
+                }
+                if *self.peek_token() == Token::Comma {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+            self.expect(&Token::Gt)?;
+            params
+        } else {
+            Vec::new()
+        };
+        self.expect(&Token::Eq)?;
+        let aliased_type = self.parse_type()?;
+        self.expect(&Token::Semicolon)?;
+        let hi = self.last_span_end();
+        Ok(TypeAliasDecl {
+            name,
+            type_params,
+            aliased_type,
             span: Span::new(lo, hi),
         })
     }
 
     fn parse_impl_decl(&mut self) -> Result<ImplDecl, ParseError> {
         self.expect(&Token::Impl)?;
+        // Parse optional generic type parameters: <T, U, ...>
+        let type_params = if *self.peek_token() == Token::Lt {
+            self.advance(); // consume <
+            let mut params = Vec::new();
+            loop {
+                match self.peek_token() {
+                    Token::Ident(s) => {
+                        params.push(s.clone());
+                        self.advance();
+                    }
+                    _ => {
+                        let (_, span) = self.current().unwrap();
+                        return Err(ParseError {
+                            span: *span,
+                            msg: "expected type parameter name".to_string(),
+                        });
+                    }
+                }
+                if *self.peek_token() == Token::Comma {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+            self.expect(&Token::Gt)?;
+            params
+        } else {
+            Vec::new()
+        };
         // Check for `impl Trait for Type` or `impl Type`
         let trait_name = if self.pos + 2 < self.tokens.len() {
             let is_ident_for = matches!(&self.tokens[self.pos].0, Token::Ident(_))
@@ -360,6 +636,7 @@ impl<'a> Parser<'a> {
         Ok(ImplDecl {
             impl_type,
             trait_name,
+            type_params,
             methods,
         })
     }
@@ -827,6 +1104,12 @@ impl<'a> Parser<'a> {
     /// Parse a primary expression followed by zero or more `as Type` casts.
     /// This binds tighter than binary operators: `a * b as i32` → `a * (b as i32)`
     fn parse_primary_as(&mut self) -> Result<Expr, ParseError> {
+        // Handle prefix `!` operator (after postfix ops, so `!x.f` = `!(x.f)`)
+        if *self.peek_token() == Token::Bang {
+            self.advance(); // consume !
+            let expr = self.parse_primary_as()?;
+            return Ok(Expr::UnaryNot(Box::new(expr)));
+        }
         let mut expr = self.parse_postfix()?;
         while *self.peek_token() == Token::As {
             self.advance();
@@ -928,7 +1211,40 @@ impl<'a> Parser<'a> {
             Token::Bool => Ok(Type::Bool),
             Token::Str => Ok(Type::Str),
             Token::SelfType => Ok(Type::SelfType),
-            Token::Ident(name) => Ok(Type::Struct(name)),
+            Token::Ident(name) => {
+                // Check for generic args: name < type, type, ... >
+                if *self.peek_token() == Token::Lt {
+                    if self.type_aliases.contains_key(&name) {
+                        self.advance(); // consume <
+                        let mut args = Vec::new();
+                        loop {
+                            args.push(self.parse_type()?);
+                            if *self.peek_token() == Token::Comma {
+                                self.advance();
+                            } else {
+                                break;
+                            }
+                        }
+                        self.expect(&Token::Gt)?;
+                        return Ok(Type::Alias(name, args));
+                    } else {
+                        // Assume generic struct (or will be resolved later via stdlib imports)
+                        self.advance(); // consume <
+                        let mut args = Vec::new();
+                        loop {
+                            args.push(self.parse_type()?);
+                            if *self.peek_token() == Token::Comma {
+                                self.advance();
+                            } else {
+                                break;
+                            }
+                        }
+                        self.expect(&Token::Gt)?;
+                        return Ok(Type::GenericInstance(name, args));
+                    }
+                }
+                Ok(Type::Struct(name))
+            }
             Token::Bang => Ok(Type::Never),
             _ => {
                 let default = (Token::Eof, Span::empty(0));
@@ -1131,10 +1447,10 @@ impl<'a> Parser<'a> {
                 if *self.peek_token() == Token::LBrace {
                     return self.parse_struct_lit(&name);
                 }
-                // Check for qualified call: ident :: ident ( ... )
+                // Check for qualified path: ident :: ident
                 if *self.peek_token() == Token::DoubleColon {
                     self.advance(); // consume ::
-                    let callee = match self.peek_token() {
+                    let variant_or_fn = match self.peek_token() {
                         Token::Ident(s) => {
                             let s = s.clone();
                             self.advance();
@@ -1144,16 +1460,46 @@ impl<'a> Parser<'a> {
                             let (_, span) = self.current().unwrap();
                             return Err(ParseError {
                                 span: *span,
-                                msg: "expected function name after '::'".to_string(),
+                                msg: "expected identifier after '::'".to_string(),
                             });
                         }
                     };
-                    let args = self.parse_call_args()?;
-                    return Ok(Expr::QualifiedCall {
-                        module: name,
-                        callee,
-                        args,
-                    });
+                    // If followed by `(`, check if it's a known enum (enum literal) or not (qualified call)
+                    if *self.peek_token() == Token::LParen {
+                        if self.enum_names.contains(&name) {
+                            self.advance(); // consume '('
+                            if *self.peek_token() == Token::RParen {
+                                // Empty parens → unit variant with no payload
+                                self.advance(); // consume ')'
+                                return Ok(Expr::EnumLit {
+                                    enum_name: name,
+                                    variant: variant_or_fn,
+                                    payload: None,
+                                });
+                            }
+                            let inner = self.parse_expr()?;
+                            self.expect(&Token::RParen)?;
+                            return Ok(Expr::EnumLit {
+                                enum_name: name,
+                                variant: variant_or_fn,
+                                payload: Some(Box::new(inner)),
+                            });
+                        } else {
+                            let args = self.parse_call_args()?;
+                            return Ok(Expr::QualifiedCall {
+                                module: name,
+                                callee: variant_or_fn,
+                                args,
+                            });
+                        }
+                    } else {
+                        // No parens → unit enum variant
+                        return Ok(Expr::EnumLit {
+                            enum_name: name,
+                            variant: variant_or_fn,
+                            payload: None,
+                        });
+                    }
                 }
                 // Check for function call: ident ( ... )
                 if *self.peek_token() == Token::LParen {
@@ -1290,6 +1636,207 @@ impl<'a> Parser<'a> {
             return 0;
         }
         self.tokens[self.pos - 1].1.hi
+    }
+
+    /// Walk the entire program AST and resolve all type alias references.
+    /// Replaces Type::Struct(name) where `name` is a simple alias, and
+    /// Type::Alias(name, args) where `name` is a generic alias.
+    fn resolve_type_aliases(&self, program: &mut Program) -> Result<(), ParseError> {
+        // Clone alias data to avoid borrow conflicts
+        let alias_defs: HashMap<String, TypeAliasDecl> = program
+            .type_aliases
+            .iter()
+            .map(|d| (d.name.clone(), d.clone()))
+            .collect();
+
+        for func in &mut program.funcs {
+            for param in &mut func.params {
+                self.resolve_type_in_place_owned(&mut param.ty, &alias_defs, &mut HashSet::new())?;
+            }
+            if let Some(ref mut ret) = func.return_type {
+                self.resolve_type_in_place_owned(ret, &alias_defs, &mut HashSet::new())?;
+            }
+            // Resolve types in the function body (let type annotations, casts, etc.)
+            self.resolve_types_in_block(&mut func.body, &alias_defs)?;
+        }
+        for s in &mut program.structs {
+            for field in &mut s.fields {
+                self.resolve_type_in_place_owned(&mut field.ty, &alias_defs, &mut HashSet::new())?;
+            }
+        }
+        for t in &mut program.traits {
+            for method in &mut t.methods {
+                for param in &mut method.params {
+                    self.resolve_type_in_place_owned(
+                        &mut param.ty,
+                        &alias_defs,
+                        &mut HashSet::new(),
+                    )?;
+                }
+                if let Some(ref mut ret) = method.return_type {
+                    self.resolve_type_in_place_owned(ret, &alias_defs, &mut HashSet::new())?;
+                }
+            }
+        }
+        for i in &mut program.impls {
+            self.resolve_type_in_place_owned(&mut i.impl_type, &alias_defs, &mut HashSet::new())?;
+            for method in &mut i.methods {
+                for param in &mut method.params {
+                    self.resolve_type_in_place_owned(
+                        &mut param.ty,
+                        &alias_defs,
+                        &mut HashSet::new(),
+                    )?;
+                }
+                if let Some(ref mut ret) = method.return_type {
+                    self.resolve_type_in_place_owned(ret, &alias_defs, &mut HashSet::new())?;
+                }
+            }
+        }
+        // Also resolve within the alias definitions themselves (for chained aliases)
+        for alias in &mut program.type_aliases {
+            self.resolve_type_in_place_owned(
+                &mut alias.aliased_type,
+                &alias_defs,
+                &mut HashSet::new(),
+            )?;
+        }
+
+        Ok(())
+    }
+
+    /// Recursively resolve a type in place, substituting aliases.
+    fn resolve_type_in_place_owned(
+        &self,
+        ty: &mut Type,
+        aliases: &HashMap<String, TypeAliasDecl>,
+        visiting: &mut HashSet<String>,
+    ) -> Result<(), ParseError> {
+        match ty {
+            Type::Struct(name) => {
+                // Check if this is a simple (non-generic) alias reference
+                if let Some(alias) = aliases.get(name) {
+                    if !alias.type_params.is_empty() {
+                        return Ok(()); // generic alias requires Type::Alias form, not plain Struct
+                    }
+                    // Cycle detection
+                    if !visiting.insert(name.clone()) {
+                        return Err(ParseError {
+                            span: alias.span,
+                            msg: format!("cyclic type alias `{}`", name),
+                        });
+                    }
+                    // Substitute the aliased type and continue resolving
+                    let subst = alias.aliased_type.clone();
+                    *ty = subst;
+                    // Recurse into the substituted type
+                    return self.resolve_type_in_place_owned(ty, aliases, visiting);
+                }
+                Ok(())
+            }
+            Type::Alias(name, args) => {
+                // Look up the generic alias
+                if let Some(alias) = aliases.get(name) {
+                    if args.len() != alias.type_params.len() {
+                        return Err(ParseError {
+                            span: alias.span,
+                            msg: format!(
+                                "type alias `{}` expects {} type arguments, got {}",
+                                name,
+                                alias.type_params.len(),
+                                args.len()
+                            ),
+                        });
+                    }
+                    // Build substitution map: param_name -> concrete type arg
+                    // Substitute type params in the aliased type with concrete args
+                    let mut substituted = alias.aliased_type.clone();
+                    Self::substitute_type_params(&mut substituted, &alias.type_params, args);
+                    // Check for cycles
+                    if !visiting.insert(name.clone()) {
+                        return Err(ParseError {
+                            span: alias.span,
+                            msg: format!("cyclic type alias `{}`", name),
+                        });
+                    }
+                    *ty = substituted;
+                    // Recurse into the substituted type
+                    return self.resolve_type_in_place_owned(ty, aliases, visiting);
+                }
+                // Unknown alias — let codegen produce the error
+                Ok(())
+            }
+            Type::GenericInstance(_name, args) => {
+                // Resolve type args within the generic instance
+                for arg in args.iter_mut() {
+                    self.resolve_type_in_place_owned(arg, aliases, visiting)?;
+                }
+                Ok(())
+            }
+            Type::Ref { inner, .. } | Type::Ptr { inner, .. } => {
+                self.resolve_type_in_place_owned(inner, aliases, visiting)
+            }
+            Type::Tuple(types) => {
+                for t in types.iter_mut() {
+                    self.resolve_type_in_place_owned(t, aliases, visiting)?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Substitute type parameter references in a type with concrete type arguments.
+    pub fn substitute_type_params(ty: &mut Type, params: &[String], args: &[Type]) {
+        match ty {
+            Type::Struct(name) => {
+                if let Some(pos) = params.iter().position(|p| p == name)
+                    && let Some(arg) = args.get(pos)
+                {
+                    *ty = arg.clone();
+                }
+            }
+            Type::GenericInstance(_name, type_args) => {
+                for arg in type_args.iter_mut() {
+                    Self::substitute_type_params(arg, params, args);
+                }
+                // If the base name itself is a type param, it would have been caught by Type::Struct above
+            }
+            Type::Ref { inner, .. } | Type::Ptr { inner, .. } => {
+                Self::substitute_type_params(inner, params, args);
+            }
+            Type::Tuple(types) => {
+                for t in types.iter_mut() {
+                    Self::substitute_type_params(t, params, args);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Resolve types within a block body: type annotations, cast types,
+    /// and recurse into nested blocks (if, loop, while).
+    fn resolve_types_in_block(
+        &self,
+        body: &mut Block,
+        aliases: &HashMap<String, TypeAliasDecl>,
+    ) -> Result<(), ParseError> {
+        for stmt in &mut body.stmts {
+            match stmt {
+                Stmt::Let {
+                    type_ann: Some(ty), ..
+                } => {
+                    self.resolve_type_in_place_owned(ty, aliases, &mut HashSet::new())?;
+                }
+                Stmt::Const {
+                    type_ann: Some(ty), ..
+                } => {
+                    self.resolve_type_in_place_owned(ty, aliases, &mut HashSet::new())?;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     fn current_span_lo(&self) -> usize {
@@ -1800,7 +2347,8 @@ mod tests {
 
     #[test]
     fn test_qualified_call() {
-        let prog = parse("fn f() { io::println(42); }").unwrap();
+        // Multiple args → qualified call (single arg → enum literal)
+        let prog = parse("fn f() { io::println(42, 43); }").unwrap();
         match &prog.funcs[0].body.stmts[0] {
             Stmt::Expr(Expr::QualifiedCall {
                 module,
@@ -1809,10 +2357,51 @@ mod tests {
             }) => {
                 assert_eq!(module, "io");
                 assert_eq!(callee, "println");
-                assert_eq!(args.len(), 1);
+                assert_eq!(args.len(), 2);
                 assert!(matches!(&args[0], Expr::IntLit(42)));
+                assert!(matches!(&args[1], Expr::IntLit(43)));
             }
             _ => panic!("expected QualifiedCall"),
+        }
+    }
+
+    #[test]
+    fn test_enum_lit_with_payload() {
+        let prog = parse("enum Option<T> { Some(T), None } fn f() { let x = Option::Some(42); }").unwrap();
+        match &prog.funcs[0].body.stmts[0] {
+            Stmt::Let { init, .. } => match init {
+                Expr::EnumLit {
+                    enum_name,
+                    variant,
+                    payload,
+                } => {
+                    assert_eq!(enum_name, "Option");
+                    assert_eq!(variant, "Some");
+                    assert!(matches!(payload, Some(p) if matches!(**p, Expr::IntLit(42))));
+                }
+                _ => panic!("expected EnumLit"),
+            },
+            _ => panic!("expected Let"),
+        }
+    }
+
+    #[test]
+    fn test_enum_lit_unit_variant() {
+        let prog = parse("enum Option<T> { Some(T), None } fn f() { let x = Option::None; }").unwrap();
+        match &prog.funcs[0].body.stmts[0] {
+            Stmt::Let { init, .. } => match init {
+                Expr::EnumLit {
+                    enum_name,
+                    variant,
+                    payload,
+                } => {
+                    assert_eq!(enum_name, "Option");
+                    assert_eq!(variant, "None");
+                    assert!(payload.is_none());
+                }
+                _ => panic!("expected EnumLit"),
+            },
+            _ => panic!("expected Let"),
         }
     }
 
@@ -2574,7 +3163,101 @@ mod tests {
                     _ => panic!("expected Loop"),
                 }
             }
-            _ => panic!("expected If"),
+            _ => panic!("expected nested If"),
         }
+    }
+
+    #[test]
+    fn test_type_alias_simple() {
+        let prog = parse("type Meters = i32; fn main() {}").unwrap();
+        assert_eq!(prog.type_aliases.len(), 1);
+        let alias = &prog.type_aliases[0];
+        assert_eq!(alias.name, "Meters");
+        assert!(alias.type_params.is_empty());
+        assert_eq!(alias.aliased_type, Type::I32);
+    }
+
+    #[test]
+    fn test_type_alias_generic() {
+        let prog = parse("type Pair<T> = (T, T); fn main() {}").unwrap();
+        assert_eq!(prog.type_aliases.len(), 1);
+        let alias = &prog.type_aliases[0];
+        assert_eq!(alias.name, "Pair");
+        assert_eq!(alias.type_params, vec!["T".to_string()]);
+        assert_eq!(
+            alias.aliased_type,
+            Type::Tuple(vec![Type::Struct("T".into()), Type::Struct("T".into())])
+        );
+    }
+
+    #[test]
+    fn test_type_alias_in_type_position() {
+        // After resolution, Meters should be resolved to i32 in let type annotation
+        let prog = parse("type Meters = i32; fn main() { let x: Meters = 42; }").unwrap();
+        assert_eq!(prog.type_aliases.len(), 1);
+        // The let stmt should have type i32 (resolved from Meters)
+        match &prog.funcs[0].body.stmts[0] {
+            Stmt::Let {
+                type_ann: Some(ty), ..
+            } => {
+                assert_eq!(*ty, Type::I32);
+            }
+            _ => panic!("expected Let with type annotation"),
+        }
+    }
+
+    #[test]
+    fn test_type_alias_generic_usage() {
+        let prog =
+            parse("type Pair<T> = (T, T); fn main() { let x: Pair<i32> = (1, 2); }").unwrap();
+        // After resolution, Pair<i32> should be resolved to (i32, i32)
+        match &prog.funcs[0].body.stmts[0] {
+            Stmt::Let {
+                type_ann: Some(ty), ..
+            } => {
+                assert_eq!(*ty, Type::Tuple(vec![Type::I32, Type::I32]));
+            }
+            _ => panic!("expected Let with type annotation"),
+        }
+    }
+
+    #[test]
+    fn test_type_alias_cycle() {
+        let result = parse("type A = B; type B = A; fn main() {}");
+        assert!(result.is_err());
+        if let Err(e) = result {
+            assert!(
+                e.msg.contains("cyclic"),
+                "error should mention cyclic: {}",
+                e.msg
+            );
+        }
+    }
+
+    #[test]
+    fn test_type_alias_duplicate_name() {
+        let result = parse("type Foo = i32; struct Foo { x: i32, } fn main() {}");
+        assert!(result.is_err());
+        if let Err(e) = result {
+            assert!(
+                e.msg.contains("conflicts"),
+                "error should mention conflicts: {}",
+                e.msg
+            );
+        }
+    }
+
+    #[test]
+    fn test_type_alias_in_fn_return() {
+        // Alias in return type position should be resolved
+        let prog = parse("type Meters = i32; fn main() -> Meters { 42 }").unwrap();
+        assert_eq!(prog.funcs[0].return_type, Some(Type::I32));
+    }
+
+    #[test]
+    fn test_type_alias_in_fn_param() {
+        // Alias in function parameter should be resolved
+        let prog = parse("type Meters = i32; fn foo(x: Meters) {}").unwrap();
+        assert_eq!(prog.funcs[0].params[0].ty, Type::I32);
     }
 }

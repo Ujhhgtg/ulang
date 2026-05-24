@@ -79,8 +79,10 @@ mod tests {
         assert_eq!(Token::RArrow, Token::RArrow);
         assert_eq!(Token::Dot, Token::Dot);
         assert_eq!(Token::Ellipsis, Token::Ellipsis);
+        assert_eq!(Token::Enum, Token::Enum);
         assert_eq!(Token::Struct, Token::Struct);
         assert_eq!(Token::Impl, Token::Impl);
+        assert_eq!(Token::Type, Token::Type);
         assert_eq!(Token::Trait, Token::Trait);
         assert_eq!(Token::For, Token::For);
         assert_eq!(Token::Self_, Token::Self_);
@@ -167,10 +169,12 @@ pub enum Token {
     BangEq,    // !=
     Ampersand, // &
     Dot,       // .
-    // Struct / Impl / Trait keywords
+    // Struct / Impl / Trait / Type / Enum keywords
     Struct,
+    Enum,
     Impl,
     Trait,
+    Type,
     For,
     Self_,
     SelfType,

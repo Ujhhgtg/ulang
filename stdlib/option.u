@@ -6,13 +6,30 @@ enum Option<T> {
 }
 
 impl<T> Option<T> {
-    fn is_some(&self) -> bool { self.__tag == 0 as i8 }
-    fn is_none(&self) -> bool { self.__tag != 0 as i8 }
+    fn is_some(&self) -> bool {
+        match *self {
+            Option::Some(_) => true,
+            Option::None => false,
+        }
+    }
+    fn is_none(&self) -> bool {
+        match *self {
+            Option::Some(_) => false,
+            Option::None => true,
+        }
+    }
     fn unwrap(&self) -> T {
-        if self.__tag != 0 as i8 { panic("called `Option::unwrap()` on a `None` value"); };
-        self.__Some
+        match *self {
+            Option::Some(val) => val,
+            Option::None => {
+                panic("called `Option::unwrap()` on a `None` value");
+            }
+        }
     }
     fn unwrap_or(&self, default: T) -> T {
-        if self.__tag == 0 as i8 { self.__Some } else { default }
+        match *self {
+            Option::Some(val) => val,
+            Option::None => default,
+        }
     }
 }

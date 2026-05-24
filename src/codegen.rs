@@ -1403,7 +1403,9 @@ impl<'ctx> CodeGen<'ctx> {
             Self::collect_from_types(std::slice::from_ref(ret), &mut instances, &mut seen);
         }
         Self::collect_from_block(&func.body, &mut instances, &mut seen);
-        Self::collect_enum_lits_from_block(&func.body, &mut instances, &mut seen);
+        let mut one_param_enums = HashSet::new();
+        one_param_enums.insert("Option".to_string());
+        Self::collect_enum_lits_from_block(&func.body, &mut instances, &mut seen, &one_param_enums);
 
         instances
     }
@@ -1476,9 +1478,16 @@ impl<'ctx> CodeGen<'ctx> {
             Self::collect_from_block(&func.body, &mut instances, &mut seen);
         }
 
+        let one_param_enums: HashSet<String> = program
+            .enums
+            .iter()
+            .filter(|e| e.type_params.len() == 1)
+            .map(|e| e.name.clone())
+            .collect();
+
         // Scan for generic enum literals (e.g., Option::Some(42) needs Option<i32>)
         for func in &program.funcs {
-            Self::collect_enum_lits_from_block(&func.body, &mut instances, &mut seen);
+            Self::collect_enum_lits_from_block(&func.body, &mut instances, &mut seen, &one_param_enums);
         }
 
         // Scan structs
@@ -1543,24 +1552,25 @@ impl<'ctx> CodeGen<'ctx> {
         block: &Block,
         instances: &mut Vec<(String, Vec<Type>)>,
         seen: &mut HashSet<String>,
+        one_param_enums: &HashSet<String>,
     ) {
         for stmt in &block.stmts {
             match stmt {
                 Stmt::Let { init, .. } | Stmt::Const { init, .. } => {
-                    Self::collect_enum_lits_from_expr(init, instances, seen);
+                    Self::collect_enum_lits_from_expr(init, instances, seen, one_param_enums);
                 }
                 Stmt::Expr(expr) => {
-                    Self::collect_enum_lits_from_expr(expr, instances, seen);
+                    Self::collect_enum_lits_from_expr(expr, instances, seen, one_param_enums);
                 }
                 Stmt::Return { value, .. } => {
                     if let Some(expr) = value {
-                        Self::collect_enum_lits_from_expr(expr, instances, seen);
+                        Self::collect_enum_lits_from_expr(expr, instances, seen, one_param_enums);
                     }
                 }
             }
         }
         if let Some(ref tail) = block.tail_expr {
-            Self::collect_enum_lits_from_expr(tail, instances, seen);
+            Self::collect_enum_lits_from_expr(tail, instances, seen, one_param_enums);
         }
     }
 
@@ -1569,18 +1579,21 @@ impl<'ctx> CodeGen<'ctx> {
         expr: &Expr,
         instances: &mut Vec<(String, Vec<Type>)>,
         seen: &mut HashSet<String>,
+        one_param_enums: &HashSet<String>,
     ) {
         match expr {
             Expr::EnumLit {
                 enum_name, payload, ..
             } => {
-                if let Some(payload_expr) = payload {
-                    let payload_ty = Self::literal_type(payload_expr);
-                    // Only for primitive payloads (skip type params like T)
-                    if Self::is_concrete_type(&payload_ty) {
-                        let key = Self::mangle_generic_instance(enum_name, &[payload_ty.clone()]);
-                        if seen.insert(key) {
-                            instances.push((enum_name.clone(), vec![payload_ty]));
+                if one_param_enums.contains(enum_name) {
+                    if let Some(payload_expr) = payload {
+                        let payload_ty = Self::literal_type(payload_expr);
+                        // Only for primitive payloads (skip type params like T)
+                        if Self::is_concrete_type(&payload_ty) {
+                            let key = Self::mangle_generic_instance(enum_name, &[payload_ty.clone()]);
+                            if seen.insert(key) {
+                                instances.push((enum_name.clone(), vec![payload_ty]));
+                            }
                         }
                     }
                 }
@@ -1591,14 +1604,14 @@ impl<'ctx> CodeGen<'ctx> {
                 else_ifs,
                 else_block,
             } => {
-                Self::collect_enum_lits_from_expr(cond, instances, seen);
-                Self::collect_enum_lits_from_block(then_block, instances, seen);
+                Self::collect_enum_lits_from_expr(cond, instances, seen, one_param_enums);
+                Self::collect_enum_lits_from_block(then_block, instances, seen, one_param_enums);
                 for (econd, eblock) in else_ifs {
-                    Self::collect_enum_lits_from_expr(econd, instances, seen);
-                    Self::collect_enum_lits_from_block(eblock, instances, seen);
+                    Self::collect_enum_lits_from_expr(econd, instances, seen, one_param_enums);
+                    Self::collect_enum_lits_from_block(eblock, instances, seen, one_param_enums);
                 }
                 if let Some(eb) = else_block {
-                    Self::collect_enum_lits_from_block(eb, instances, seen);
+                    Self::collect_enum_lits_from_block(eb, instances, seen, one_param_enums);
                 }
             }
             Expr::IfLet {
@@ -1607,19 +1620,19 @@ impl<'ctx> CodeGen<'ctx> {
                 else_block,
                 ..
             } => {
-                Self::collect_enum_lits_from_expr(scrutinee, instances, seen);
-                Self::collect_enum_lits_from_block(then_block, instances, seen);
+                Self::collect_enum_lits_from_expr(scrutinee, instances, seen, one_param_enums);
+                Self::collect_enum_lits_from_block(then_block, instances, seen, one_param_enums);
                 if let Some(eb) = else_block {
-                    Self::collect_enum_lits_from_block(eb, instances, seen);
+                    Self::collect_enum_lits_from_block(eb, instances, seen, one_param_enums);
                 }
             }
             Expr::Match { scrutinee, arms } => {
-                Self::collect_enum_lits_from_expr(scrutinee, instances, seen);
+                Self::collect_enum_lits_from_expr(scrutinee, instances, seen, one_param_enums);
                 for arm in arms {
                     if let Some(guard) = &arm.guard {
-                        Self::collect_enum_lits_from_expr(guard, instances, seen);
+                        Self::collect_enum_lits_from_expr(guard, instances, seen, one_param_enums);
                     }
-                    Self::collect_enum_lits_from_block(&arm.body, instances, seen);
+                    Self::collect_enum_lits_from_block(&arm.body, instances, seen, one_param_enums);
                 }
             }
             _ => {}
@@ -2442,6 +2455,19 @@ impl<'ctx> CodeGen<'ctx> {
                 inner: Box::new(self.expr_type(expr)),
                 len: *count,
             },
+            Expr::Deref(inner) => {
+                let inner_ty = self.expr_type(inner);
+                match inner_ty {
+                    Type::Ptr { inner: pointee, .. } => *pointee,
+                    Type::Ref { inner: pointee, .. } => *pointee,
+                    _ => Type::I32,
+                }
+            }
+            Expr::Ref { expr: inner, is_mut } => Type::Ref {
+                inner: Box::new(self.expr_type(inner)),
+                is_mut: *is_mut,
+            },
+            Expr::Tuple(elems) => Type::Tuple(elems.iter().map(|e| self.expr_type(e)).collect()),
             _ => Self::literal_type(expr),
         }
     }
@@ -3329,7 +3355,7 @@ impl<'ctx> CodeGen<'ctx> {
                 let ptr_val = self.compile_expr(expr)?;
                 let ptr = ptr_val.into_pointer_value();
                 // Determine pointee type
-                let pointee_ty = Self::literal_type(expr);
+                let pointee_ty = self.expr_type(expr);
                 let pointee_llvm_ty = self.type_to_llvm(match &pointee_ty {
                     Type::Ref { inner, .. } => inner,
                     Type::Ptr { inner, .. } => inner,
@@ -5655,6 +5681,68 @@ mod tests {
             )
             .unwrap(),
             0
+        );
+    }
+
+    #[test]
+    fn test_jit_option_pattern_matching() {
+        assert_eq!(
+            jit("
+                enum Option<T> { Some(T), None, }
+                impl<T> Option<T> {
+                    fn unwrap_or(&self, default: T) -> T {
+                        match *self {
+                            Option::Some(val) => val,
+                            Option::None => default,
+                        }
+                    }
+                }
+                fn main() -> i32 {
+                    let opt = Option::Some(42);
+                    opt.unwrap_or(0)
+                }
+            ").unwrap(),
+            42
+        );
+        assert_eq!(
+            jit("
+                enum Option<T> { Some(T), None, }
+                impl<T> Option<T> {
+                    fn unwrap_or(&self, default: T) -> T {
+                        match *self {
+                            Option::Some(val) => val,
+                            Option::None => default,
+                        }
+                    }
+                }
+                fn main() -> i32 {
+                    let opt: Option<i32> = Option::None;
+                    opt.unwrap_or(42)
+                }
+            ").unwrap(),
+            42
+        );
+    }
+
+    #[test]
+    fn test_jit_result_pattern_matching() {
+        assert_eq!(
+            jit("
+                enum Result<T, E> { Ok(T), Err(E), }
+                impl<T, E> Result<T, E> {
+                    fn is_ok(&self) -> bool {
+                        match *self {
+                            Result::Ok(_) => true,
+                            Result::Err(_) => false,
+                        }
+                    }
+                }
+                fn main() -> i32 {
+                    let res: Result<i32, i32> = Result::Ok(100);
+                    if res.is_ok() { 42 } else { 0 }
+                }
+            ").unwrap(),
+            42
         );
     }
 

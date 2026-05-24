@@ -415,3 +415,44 @@ fn test_single_element_array() {
         "use std::io::println;\nfn main() { let a = [42]; println(a[0]); }\n"
     ));
 }
+
+#[test]
+fn test_option_stdlib() {
+    assert!(run_test(
+        "option_test",
+        r#"use std::option::Option;
+        fn main() -> i32 {
+            let opt = Option::Some(42);
+            if opt.is_some() {
+                if opt.unwrap() == 42 {
+                    if opt.unwrap_or(100) == 42 {
+                        return 0;
+                    }
+                }
+            };
+            return 1;
+        }"#
+    ));
+}
+
+#[test]
+fn test_result_stdlib() {
+    assert!(run_test(
+        "result_test",
+        r#"use std::result::Result;
+        fn main() -> i32 {
+            let r: Result<i32, i32> = Result::Ok(42);
+            let e: Result<i32, i32> = Result::Err(100);
+            if r.is_ok() {
+                if e.is_err() {
+                    if r.unwrap() == 42 {
+                        if e.unwrap_err() == 100 {
+                            return 0;
+                        }
+                    }
+                }
+            };
+            return 1;
+        }"#
+    ));
+}

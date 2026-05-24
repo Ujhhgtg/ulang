@@ -118,7 +118,21 @@ impl<'a> Lexer<'a> {
             }
             '&' => {
                 self.advance();
-                Token::Ampersand
+                if self.current_char() == Some('&') {
+                    self.advance();
+                    Token::AndAnd
+                } else {
+                    Token::Ampersand
+                }
+            }
+            '|' => {
+                self.advance();
+                if self.current_char() == Some('|') {
+                    self.advance();
+                    Token::OrOr
+                } else {
+                    Token::Pipe
+                }
             }
             '!' => {
                 self.advance();
@@ -781,5 +795,15 @@ mod tests {
             );
             prev_hi = span.hi;
         }
+    }
+
+    #[test]
+    fn test_logical_operators() {
+        let tokens = lex_all("&& || & |");
+        assert_eq!(tokens[0].0, Token::AndAnd);
+        assert_eq!(tokens[1].0, Token::OrOr);
+        assert_eq!(tokens[2].0, Token::Ampersand);
+        assert_eq!(tokens[3].0, Token::Pipe);
+        assert!(matches!(tokens[4].0, Token::Eof));
     }
 }

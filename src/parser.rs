@@ -997,7 +997,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_assign(&mut self) -> Result<Expr, ParseError> {
-        let lhs = self.parse_comparison()?;
+        let lhs = self.parse_logical_or()?;
         if *self.peek_token() == Token::Eq {
             match &lhs {
                 Expr::Ident(_) | Expr::Deref(_) | Expr::Member { .. } | Expr::Index { .. } => {
@@ -1022,6 +1022,42 @@ impl<'a> Parser<'a> {
         } else {
             Ok(lhs)
         }
+    }
+
+    fn parse_logical_or(&mut self) -> Result<Expr, ParseError> {
+        let mut lhs = self.parse_logical_and()?;
+        loop {
+            if *self.peek_token() == Token::OrOr {
+                self.advance();
+                let rhs = self.parse_logical_and()?;
+                lhs = Expr::Binary {
+                    op: BinOp::Or,
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                };
+            } else {
+                break;
+            }
+        }
+        Ok(lhs)
+    }
+
+    fn parse_logical_and(&mut self) -> Result<Expr, ParseError> {
+        let mut lhs = self.parse_comparison()?;
+        loop {
+            if *self.peek_token() == Token::AndAnd {
+                self.advance();
+                let rhs = self.parse_comparison()?;
+                lhs = Expr::Binary {
+                    op: BinOp::And,
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                };
+            } else {
+                break;
+            }
+        }
+        Ok(lhs)
     }
 
     fn parse_comparison(&mut self) -> Result<Expr, ParseError> {
@@ -1720,7 +1756,9 @@ impl<'a> Parser<'a> {
         }
 
         // Regular `if` expression
+        self.suppress_struct_lit = true;
         let cond = self.parse_expr()?;
+        self.suppress_struct_lit = false;
         let then_block = self.parse_block()?;
         let mut else_ifs = Vec::new();
         let mut else_block = None;
@@ -1763,7 +1801,9 @@ impl<'a> Parser<'a> {
 
     fn parse_while_expr(&mut self) -> Result<Expr, ParseError> {
         self.expect(&Token::While)?;
+        self.suppress_struct_lit = true;
         let cond = self.parse_expr()?;
+        self.suppress_struct_lit = false;
         let body = self.parse_block()?;
         Ok(Expr::While {
             cond: Box::new(cond),
@@ -2514,6 +2554,40 @@ mod tests {
                 }
             }
             _ => panic!("expected Binary(Add, ..)"),
+        }
+    }
+
+    #[test]
+    fn test_logical_precedence() {
+        // a == b && c == d || e == f should parse as:
+        // Or(And(Eq(a, b), Eq(c, d)), Eq(e, f))
+        let prog = parse("fn f() { a == b && c == d || e == f; }").unwrap();
+        match &prog.funcs[0].body.stmts[0] {
+            Stmt::Expr(Expr::Binary {
+                op: BinOp::Or,
+                lhs,
+                rhs,
+            }) => {
+                match lhs.as_ref() {
+                    Expr::Binary {
+                        op: BinOp::And,
+                        lhs: inner_lhs,
+                        rhs: inner_rhs,
+                    } => {
+                        assert!(matches!(
+                            inner_lhs.as_ref(),
+                            Expr::Binary { op: BinOp::Eq, .. }
+                        ));
+                        assert!(matches!(
+                            inner_rhs.as_ref(),
+                            Expr::Binary { op: BinOp::Eq, .. }
+                        ));
+                    }
+                    _ => panic!("expected And as lhs of Or"),
+                }
+                assert!(matches!(rhs.as_ref(), Expr::Binary { op: BinOp::Eq, .. }));
+            }
+            _ => panic!("expected Binary(Or, ..)"),
         }
     }
 

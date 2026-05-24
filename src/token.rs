@@ -102,6 +102,9 @@ mod tests {
         assert_eq!(Token::Gt, Token::Gt);
         assert_eq!(Token::Le, Token::Le);
         assert_eq!(Token::Ge, Token::Ge);
+        assert_eq!(Token::AndAnd, Token::AndAnd);
+        assert_eq!(Token::OrOr, Token::OrOr);
+        assert_eq!(Token::Pipe, Token::Pipe);
         assert_eq!(Token::Eof, Token::Eof);
     }
 }
@@ -184,11 +187,14 @@ pub enum Token {
     LBracket, // [
     RBracket, // ]
     // Operators (cont.)
-    EqEq, // ==
-    Lt,   // <
-    Gt,   // >
-    Le,   // <=
-    Ge,   // >=
+    EqEq,   // ==
+    Lt,     // <
+    Gt,     // >
+    Le,     // <=
+    Ge,     // >=
+    AndAnd, // &&
+    OrOr,   // ||
+    Pipe,   // |
     // Pattern matching
     Match,
     FatArrow, // =>

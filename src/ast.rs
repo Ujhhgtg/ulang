@@ -209,6 +209,8 @@ pub enum BinOp {
     Gt,
     Le,
     Ge,
+    And,
+    Or,
 }
 
 #[allow(dead_code)]

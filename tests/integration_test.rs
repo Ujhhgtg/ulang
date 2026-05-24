@@ -456,3 +456,20 @@ fn test_result_stdlib() {
         }"#
     ));
 }
+
+#[test]
+fn test_logical_and_or() {
+    assert!(run_test(
+        "logical_and_or",
+        r#"fn main() -> i32 {
+            let x = 10;
+            let y = 20;
+            let a = x < 15 && y > 15;
+            let b = x > 15 || y > 15;
+            if a && b {
+                return 0;
+            };
+            return 1;
+        }"#
+    ));
+}

@@ -1487,7 +1487,12 @@ impl<'ctx> CodeGen<'ctx> {
 
         // Scan for generic enum literals (e.g., Option::Some(42) needs Option<i32>)
         for func in &program.funcs {
-            Self::collect_enum_lits_from_block(&func.body, &mut instances, &mut seen, &one_param_enums);
+            Self::collect_enum_lits_from_block(
+                &func.body,
+                &mut instances,
+                &mut seen,
+                &one_param_enums,
+            );
         }
 
         // Scan structs
@@ -1590,7 +1595,8 @@ impl<'ctx> CodeGen<'ctx> {
                         let payload_ty = Self::literal_type(payload_expr);
                         // Only for primitive payloads (skip type params like T)
                         if Self::is_concrete_type(&payload_ty) {
-                            let key = Self::mangle_generic_instance(enum_name, &[payload_ty.clone()]);
+                            let key =
+                                Self::mangle_generic_instance(enum_name, &[payload_ty.clone()]);
                             if seen.insert(key) {
                                 instances.push((enum_name.clone(), vec![payload_ty]));
                             }
@@ -2371,7 +2377,14 @@ impl<'ctx> CodeGen<'ctx> {
             Expr::Binary { op, lhs, rhs, .. }
                 if !matches!(
                     op,
-                    BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge
+                    BinOp::Eq
+                        | BinOp::Neq
+                        | BinOp::Lt
+                        | BinOp::Gt
+                        | BinOp::Le
+                        | BinOp::Ge
+                        | BinOp::And
+                        | BinOp::Or
                 ) =>
             {
                 let lhs_ty = self.expr_type(lhs);
@@ -2463,7 +2476,10 @@ impl<'ctx> CodeGen<'ctx> {
                     _ => Type::I32,
                 }
             }
-            Expr::Ref { expr: inner, is_mut } => Type::Ref {
+            Expr::Ref {
+                expr: inner,
+                is_mut,
+            } => Type::Ref {
                 inner: Box::new(self.expr_type(inner)),
                 is_mut: *is_mut,
             },
@@ -2520,7 +2536,15 @@ impl<'ctx> CodeGen<'ctx> {
             Expr::StructLit { struct_name, .. } => Type::Struct(struct_name.clone()),
             Expr::EnumLit { enum_name, .. } => Type::Struct(enum_name.clone()),
             Expr::Binary {
-                op: BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge,
+                op:
+                    BinOp::Eq
+                    | BinOp::Neq
+                    | BinOp::Lt
+                    | BinOp::Gt
+                    | BinOp::Le
+                    | BinOp::Ge
+                    | BinOp::And
+                    | BinOp::Or,
                 ..
             } => Type::Bool,
             Expr::Array(elems) => {
@@ -3517,6 +3541,220 @@ impl<'ctx> CodeGen<'ctx> {
                 Ok(self.try_extract_result(result))
             }
             Expr::Binary { op, lhs, rhs } => {
+                if *op == BinOp::And {
+                    let parent_fn = self
+                        .builder
+                        .get_insert_block()
+                        .unwrap()
+                        .get_parent()
+                        .unwrap();
+
+                    let rhs_bb = self.context.append_basic_block(parent_fn, "and_rhs");
+                    let merge_bb = self.context.append_basic_block(parent_fn, "and_merge");
+
+                    let result_alloca = self
+                        .builder
+                        .build_alloca(self.bool_type, "and_result")
+                        .map_err(|e| format!("failed to build and result alloca: {}", e))?;
+
+                    let lhs_val = self.compile_expr(lhs)?;
+                    let lhs_i1 = match lhs_val {
+                        BasicValueEnum::IntValue(v) => {
+                            if v.get_type().get_bit_width() != 1 {
+                                let zero = v.get_type().const_zero();
+                                self.builder
+                                    .build_int_compare(inkwell::IntPredicate::NE, v, zero, "lhs_i1")
+                                    .map_err(|e| format!("failed to compare lhs != 0: {}", e))?
+                            } else {
+                                v
+                            }
+                        }
+                        _ => {
+                            return Err(
+                                "logical AND operands must be booleans or integers".to_string()
+                            );
+                        }
+                    };
+
+                    self.builder
+                        .build_store(result_alloca, lhs_i1)
+                        .map_err(|e| format!("failed to store lhs: {}", e))?;
+
+                    let lhs_terminated = self
+                        .builder
+                        .get_insert_block()
+                        .unwrap()
+                        .get_terminator()
+                        .is_some();
+
+                    if lhs_terminated {
+                        return Ok(lhs_val);
+                    }
+
+                    self.builder
+                        .build_conditional_branch(lhs_i1, rhs_bb, merge_bb)
+                        .map_err(|e| {
+                            format!("failed to build conditional branch for AND: {}", e)
+                        })?;
+
+                    // Compile RHS
+                    self.builder.position_at_end(rhs_bb);
+                    let rhs_val = self.compile_expr(rhs)?;
+                    let rhs_i1 = match rhs_val {
+                        BasicValueEnum::IntValue(v) => {
+                            if v.get_type().get_bit_width() != 1 {
+                                let zero = v.get_type().const_zero();
+                                self.builder
+                                    .build_int_compare(inkwell::IntPredicate::NE, v, zero, "rhs_i1")
+                                    .map_err(|e| format!("failed to compare rhs != 0: {}", e))?
+                            } else {
+                                v
+                            }
+                        }
+                        _ => {
+                            return Err(
+                                "logical AND operands must be booleans or integers".to_string()
+                            );
+                        }
+                    };
+
+                    self.builder
+                        .build_store(result_alloca, rhs_i1)
+                        .map_err(|e| format!("failed to store rhs: {}", e))?;
+
+                    let rhs_terminated = self
+                        .builder
+                        .get_insert_block()
+                        .unwrap()
+                        .get_terminator()
+                        .is_some();
+
+                    if !rhs_terminated {
+                        self.builder
+                            .build_unconditional_branch(merge_bb)
+                            .map_err(|e| {
+                                format!(
+                                    "failed to build unconditional branch to merge for AND: {}",
+                                    e
+                                )
+                            })?;
+                    }
+
+                    // Merge Block
+                    self.builder.position_at_end(merge_bb);
+                    let res = self
+                        .builder
+                        .build_load(self.bool_type, result_alloca, "and_res")
+                        .map_err(|e| format!("failed to load AND result: {}", e))?;
+                    return Ok(res);
+                }
+
+                if *op == BinOp::Or {
+                    let parent_fn = self
+                        .builder
+                        .get_insert_block()
+                        .unwrap()
+                        .get_parent()
+                        .unwrap();
+
+                    let rhs_bb = self.context.append_basic_block(parent_fn, "or_rhs");
+                    let merge_bb = self.context.append_basic_block(parent_fn, "or_merge");
+
+                    let result_alloca = self
+                        .builder
+                        .build_alloca(self.bool_type, "or_result")
+                        .map_err(|e| format!("failed to build or result alloca: {}", e))?;
+
+                    let lhs_val = self.compile_expr(lhs)?;
+                    let lhs_i1 = match lhs_val {
+                        BasicValueEnum::IntValue(v) => {
+                            if v.get_type().get_bit_width() != 1 {
+                                let zero = v.get_type().const_zero();
+                                self.builder
+                                    .build_int_compare(inkwell::IntPredicate::NE, v, zero, "lhs_i1")
+                                    .map_err(|e| format!("failed to compare lhs != 0: {}", e))?
+                            } else {
+                                v
+                            }
+                        }
+                        _ => {
+                            return Err(
+                                "logical OR operands must be booleans or integers".to_string()
+                            );
+                        }
+                    };
+
+                    self.builder
+                        .build_store(result_alloca, lhs_i1)
+                        .map_err(|e| format!("failed to store lhs: {}", e))?;
+
+                    let lhs_terminated = self
+                        .builder
+                        .get_insert_block()
+                        .unwrap()
+                        .get_terminator()
+                        .is_some();
+
+                    if lhs_terminated {
+                        return Ok(lhs_val);
+                    }
+
+                    self.builder
+                        .build_conditional_branch(lhs_i1, merge_bb, rhs_bb)
+                        .map_err(|e| format!("failed to build conditional branch for OR: {}", e))?;
+
+                    // Compile RHS
+                    self.builder.position_at_end(rhs_bb);
+                    let rhs_val = self.compile_expr(rhs)?;
+                    let rhs_i1 = match rhs_val {
+                        BasicValueEnum::IntValue(v) => {
+                            if v.get_type().get_bit_width() != 1 {
+                                let zero = v.get_type().const_zero();
+                                self.builder
+                                    .build_int_compare(inkwell::IntPredicate::NE, v, zero, "rhs_i1")
+                                    .map_err(|e| format!("failed to compare rhs != 0: {}", e))?
+                            } else {
+                                v
+                            }
+                        }
+                        _ => {
+                            return Err(
+                                "logical OR operands must be booleans or integers".to_string()
+                            );
+                        }
+                    };
+
+                    self.builder
+                        .build_store(result_alloca, rhs_i1)
+                        .map_err(|e| format!("failed to store rhs: {}", e))?;
+
+                    let rhs_terminated = self
+                        .builder
+                        .get_insert_block()
+                        .unwrap()
+                        .get_terminator()
+                        .is_some();
+
+                    if !rhs_terminated {
+                        self.builder
+                            .build_unconditional_branch(merge_bb)
+                            .map_err(|e| {
+                                format!(
+                                    "failed to build unconditional branch to merge for OR: {}",
+                                    e
+                                )
+                            })?;
+                    }
+
+                    // Merge Block
+                    self.builder.position_at_end(merge_bb);
+                    let res = self
+                        .builder
+                        .build_load(self.bool_type, result_alloca, "or_res")
+                        .map_err(|e| format!("failed to load OR result: {}", e))?;
+                    return Ok(res);
+                }
+
                 let lhs_val = self.compile_expr(lhs)?;
                 let rhs_val = self.compile_expr(rhs)?;
 
@@ -4978,6 +5216,8 @@ impl<'ctx> CodeGen<'ctx> {
                     BinOp::Gt => Ok(if lhs > rhs { 1 } else { 0 }),
                     BinOp::Le => Ok(if lhs <= rhs { 1 } else { 0 }),
                     BinOp::Ge => Ok(if lhs >= rhs { 1 } else { 0 }),
+                    BinOp::And => Ok(if lhs != 0 && rhs != 0 { 1 } else { 0 }),
+                    BinOp::Or => Ok(if lhs != 0 || rhs != 0 { 1 } else { 0 }),
                 }
             }
             Expr::Ref { .. } => {
@@ -5314,6 +5554,124 @@ mod tests {
     #[test]
     fn test_jit_arithmetic() {
         assert_eq!(jit("fn main() { 1+2*3; }").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_jit_logical_and_tt() {
+        assert_eq!(
+            jit("fn main() -> i32 { (true && true) as i32 }").unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_jit_logical_and_tf() {
+        assert_eq!(
+            jit("fn main() -> i32 { (true && false) as i32 }").unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_jit_logical_and_ft() {
+        assert_eq!(
+            jit("fn main() -> i32 { (false && true) as i32 }").unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_jit_logical_and_ff() {
+        assert_eq!(
+            jit("fn main() -> i32 { (false && false) as i32 }").unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_jit_logical_and_ints_t() {
+        assert_eq!(jit("fn main() -> i32 { (1 && 2) as i32 }").unwrap(), 1);
+    }
+
+    #[test]
+    fn test_jit_logical_and_ints_f() {
+        assert_eq!(jit("fn main() -> i32 { (0 && 2) as i32 }").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_jit_logical_or_tt() {
+        assert_eq!(
+            jit("fn main() -> i32 { (true || true) as i32 }").unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_jit_logical_or_tf() {
+        assert_eq!(
+            jit("fn main() -> i32 { (true || false) as i32 }").unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_jit_logical_or_ft() {
+        assert_eq!(
+            jit("fn main() -> i32 { (false || true) as i32 }").unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_jit_logical_or_ff() {
+        assert_eq!(
+            jit("fn main() -> i32 { (false || false) as i32 }").unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_jit_logical_or_ints_t() {
+        assert_eq!(jit("fn main() -> i32 { (0 || 2) as i32 }").unwrap(), 1);
+    }
+
+    #[test]
+    fn test_jit_logical_or_ints_f() {
+        assert_eq!(jit("fn main() -> i32 { (0 || 0) as i32 }").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_jit_logical_short_circuit_and() {
+        // AND short-circuiting: false && mutate(...) => mutate should not run
+        let src_and = "
+            fn mutate(ptr: *mut i32) -> bool {
+                *ptr = 42;
+                true
+            }
+            fn main() -> i32 {
+                let mut x = 0;
+                let res = false && mutate(&mut x);
+                x
+            }
+        ";
+        assert_eq!(jit(src_and).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_jit_logical_short_circuit_or() {
+        // OR short-circuiting: true || mutate(...) => mutate should not run
+        let src_or = "
+            fn mutate(ptr: *mut i32) -> bool {
+                *ptr = 42;
+                true
+            }
+            fn main() -> i32 {
+                let mut x = 0;
+                let res = true || mutate(&mut x);
+                x
+            }
+        ";
+        assert_eq!(jit(src_or).unwrap(), 0);
     }
 
     #[test]
@@ -5701,7 +6059,8 @@ mod tests {
                     let opt = Option::Some(42);
                     opt.unwrap_or(0)
                 }
-            ").unwrap(),
+            ")
+            .unwrap(),
             42
         );
         assert_eq!(
@@ -5719,7 +6078,8 @@ mod tests {
                     let opt: Option<i32> = Option::None;
                     opt.unwrap_or(42)
                 }
-            ").unwrap(),
+            ")
+            .unwrap(),
             42
         );
     }
@@ -5741,7 +6101,8 @@ mod tests {
                     let res: Result<i32, i32> = Result::Ok(100);
                     if res.is_ok() { 42 } else { 0 }
                 }
-            ").unwrap(),
+            ")
+            .unwrap(),
             42
         );
     }

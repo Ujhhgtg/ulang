@@ -1,0 +1,63 @@
+extern "C" {
+    fn malloc(size: usize) -> *mut u8;
+    fn realloc(ptr: *mut u8, new_size: usize) -> *mut u8;
+    fn free(ptr: *mut u8);
+    fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut u8;
+}
+
+struct String {
+    ptr: *mut u8,
+    len: usize,
+    cap: usize,
+}
+
+impl String {
+    fn new() -> String {
+        String { ptr: 0 as *mut u8, len: 0, cap: 0 }
+    }
+
+    fn with_capacity(cap: usize) -> String {
+        let ptr = if cap == 0 { 0 as *mut u8 } else { malloc(cap) };
+        String { ptr: ptr, len: 0, cap: cap }
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn capacity(&self) -> usize {
+        self.cap
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    fn push_str(&mut self, s: &str) {
+        let new_len = self.len + s.1;
+        if new_len > self.cap {
+            let ptr = malloc(new_len);
+            memcpy(ptr, self.ptr, self.len);
+            if self.cap > 0 {
+                free(self.ptr);
+            };
+            self.ptr = ptr;
+            self.cap = new_len;
+        };
+        memcpy((self.ptr as usize + self.len) as *mut u8, s.0, s.1);
+        self.len = new_len;
+    }
+
+    fn drop(&mut self) {
+        if self.cap > 0 {
+            free(self.ptr);
+            self.ptr = 0 as *mut u8;
+            self.len = 0;
+            self.cap = 0;
+        };
+    }
+}

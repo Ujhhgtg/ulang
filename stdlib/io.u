@@ -1,0 +1,19 @@
+extern "C" {
+    fn printf(fmt: *const i8, ...) -> i32;
+}
+
+fn print(x: i32) {
+    printf("%d".0, x);
+}
+
+fn println(x: i32) {
+    printf("%d\n".0, x);
+}
+
+fn print(s: &str) {
+    printf("%s".0, s.0);
+}
+
+fn println(s: &str) {
+    printf("%s\n".0, s.0);
+}

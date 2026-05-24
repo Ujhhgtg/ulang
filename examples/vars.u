@@ -1,0 +1,18 @@
+// Variables, mutability, constants, and assignment
+use std::io::println;
+
+fn main() {
+    // Immutable variable (default)
+    let x = 10;
+
+    // Mutable variable
+    let mut y = 20;
+    y = y + 5;
+
+    // Constant (compile-time evaluated)
+    const FACTOR: i32 = 3;
+    const SCALED: i32 = FACTOR * 7;
+
+    let result = x + y + SCALED;
+    println(result);
+}

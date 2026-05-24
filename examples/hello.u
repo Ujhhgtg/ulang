@@ -1,0 +1,8 @@
+// Print string literals and integers using overloaded println
+use std::io::println;
+
+fn main() {
+    println("hello");
+    println("world");
+    println(42);
+}

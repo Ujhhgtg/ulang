@@ -1,0 +1,11 @@
+extern "C" {
+    fn _Exit(code: i32) -> !;
+}
+
+fn exit() -> ! {
+    _Exit(0);
+}
+
+fn exit(code: i32) -> ! {
+    _Exit(code);
+}

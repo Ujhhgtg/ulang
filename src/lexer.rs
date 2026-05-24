@@ -42,7 +42,12 @@ impl<'a> Lexer<'a> {
             }
             '-' => {
                 self.advance();
-                Token::Minus
+                if self.current_char() == Some('>') {
+                    self.advance();
+                    Token::RArrow
+                } else {
+                    Token::Minus
+                }
             }
             '*' => {
                 self.advance();
@@ -52,17 +57,49 @@ impl<'a> Lexer<'a> {
                 self.advance();
                 Token::Slash
             }
+            ':' => {
+                self.advance();
+                if self.current_char() == Some(':') {
+                    self.advance();
+                    Token::DoubleColon
+                } else {
+                    Token::Colon
+                }
+            }
             '=' => {
                 self.advance();
-                Token::Eq
+                if self.current_char() == Some('=') {
+                    self.advance();
+                    Token::EqEq
+                } else {
+                    Token::Eq
+                }
             }
             ';' => {
                 self.advance();
                 Token::Semicolon
             }
+            '.' => {
+                self.advance();
+                if self.current_char() == Some('.') {
+                    self.advance();
+                    if self.current_char() == Some('.') {
+                        self.advance();
+                        Token::Ellipsis
+                    } else {
+                        return Err("unexpected token '..'".to_string());
+                    }
+                } else {
+                    Token::Dot
+                }
+            }
             '(' => {
                 self.advance();
                 Token::LParen
+            }
+            ',' => {
+                self.advance();
+                Token::Comma
             }
             ')' => {
                 self.advance();
@@ -76,15 +113,94 @@ impl<'a> Lexer<'a> {
                 self.advance();
                 Token::RBrace
             }
-            c if c.is_ascii_digit() => {
-                let num = self.read_number();
-                Token::IntLit(num)
+            '&' => {
+                self.advance();
+                Token::Ampersand
             }
+            '!' => {
+                self.advance();
+                if self.current_char() == Some('=') {
+                    self.advance();
+                    Token::BangEq
+                } else {
+                    Token::Bang
+                }
+            }
+            '<' => {
+                self.advance();
+                if self.current_char() == Some('=') {
+                    self.advance();
+                    Token::Le
+                } else {
+                    Token::Lt
+                }
+            }
+            '>' => {
+                self.advance();
+                if self.current_char() == Some('=') {
+                    self.advance();
+                    Token::Ge
+                } else {
+                    Token::Gt
+                }
+            }
+            '#' => {
+                self.advance();
+                Token::Pound
+            }
+            '[' => {
+                self.advance();
+                Token::LBracket
+            }
+            ']' => {
+                self.advance();
+                Token::RBracket
+            }
+            '"' => {
+                self.advance(); // consume opening "
+                let s = self.read_string()?;
+                Token::StrLit(s)
+            }
+            c if c.is_ascii_digit() => self.read_number_or_float()?,
             c if c.is_ascii_alphabetic() || c == '_' => {
                 let ident = self.read_identifier();
                 match ident.as_str() {
                     "fn" => Token::Fn,
                     "let" => Token::Let,
+                    "mut" => Token::Mut,
+                    "const" => Token::Const,
+                    "use" => Token::Use,
+                    "extern" => Token::Extern,
+                    "as" => Token::As,
+                    // Type names
+                    "i8" => Token::I8,
+                    "i16" => Token::I16,
+                    "i32" => Token::I32,
+                    "i64" => Token::I64,
+                    "u8" => Token::U8,
+                    "u16" => Token::U16,
+                    "u32" => Token::U32,
+                    "u64" => Token::U64,
+                    "usize" => Token::Usize,
+                    "isize" => Token::Isize,
+                    "f32" => Token::F32,
+                    "f64" => Token::F64,
+                    "str" => Token::Str,
+                    "bool" => Token::Bool,
+                    "true" => Token::True,
+                    "false" => Token::False,
+                    "if" => Token::If,
+                    "else" => Token::Else,
+                    "loop" => Token::Loop,
+                    "while" => Token::While,
+                    "return" => Token::Return,
+                    "struct" => Token::Struct,
+                    "impl" => Token::Impl,
+                    "trait" => Token::Trait,
+                    "for" => Token::For,
+                    "self" => Token::Self_,
+                    "Self" => Token::SelfType,
+                    "_" => Token::Underscore,
                     _ => Token::Ident(ident),
                 }
             }
@@ -108,12 +224,111 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    fn read_number(&mut self) -> i64 {
+    fn read_number_or_float(&mut self) -> Result<Token, String> {
         let lo = self.pos;
         while self.pos < self.source.len() && self.current_char().unwrap().is_ascii_digit() {
             self.advance();
         }
-        self.source[lo..self.pos].parse().unwrap()
+        // Check for float literal (digit-sequence . digit-sequence)
+        if self.pos < self.source.len() && self.current_char() == Some('.') {
+            // Check if the next char after '.' is a digit (to avoid parsing e.g. "foo.bar")
+            let saved = self.pos;
+            self.advance(); // consume '.'
+            if self.pos < self.source.len() && self.current_char().unwrap().is_ascii_digit() {
+                while self.pos < self.source.len() && self.current_char().unwrap().is_ascii_digit()
+                {
+                    self.advance();
+                }
+                let val: f64 = self.source[lo..self.pos].parse().map_err(|_| {
+                    format!("invalid float literal '{}'", &self.source[lo..self.pos])
+                })?;
+                if let Some(suffix_token) = self.try_read_type_suffix() {
+                    return Ok(Token::FloatSuffixLit(val, Box::new(suffix_token)));
+                }
+                return Ok(Token::FloatLit(val));
+            } else {
+                // Not a float, restore position and treat as integer
+                self.pos = saved;
+            }
+        }
+        let val: i64 = self.source[lo..self.pos]
+            .parse()
+            .map_err(|_| format!("invalid integer literal '{}'", &self.source[lo..self.pos]))?;
+        // Check for type suffix like 42i32, 255u8
+        if let Some(suffix_token) = self.try_read_type_suffix() {
+            Ok(Token::IntSuffixLit(val, Box::new(suffix_token)))
+        } else {
+            Ok(Token::IntLit(val))
+        }
+    }
+
+    /// After reading the numeric part, check if the upcoming chars form a type name suffix.
+    /// If yes, consume them and return the corresponding type name token.
+    /// If no, return None without advancing the position.
+    fn try_read_type_suffix(&mut self) -> Option<Token> {
+        let saved = self.pos;
+        let ident = self.read_identifier();
+        match ident.as_str() {
+            "i8" => Some(Token::I8),
+            "i16" => Some(Token::I16),
+            "i32" => Some(Token::I32),
+            "i64" => Some(Token::I64),
+            "u8" => Some(Token::U8),
+            "u16" => Some(Token::U16),
+            "u32" => Some(Token::U32),
+            "u64" => Some(Token::U64),
+            "usize" => Some(Token::Usize),
+            "isize" => Some(Token::Isize),
+            "f32" => Some(Token::F32),
+            "f64" => Some(Token::F64),
+            _ => {
+                // Not a type suffix — restore position
+                self.pos = saved;
+                None
+            }
+        }
+    }
+
+    fn read_string(&mut self) -> Result<String, String> {
+        let mut s = String::new();
+        loop {
+            match self.current_char() {
+                Some('"') => {
+                    self.advance(); // consume closing "
+                    return Ok(s);
+                }
+                Some('\\') => {
+                    self.advance();
+                    match self.current_char() {
+                        Some('n') => {
+                            s.push('\n');
+                            self.advance();
+                        }
+                        Some('\\') => {
+                            s.push('\\');
+                            self.advance();
+                        }
+                        Some('"') => {
+                            s.push('"');
+                            self.advance();
+                        }
+                        Some(c) => {
+                            return Err(format!("invalid escape sequence '\\{}'", c));
+                        }
+                        None => {
+                            return Err("unterminated string literal after backslash".to_string());
+                        }
+                    }
+                }
+                Some(c) => {
+                    s.push(c);
+                    self.advance();
+                }
+                None => {
+                    return Err("unterminated string literal".to_string());
+                }
+            }
+        }
     }
 
     fn read_identifier(&mut self) -> String {
@@ -195,10 +410,12 @@ mod tests {
 
     #[test]
     fn test_keywords() {
-        let tokens = lex_all("fn let");
+        let tokens = lex_all("fn let mut const");
         assert_eq!(tokens[0].0, Token::Fn);
         assert_eq!(tokens[1].0, Token::Let);
-        assert!(matches!(tokens[2].0, Token::Eof));
+        assert_eq!(tokens[2].0, Token::Mut);
+        assert_eq!(tokens[3].0, Token::Const);
+        assert!(matches!(tokens[4].0, Token::Eof));
     }
 
     #[test]
@@ -265,6 +482,278 @@ mod tests {
         let result = lexer.next_token();
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), "unexpected character '@'");
+    }
+
+    #[test]
+    fn test_float_literal() {
+        let tokens = lex_all("3.14");
+        assert_eq!(tokens[0].0, Token::FloatLit(3.14));
+        assert!(matches!(tokens[1].0, Token::Eof));
+    }
+
+    #[test]
+    fn test_float_leading_zero() {
+        let tokens = lex_all("0.5");
+        assert_eq!(tokens[0].0, Token::FloatLit(0.5));
+        assert!(matches!(tokens[1].0, Token::Eof));
+    }
+
+    #[test]
+    fn test_colon_token() {
+        let tokens = lex_all(":");
+        assert_eq!(tokens[0].0, Token::Colon);
+        assert!(matches!(tokens[1].0, Token::Eof));
+    }
+
+    #[test]
+    fn test_ampersand_token() {
+        let tokens = lex_all("&");
+        assert_eq!(tokens[0].0, Token::Ampersand);
+        assert!(matches!(tokens[1].0, Token::Eof));
+    }
+
+    #[test]
+    fn test_as_keyword() {
+        let tokens = lex_all("as");
+        assert_eq!(tokens[0].0, Token::As);
+        assert!(matches!(tokens[1].0, Token::Eof));
+    }
+
+    #[test]
+    fn test_bool_keyword() {
+        let tokens = lex_all("bool");
+        assert_eq!(tokens[0].0, Token::Bool);
+        assert!(matches!(tokens[1].0, Token::Eof));
+    }
+
+    #[test]
+    fn test_true_false_literals() {
+        let tokens = lex_all("true false");
+        assert_eq!(tokens[0].0, Token::True);
+        assert_eq!(tokens[1].0, Token::False);
+        assert!(matches!(tokens[2].0, Token::Eof));
+    }
+
+    #[test]
+    fn test_type_name_tokens() {
+        let types = [
+            ("i8", Token::I8),
+            ("i16", Token::I16),
+            ("i32", Token::I32),
+            ("i64", Token::I64),
+            ("u8", Token::U8),
+            ("u16", Token::U16),
+            ("u32", Token::U32),
+            ("u64", Token::U64),
+            ("usize", Token::Usize),
+            ("isize", Token::Isize),
+            ("f32", Token::F32),
+            ("f64", Token::F64),
+        ];
+        for (s, expected) in &types {
+            let tokens = lex_all(s);
+            assert_eq!(tokens[0].0, *expected, "type token '{}' mismatch", s);
+            assert!(matches!(tokens[1].0, Token::Eof));
+        }
+    }
+
+    #[test]
+    fn test_typed_let() {
+        let tokens = lex_all("let x: i32 = 42");
+        assert_eq!(tokens[0].0, Token::Let);
+        assert_eq!(tokens[1].0, Token::Ident("x".into()));
+        assert_eq!(tokens[2].0, Token::Colon);
+        assert_eq!(tokens[3].0, Token::I32);
+        assert_eq!(tokens[4].0, Token::Eq);
+        assert_eq!(tokens[5].0, Token::IntLit(42));
+        assert!(matches!(tokens[6].0, Token::Eof));
+    }
+
+    #[test]
+    fn test_as_cast_syntax() {
+        let tokens = lex_all("x as f64");
+        assert_eq!(tokens[0].0, Token::Ident("x".into()));
+        assert_eq!(tokens[1].0, Token::As);
+        assert_eq!(tokens[2].0, Token::F64);
+        assert!(matches!(tokens[3].0, Token::Eof));
+    }
+
+    #[test]
+    fn test_int_suffix_lit() {
+        let tokens = lex_all("42i32");
+        assert_eq!(tokens[0].0, Token::IntSuffixLit(42, Box::new(Token::I32)));
+        assert!(matches!(tokens[1].0, Token::Eof));
+    }
+
+    #[test]
+    fn test_u8_suffix_lit() {
+        let tokens = lex_all("255u8");
+        assert_eq!(tokens[0].0, Token::IntSuffixLit(255, Box::new(Token::U8)));
+        assert!(matches!(tokens[1].0, Token::Eof));
+    }
+
+    #[test]
+    fn test_i64_suffix_lit() {
+        let tokens = lex_all("1000i64");
+        assert_eq!(tokens[0].0, Token::IntSuffixLit(1000, Box::new(Token::I64)));
+        assert!(matches!(tokens[1].0, Token::Eof));
+    }
+
+    #[test]
+    fn test_float_suffix_lit() {
+        let tokens = lex_all("3.14f64");
+        assert_eq!(
+            tokens[0].0,
+            Token::FloatSuffixLit(3.14, Box::new(Token::F64))
+        );
+        assert!(matches!(tokens[1].0, Token::Eof));
+    }
+
+    #[test]
+    fn test_f32_suffix_lit() {
+        let tokens = lex_all("1.5f32");
+        assert_eq!(
+            tokens[0].0,
+            Token::FloatSuffixLit(1.5, Box::new(Token::F32))
+        );
+        assert!(matches!(tokens[1].0, Token::Eof));
+    }
+
+    #[test]
+    fn test_if_keyword() {
+        let tokens = lex_all("if");
+        assert_eq!(tokens[0].0, Token::If);
+        assert!(matches!(tokens[1].0, Token::Eof));
+    }
+
+    #[test]
+    fn test_else_keyword() {
+        let tokens = lex_all("else");
+        assert_eq!(tokens[0].0, Token::Else);
+        assert!(matches!(tokens[1].0, Token::Eof));
+    }
+
+    #[test]
+    fn test_loop_keyword() {
+        let tokens = lex_all("loop");
+        assert_eq!(tokens[0].0, Token::Loop);
+        assert!(matches!(tokens[1].0, Token::Eof));
+    }
+
+    #[test]
+    fn test_while_keyword() {
+        let tokens = lex_all("while");
+        assert_eq!(tokens[0].0, Token::While);
+        assert!(matches!(tokens[1].0, Token::Eof));
+    }
+
+    #[test]
+    fn test_return_keyword() {
+        let tokens = lex_all("return");
+        assert_eq!(tokens[0].0, Token::Return);
+        assert!(matches!(tokens[1].0, Token::Eof));
+    }
+
+    #[test]
+    fn test_eqeq_operator() {
+        let tokens = lex_all("==");
+        assert_eq!(tokens[0].0, Token::EqEq);
+        assert!(matches!(tokens[1].0, Token::Eof));
+    }
+
+    #[test]
+    fn test_bangeq_operator() {
+        let tokens = lex_all("!=");
+        assert_eq!(tokens[0].0, Token::BangEq);
+        assert!(matches!(tokens[1].0, Token::Eof));
+    }
+
+    #[test]
+    fn test_lt_operator() {
+        let tokens = lex_all("<");
+        assert_eq!(tokens[0].0, Token::Lt);
+        assert!(matches!(tokens[1].0, Token::Eof));
+    }
+
+    #[test]
+    fn test_gt_operator() {
+        let tokens = lex_all(">");
+        assert_eq!(tokens[0].0, Token::Gt);
+        assert!(matches!(tokens[1].0, Token::Eof));
+    }
+
+    #[test]
+    fn test_le_operator() {
+        let tokens = lex_all("<=");
+        assert_eq!(tokens[0].0, Token::Le);
+        assert!(matches!(tokens[1].0, Token::Eof));
+    }
+
+    #[test]
+    fn test_ge_operator() {
+        let tokens = lex_all(">=");
+        assert_eq!(tokens[0].0, Token::Ge);
+        assert!(matches!(tokens[1].0, Token::Eof));
+    }
+
+    #[test]
+    fn test_bang_equals_does_not_break_bang() {
+        let tokens = lex_all("!x");
+        assert_eq!(tokens[0].0, Token::Bang);
+        assert_eq!(tokens[1].0, Token::Ident("x".into()));
+        assert!(matches!(tokens[2].0, Token::Eof));
+    }
+
+    #[test]
+    fn test_equals_does_not_break_eqeq() {
+        let tokens = lex_all("=x");
+        assert_eq!(tokens[0].0, Token::Eq);
+        assert_eq!(tokens[1].0, Token::Ident("x".into()));
+        assert!(matches!(tokens[2].0, Token::Eof));
+    }
+
+    #[test]
+    fn test_control_flow_lexing() {
+        let tokens = lex_all("if cond { 1 } else { 2 }");
+        assert_eq!(tokens[0].0, Token::If);
+        assert_eq!(tokens[1].0, Token::Ident("cond".into()));
+        assert_eq!(tokens[2].0, Token::LBrace);
+        assert_eq!(tokens[3].0, Token::IntLit(1));
+        assert_eq!(tokens[4].0, Token::RBrace);
+        assert_eq!(tokens[5].0, Token::Else);
+        assert_eq!(tokens[6].0, Token::LBrace);
+        assert_eq!(tokens[7].0, Token::IntLit(2));
+        assert_eq!(tokens[8].0, Token::RBrace);
+        assert!(matches!(tokens[9].0, Token::Eof));
+    }
+
+    #[test]
+    fn test_comparison_in_expression() {
+        let tokens = lex_all("x == y");
+        assert_eq!(tokens[0].0, Token::Ident("x".into()));
+        assert_eq!(tokens[1].0, Token::EqEq);
+        assert_eq!(tokens[2].0, Token::Ident("y".into()));
+        assert!(matches!(tokens[3].0, Token::Eof));
+    }
+
+    #[test]
+    fn test_suffix_in_expression() {
+        let tokens = lex_all("let x = 42i32;");
+        assert_eq!(tokens[0].0, Token::Let);
+        assert_eq!(tokens[1].0, Token::Ident("x".into()));
+        assert_eq!(tokens[2].0, Token::Eq);
+        assert_eq!(tokens[3].0, Token::IntSuffixLit(42, Box::new(Token::I32)));
+        assert_eq!(tokens[4].0, Token::Semicolon);
+        assert!(matches!(tokens[5].0, Token::Eof));
+    }
+
+    #[test]
+    fn test_non_type_suffix_not_consumed() {
+        // 42foo should lex as IntLit(42) then Ident("foo")
+        let tokens = lex_all("42foo");
+        assert_eq!(tokens[0].0, Token::IntLit(42));
+        assert_eq!(tokens[1].0, Token::Ident("foo".into()));
+        assert!(matches!(tokens[2].0, Token::Eof));
     }
 
     #[test]

@@ -1,4 +1,6 @@
+use std::io::println;
+
 fn main() {
     let x = 2 + 3;
-    print(x);
+    println(x);
 }

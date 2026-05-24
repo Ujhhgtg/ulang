@@ -1,0 +1,31 @@
+// Type annotations, casts, literal suffixes, tuples, and strings
+use std::io::println;
+
+fn main() {
+    // Explicit type annotation
+    let x: i64 = 100;
+    let y: u8 = 42;
+    let z: f64 = 3.14;
+
+    // Cast between types
+    let sum = x + (y as i64);
+    let truncated = z as i32;
+
+    // Literal suffixes as shorthand for cast
+    let a = 42i64;
+    let b = 255u8;
+
+    // Tuples and member access
+    let pair = (10, 20);
+    let first = pair.0;
+    let second = pair.1;
+
+    // String literal as &str, printed via println (overloaded)
+    println("hello, ulang!");
+
+    // String concatenation via printf: access .0 for raw pointer
+    // (str is a fat pointer {ptr, len})
+    let s = "hello";
+    println(s);
+    println(first + second);
+}

@@ -1,0 +1,16 @@
+// References: &, &mut, and dereference *
+use std::io::println;
+
+fn main() {
+    // Immutable reference
+    let x = 42;
+    let r = &x;
+    let v = *r;       // dereference
+    println(v);
+
+    // Mutable reference with assignment through deref
+    let mut y = 10;
+    let r = &mut y;
+    *r = *r + 5;      // read and write through mutable ref
+    println(y);
+}

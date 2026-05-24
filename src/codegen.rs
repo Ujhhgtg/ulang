@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use inkwell::AddressSpace;
@@ -8,12 +8,16 @@ use inkwell::context::Context;
 use inkwell::execution_engine::{ExecutionEngine, JitFunction};
 use inkwell::module::Module;
 use inkwell::targets::{
-    CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
+    CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine, TargetTriple,
 };
-use inkwell::types::IntType;
-use inkwell::values::{BasicValueEnum, IntValue, PointerValue};
+use inkwell::types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum, FloatType, IntType};
+use inkwell::values::{AnyValue, BasicMetadataValueEnum, BasicValueEnum, PointerValue};
 
-use crate::ast::{BinOp, Expr, Function, Program, Stmt};
+use inkwell::attributes::Attribute;
+
+use crate::ast::{BinOp, Block, Expr, Function, Program, Stmt, StructDecl, StructField, Type};
+
+type OverloadMap = HashMap<String, Vec<(String, Vec<Type>)>>;
 
 type MainFunc = unsafe extern "C" fn() -> i32;
 
@@ -23,14 +27,35 @@ pub struct CodeGen<'ctx> {
     builder: Builder<'ctx>,
     execution_engine: Option<ExecutionEngine<'ctx>>,
     i32_type: IntType<'ctx>,
-    symbols: HashMap<String, PointerValue<'ctx>>,
+    i8_type: IntType<'ctx>,
+    i16_type: IntType<'ctx>,
+    i64_type: IntType<'ctx>,
+    bool_type: IntType<'ctx>,
+    f32_type: FloatType<'ctx>,
+    f64_type: FloatType<'ctx>,
+    ptr_int_type: IntType<'ctx>,
+    symbols: HashMap<String, (PointerValue<'ctx>, bool, Type)>,
+    consts: HashMap<String, i64>,
+    pub overloads: OverloadMap,
+    opt_level: OptimizationLevel,
+    struct_fields: HashMap<String, Vec<StructField>>,
+    // Maps type_name -> LLVM struct type
+    struct_types: HashMap<String, inkwell::types::StructType<'ctx>>,
+    // Maps type_name -> Vec<(method_name, mangled_fn_name)>
+    impl_methods: HashMap<String, Vec<(String, String)>>,
+    // Maps type_name -> set of trait names implemented
+    trait_impls: HashMap<String, HashSet<String>>,
+    // Maps function name -> declared return type
+    fn_return_types: HashMap<String, Type>,
+    // Maps function name -> declared parameter types
+    fn_param_types: HashMap<String, Vec<Type>>,
 }
 
 impl<'ctx> CodeGen<'ctx> {
-    pub fn new_jit(context: &'ctx Context) -> Result<Self, String> {
+    pub fn new_jit(context: &'ctx Context, opt: OptimizationLevel) -> Result<Self, String> {
         let module = context.create_module("ulang");
         let execution_engine = module
-            .create_jit_execution_engine(OptimizationLevel::None)
+            .create_jit_execution_engine(opt)
             .map_err(|e| format!("failed to create JIT engine: {}", e))?;
         let builder = context.create_builder();
         let i32_type = context.i32_type();
@@ -41,11 +66,27 @@ impl<'ctx> CodeGen<'ctx> {
             builder,
             execution_engine: Some(execution_engine),
             i32_type,
+            bool_type: context.bool_type(),
+            i8_type: context.i8_type(),
+            i16_type: context.i16_type(),
+            i64_type: context.i64_type(),
+            f32_type: context.f32_type(),
+            f64_type: context.f64_type(),
+            ptr_int_type: context.i64_type(),
             symbols: HashMap::new(),
+            consts: HashMap::new(),
+            overloads: HashMap::new(),
+            struct_fields: HashMap::new(),
+            struct_types: HashMap::new(),
+            impl_methods: HashMap::new(),
+            trait_impls: HashMap::new(),
+            fn_return_types: HashMap::new(),
+            fn_param_types: HashMap::new(),
+            opt_level: opt,
         })
     }
 
-    pub fn new_native(context: &'ctx Context) -> Self {
+    pub fn new_native(context: &'ctx Context, opt: OptimizationLevel) -> Self {
         let module = context.create_module("ulang");
         let builder = context.create_builder();
         let i32_type = context.i32_type();
@@ -56,22 +97,1046 @@ impl<'ctx> CodeGen<'ctx> {
             builder,
             execution_engine: None,
             i32_type,
+            bool_type: context.bool_type(),
+            i8_type: context.i8_type(),
+            i16_type: context.i16_type(),
+            i64_type: context.i64_type(),
+            f32_type: context.f32_type(),
+            f64_type: context.f64_type(),
+            ptr_int_type: context.i64_type(),
             symbols: HashMap::new(),
+            consts: HashMap::new(),
+            overloads: HashMap::new(),
+            struct_fields: HashMap::new(),
+            struct_types: HashMap::new(),
+            impl_methods: HashMap::new(),
+            trait_impls: HashMap::new(),
+            fn_return_types: HashMap::new(),
+            fn_param_types: HashMap::new(),
+            opt_level: opt,
         }
     }
 
-    pub fn compile_module(&mut self, program: &Program) -> Result<(), String> {
-        let printf_type = self.i32_type.fn_type(
-            &[self.context.ptr_type(AddressSpace::default()).into()],
-            true,
-        );
-        if self.module.get_function("printf").is_none() {
-            self.module.add_function("printf", printf_type, None);
+    /// Resolve `SelfType` to the actual struct type in a function's params and return type.
+    fn resolve_self_type(func: &mut Function, actual_type: &Type) {
+        for param in &mut func.params {
+            Self::resolve_type_self(&mut param.ty, actual_type);
+        }
+        if let Some(ref mut ret_ty) = func.return_type {
+            Self::resolve_type_self(ret_ty, actual_type);
+        }
+    }
+
+    fn resolve_type_self(ty: &mut Type, actual_type: &Type) {
+        match ty {
+            Type::SelfType => {
+                *ty = actual_type.clone();
+            }
+            Type::Ref { inner, .. } | Type::Ptr { inner, .. } => {
+                Self::resolve_type_self(inner, actual_type);
+            }
+            _ => {}
+        }
+    }
+
+    fn primitive_type_name(ty: &Type) -> Option<&'static str> {
+        match ty {
+            Type::Bool => Some("bool"),
+            Type::I8 => Some("i8"),
+            Type::I16 => Some("i16"),
+            Type::I32 => Some("i32"),
+            Type::I64 => Some("i64"),
+            Type::U8 => Some("u8"),
+            Type::U16 => Some("u16"),
+            Type::U32 => Some("u32"),
+            Type::U64 => Some("u64"),
+            Type::Usize => Some("usize"),
+            Type::Isize => Some("isize"),
+            Type::F32 => Some("f32"),
+            Type::F64 => Some("f64"),
+            _ => None,
+        }
+    }
+
+    fn generate_primitive_trait_impls(&mut self) -> Result<(), String> {
+        let primitives = [
+            Type::Bool,
+            Type::I8,
+            Type::I16,
+            Type::I32,
+            Type::I64,
+            Type::U8,
+            Type::U16,
+            Type::U32,
+            Type::U64,
+            Type::Usize,
+            Type::Isize,
+            Type::F32,
+            Type::F64,
+        ];
+
+        for ty in &primitives {
+            let ty_name = Self::primitive_type_name(ty).unwrap();
+            let llvm_ty = self.type_to_llvm(ty);
+            let is_float = Self::is_float(ty);
+
+            // Default::default() — returns zero (false for bool)
+            {
+                let fn_name = format!("__builtin_Default_default_{}", ty_name);
+                let fn_type = llvm_ty.fn_type(&[], false);
+                if self.module.get_function(&fn_name).is_none() {
+                    let fn_val = self.module.add_function(&fn_name, fn_type, None);
+                    let entry = self.context.append_basic_block(fn_val, "entry");
+                    self.builder.position_at_end(entry);
+                    let default_val: BasicValueEnum<'ctx> = if is_float {
+                        llvm_ty.into_float_type().const_float(0.0).into()
+                    } else {
+                        llvm_ty.into_int_type().const_zero().into()
+                    };
+                    self.builder
+                        .build_return(Some(&default_val))
+                        .map_err(|e| format!("failed to build default return: {}", e))?;
+                }
+                self.impl_methods
+                    .entry(ty_name.to_string())
+                    .or_default()
+                    .push(("default".to_string(), fn_name));
+            }
+
+            // Clone::clone(&self) — returns *self
+            {
+                let fn_name = format!("__builtin_Clone_clone_{}", ty_name);
+                let param_types = [self.context.ptr_type(AddressSpace::default()).into()];
+                let fn_type = llvm_ty.fn_type(&param_types, false);
+                if self.module.get_function(&fn_name).is_none() {
+                    let fn_val = self.module.add_function(&fn_name, fn_type, None);
+                    let entry = self.context.append_basic_block(fn_val, "entry");
+                    self.builder.position_at_end(entry);
+                    let ptr_param = fn_val.get_first_param().unwrap();
+                    let loaded = self
+                        .builder
+                        .build_load(llvm_ty, ptr_param.into_pointer_value(), "cloned")
+                        .map_err(|e| format!("failed to load for clone: {}", e))?;
+                    self.builder
+                        .build_return(Some(&loaded))
+                        .map_err(|e| format!("failed to build clone return: {}", e))?;
+                }
+                self.impl_methods
+                    .entry(ty_name.to_string())
+                    .or_default()
+                    .push(("clone".to_string(), fn_name));
+            }
+
+            // Copy — marker, no functions
+
+            // Eq::eq — returns bool (i1)
+            {
+                let fn_name = format!("__builtin_Eq_eq_{}", ty_name);
+                let param_types = [
+                    self.context.ptr_type(AddressSpace::default()).into(),
+                    self.context.ptr_type(AddressSpace::default()).into(),
+                ];
+                let ret_ty: BasicTypeEnum = self.bool_type.into();
+                let fn_type = ret_ty.fn_type(&param_types, false);
+                if self.module.get_function(&fn_name).is_none() {
+                    let fn_val = self.module.add_function(&fn_name, fn_type, None);
+                    let entry = self.context.append_basic_block(fn_val, "entry");
+                    self.builder.position_at_end(entry);
+                    let params = fn_val.get_params();
+                    let self_loaded = self
+                        .builder
+                        .build_load(llvm_ty, params[0].into_pointer_value(), "self")
+                        .map_err(|e| format!("failed to load self: {}", e))?;
+                    let other_loaded = self
+                        .builder
+                        .build_load(llvm_ty, params[1].into_pointer_value(), "other")
+                        .map_err(|e| format!("failed to load other: {}", e))?;
+
+                    let cmp = if is_float {
+                        self.builder
+                            .build_float_compare(
+                                inkwell::FloatPredicate::OEQ,
+                                self_loaded.into_float_value(),
+                                other_loaded.into_float_value(),
+                                "eq",
+                            )
+                            .map_err(|e| format!("failed to build float eq: {}", e))?
+                    } else {
+                        self.builder
+                            .build_int_compare(
+                                inkwell::IntPredicate::EQ,
+                                self_loaded.into_int_value(),
+                                other_loaded.into_int_value(),
+                                "eq",
+                            )
+                            .map_err(|e| format!("failed to build int eq: {}", e))?
+                    };
+                    // cmp is i1, return directly (no zext to i32)
+                    self.builder
+                        .build_return(Some(&BasicValueEnum::from(cmp)))
+                        .map_err(|e| format!("failed to build eq return: {}", e))?;
+                }
+                self.impl_methods
+                    .entry(ty_name.to_string())
+                    .or_default()
+                    .push(("eq".to_string(), fn_name));
+            }
+
+            // Eq::ne — returns !eq (bool, i1)
+            {
+                let fn_name = format!("__builtin_Eq_ne_{}", ty_name);
+                let param_types = [
+                    self.context.ptr_type(AddressSpace::default()).into(),
+                    self.context.ptr_type(AddressSpace::default()).into(),
+                ];
+                let ret_ty: BasicTypeEnum = self.bool_type.into();
+                let fn_type = ret_ty.fn_type(&param_types, false);
+                if self.module.get_function(&fn_name).is_none() {
+                    let fn_val = self.module.add_function(&fn_name, fn_type, None);
+                    let entry = self.context.append_basic_block(fn_val, "entry");
+                    self.builder.position_at_end(entry);
+                    let params = fn_val.get_params();
+                    let self_loaded = self
+                        .builder
+                        .build_load(llvm_ty, params[0].into_pointer_value(), "self")
+                        .map_err(|e| format!("failed to load self: {}", e))?;
+                    let other_loaded = self
+                        .builder
+                        .build_load(llvm_ty, params[1].into_pointer_value(), "other")
+                        .map_err(|e| format!("failed to load other: {}", e))?;
+
+                    // Compute eq, then NOT for ne
+                    let eq = if is_float {
+                        self.builder
+                            .build_float_compare(
+                                inkwell::FloatPredicate::OEQ,
+                                self_loaded.into_float_value(),
+                                other_loaded.into_float_value(),
+                                "eq",
+                            )
+                            .map_err(|e| format!("failed to build float eq for ne: {}", e))?
+                    } else {
+                        self.builder
+                            .build_int_compare(
+                                inkwell::IntPredicate::EQ,
+                                self_loaded.into_int_value(),
+                                other_loaded.into_int_value(),
+                                "eq",
+                            )
+                            .map_err(|e| format!("failed to build int eq for ne: {}", e))?
+                    };
+                    let ne = self
+                        .builder
+                        .build_not(eq, "ne")
+                        .map_err(|e| format!("failed to build not for ne: {}", e))?;
+                    self.builder
+                        .build_return(Some(&BasicValueEnum::from(ne)))
+                        .map_err(|e| format!("failed to build ne return: {}", e))?;
+                }
+                self.impl_methods
+                    .entry(ty_name.to_string())
+                    .or_default()
+                    .push(("ne".to_string(), fn_name));
+            }
+
+            // Ord::cmp — sign of difference
+            {
+                let fn_name = format!("__builtin_Ord_cmp_{}", ty_name);
+                let param_types = [
+                    self.context.ptr_type(AddressSpace::default()).into(),
+                    self.context.ptr_type(AddressSpace::default()).into(),
+                ];
+                let ret_ty: BasicTypeEnum = self.i32_type.into();
+                let fn_type = ret_ty.fn_type(&param_types, false);
+                if self.module.get_function(&fn_name).is_none() {
+                    let fn_val = self.module.add_function(&fn_name, fn_type, None);
+                    let entry = self.context.append_basic_block(fn_val, "entry");
+                    self.builder.position_at_end(entry);
+                    let params = fn_val.get_params();
+                    let self_loaded = self
+                        .builder
+                        .build_load(llvm_ty, params[0].into_pointer_value(), "self")
+                        .map_err(|e| format!("failed to load self: {}", e))?;
+                    let other_loaded = self
+                        .builder
+                        .build_load(llvm_ty, params[1].into_pointer_value(), "other")
+                        .map_err(|e| format!("failed to load other: {}", e))?;
+
+                    let result = if is_float {
+                        let self_f = self_loaded.into_float_value();
+                        let other_f = other_loaded.into_float_value();
+                        // cmp = self > other ? 1 : self < other ? -1 : 0
+                        let gt = self
+                            .builder
+                            .build_float_compare(
+                                inkwell::FloatPredicate::OGT,
+                                self_f,
+                                other_f,
+                                "gt",
+                            )
+                            .map_err(|e| format!("failed to build gt: {}", e))?;
+                        let lt = self
+                            .builder
+                            .build_float_compare(
+                                inkwell::FloatPredicate::OLT,
+                                self_f,
+                                other_f,
+                                "lt",
+                            )
+                            .map_err(|e| format!("failed to build lt: {}", e))?;
+                        let gt_ext = self
+                            .builder
+                            .build_int_z_extend(gt, self.i32_type, "gt_i32")
+                            .map_err(|e| format!("failed to extend gt: {}", e))?;
+                        let lt_ext = self
+                            .builder
+                            .build_int_z_extend(lt, self.i32_type, "lt_i32")
+                            .map_err(|e| format!("failed to extend lt: {}", e))?;
+                        self.builder
+                            .build_int_sub(gt_ext, lt_ext, "cmp")
+                            .map_err(|e| format!("failed to build sub for cmp: {}", e))?
+                    } else {
+                        let self_i = self_loaded.into_int_value();
+                        let other_i = other_loaded.into_int_value();
+                        // For integers: sign of (self - other)
+                        let gt = self
+                            .builder
+                            .build_int_compare(inkwell::IntPredicate::SGT, self_i, other_i, "gt")
+                            .map_err(|e| format!("failed to build gt: {}", e))?;
+                        let lt = self
+                            .builder
+                            .build_int_compare(inkwell::IntPredicate::SLT, self_i, other_i, "lt")
+                            .map_err(|e| format!("failed to build lt: {}", e))?;
+                        let gt_ext = self
+                            .builder
+                            .build_int_z_extend(gt, self.i32_type, "gt_i32")
+                            .map_err(|e| format!("failed to extend gt: {}", e))?;
+                        let lt_ext = self
+                            .builder
+                            .build_int_z_extend(lt, self.i32_type, "lt_i32")
+                            .map_err(|e| format!("failed to extend lt: {}", e))?;
+                        self.builder
+                            .build_int_sub(gt_ext, lt_ext, "cmp")
+                            .map_err(|e| format!("failed to build sub for cmp: {}", e))?
+                    };
+
+                    self.builder
+                        .build_return(Some(&BasicValueEnum::from(result)))
+                        .map_err(|e| format!("failed to build cmp return: {}", e))?;
+                }
+                self.impl_methods
+                    .entry(ty_name.to_string())
+                    .or_default()
+                    .push(("cmp".to_string(), fn_name));
+            }
+
+            // Register in trait_impls
+            let traits: HashSet<String> = ["Default", "Clone", "Copy", "Eq", "Ord"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            self.trait_impls.insert(ty_name.to_string(), traits);
+        }
+        Ok(())
+    }
+
+    /// Convert a type to its string name for trait method naming.
+    fn type_to_mangled_name(ty: &Type) -> String {
+        if let Some(name) = Self::primitive_type_name(ty) {
+            return name.to_string();
+        }
+        match ty {
+            Type::Struct(name) => name.clone(),
+            Type::Ref { inner, .. } => Self::type_to_mangled_name(inner),
+            _ => panic!("unsupported type for trait method: {:?}", ty),
+        }
+    }
+
+    /// Get the mangled function name for a trait method on a given type.
+    fn trait_method_name(ty: &Type, trait_name: &str, method_name: &str) -> String {
+        let type_name = Self::type_to_mangled_name(ty);
+        format!("__builtin_{}_{}_{}", trait_name, method_name, type_name)
+    }
+
+    /// Check if a type implements a given trait.
+    fn check_type_implements_trait(&self, ty: &Type, trait_name: &str) -> bool {
+        match ty {
+            Type::Bool
+            | Type::I8
+            | Type::I16
+            | Type::I32
+            | Type::I64
+            | Type::U8
+            | Type::U16
+            | Type::U32
+            | Type::U64
+            | Type::Usize
+            | Type::Isize
+            | Type::F32
+            | Type::F64 => true,
+            Type::Struct(name) => self
+                .trait_impls
+                .get(name)
+                .map(|traits| traits.contains(trait_name))
+                .unwrap_or(false),
+            Type::Ref { inner, .. } => self.check_type_implements_trait(inner, trait_name),
+            // Tuple/unit types are not derivable (no plan for these)
+            _ => false,
+        }
+    }
+
+    /// Process all #[derive(...)] attributes on a struct.
+    fn process_struct_derives(
+        &mut self,
+        decl: &StructDecl,
+        _program: &Program,
+    ) -> Result<(), String> {
+        for attr in &decl.attribs {
+            if attr.name != "derive" {
+                continue;
+            }
+            for trait_name in &attr.args {
+                self.process_derive_trait(decl, trait_name)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Process a single derived trait for a struct.
+    fn process_derive_trait(&mut self, decl: &StructDecl, trait_name: &str) -> Result<(), String> {
+        // Validate all fields implement the trait
+        for field in &decl.fields {
+            if !self.check_type_implements_trait(&field.ty, trait_name) {
+                return Err(format!(
+                    "cannot derive trait '{}' for struct '{}': field '{}' of type {:?} does not implement {}",
+                    trait_name, decl.name, field.name, field.ty, trait_name
+                ));
+            }
         }
 
-        for func in &program.funcs {
-            self.compile_function(func)?;
+        // Generate implementations based on trait
+        match trait_name {
+            "Default" => self.generate_derive_default(decl)?,
+            "Clone" => self.generate_derive_clone(decl)?,
+            "Copy" => {
+                // Marker trait — just register
+            }
+            "Eq" => self.generate_derive_eq(decl)?,
+            "Ord" => self.generate_derive_ord(decl, "Ord", "cmp")?,
+            _ => {
+                return Err(format!(
+                    "cannot derive unknown trait '{}' for struct '{}'",
+                    trait_name, decl.name
+                ));
+            }
         }
+
+        // Register trait in trait_impls
+        self.trait_impls
+            .entry(decl.name.clone())
+            .or_default()
+            .insert(trait_name.to_string());
+
+        Ok(())
+    }
+
+    /// Generate `Default::default()` for a struct.
+    fn generate_derive_default(&mut self, decl: &StructDecl) -> Result<(), String> {
+        let fn_name =
+            Self::trait_method_name(&Type::Struct(decl.name.clone()), "Default", "default");
+        let struct_ty = self
+            .struct_types
+            .get(&decl.name)
+            .copied()
+            .ok_or_else(|| format!("struct type '{}' not declared", decl.name))?;
+        let fn_type = struct_ty.fn_type(&[], false);
+
+        // Skip if already declared
+        if self.module.get_function(&fn_name).is_some() {
+            return Ok(());
+        }
+
+        let fn_val = self.module.add_function(&fn_name, fn_type, None);
+        let entry = self.context.append_basic_block(fn_val, "entry");
+        self.builder.position_at_end(entry);
+
+        // Build struct with default values for each field
+        let mut result: inkwell::values::AggregateValueEnum<'ctx> = struct_ty.get_undef().into();
+
+        for (i, field) in decl.fields.iter().enumerate() {
+            let field_trait_fn = Self::trait_method_name(&field.ty, "Default", "default");
+            let field_fn = self.module.get_function(&field_trait_fn).ok_or_else(|| {
+                format!(
+                    "internal: default function '{}' not found for field '{}'",
+                    field_trait_fn, field.name
+                )
+            })?;
+
+            let field_val = self
+                .builder
+                .build_call(field_fn, &[], "field_default")
+                .map_err(|e| format!("failed to call default for field '{}': {}", field.name, e))?;
+
+            let field_any = self.try_extract_result(field_val);
+            result = self
+                .builder
+                .build_insert_value(result, field_any, i as u32, &field.name)
+                .map_err(|e| format!("failed to insert default field '{}': {}", field.name, e))?;
+        }
+
+        match result {
+            inkwell::values::AggregateValueEnum::StructValue(sv) => {
+                self.builder
+                    .build_return(Some(&BasicValueEnum::from(sv)))
+                    .map_err(|e| format!("failed to build default return: {}", e))?;
+            }
+            _ => {
+                return Err("expected struct value for default".to_string());
+            }
+        }
+
+        // Register method
+        self.impl_methods
+            .entry(decl.name.clone())
+            .or_default()
+            .push(("default".to_string(), fn_name));
+
+        Ok(())
+    }
+
+    /// Generate `Clone::clone(&self)` for a struct.
+    fn generate_derive_clone(&mut self, decl: &StructDecl) -> Result<(), String> {
+        let fn_name = Self::trait_method_name(&Type::Struct(decl.name.clone()), "Clone", "clone");
+        let struct_ty = self
+            .struct_types
+            .get(&decl.name)
+            .copied()
+            .ok_or_else(|| format!("struct type '{}' not declared", decl.name))?;
+        let param_types = [self.context.ptr_type(AddressSpace::default()).into()];
+        let fn_type = struct_ty.fn_type(&param_types, false);
+
+        if self.module.get_function(&fn_name).is_some() {
+            return Ok(());
+        }
+
+        let fn_val = self.module.add_function(&fn_name, fn_type, None);
+        let entry = self.context.append_basic_block(fn_val, "entry");
+        self.builder.position_at_end(entry);
+
+        let self_ptr = fn_val.get_first_param().unwrap().into_pointer_value();
+        let self_struct = self
+            .builder
+            .build_load(struct_ty, self_ptr, "self")
+            .map_err(|e| format!("failed to load self for clone: {}", e))?;
+
+        let mut result: inkwell::values::AggregateValueEnum<'ctx> = struct_ty.get_undef().into();
+
+        for (i, field) in decl.fields.iter().enumerate() {
+            let field_val = self
+                .builder
+                .build_extract_value(self_struct.into_struct_value(), i as u32, &field.name)
+                .map_err(|e| {
+                    format!("failed to extract field '{}' for clone: {}", field.name, e)
+                })?;
+
+            let field_trait_fn = Self::trait_method_name(&field.ty, "Clone", "clone");
+            let field_fn = self.module.get_function(&field_trait_fn).ok_or_else(|| {
+                format!(
+                    "internal: clone function '{}' not found for field '{}'",
+                    field_trait_fn, field.name
+                )
+            })?;
+
+            // Store field value to alloca and pass pointer to clone function
+            let field_llvm_ty = self.type_to_llvm(&field.ty);
+            let field_alloca = self
+                .builder
+                .build_alloca(field_llvm_ty, &format!("{}_clone", field.name))
+                .map_err(|e| format!("failed to build alloca for clone: {}", e))?;
+            self.builder
+                .build_store(field_alloca, field_val)
+                .map_err(|e| format!("failed to store field for clone: {}", e))?;
+
+            let cloned_val = self
+                .builder
+                .build_call(field_fn, &[field_alloca.into()], "field_clone")
+                .map_err(|e| format!("failed to call clone for field '{}': {}", field.name, e))?;
+
+            let cloned_any = self.try_extract_result(cloned_val);
+            result = self
+                .builder
+                .build_insert_value(result, cloned_any, i as u32, &field.name)
+                .map_err(|e| format!("failed to insert cloned field '{}': {}", field.name, e))?;
+        }
+
+        match result {
+            inkwell::values::AggregateValueEnum::StructValue(sv) => {
+                self.builder
+                    .build_return(Some(&BasicValueEnum::from(sv)))
+                    .map_err(|e| format!("failed to build clone return: {}", e))?;
+            }
+            _ => {
+                return Err("expected struct value for clone".to_string());
+            }
+        }
+
+        self.impl_methods
+            .entry(decl.name.clone())
+            .or_default()
+            .push(("clone".to_string(), fn_name));
+
+        Ok(())
+    }
+
+    /// Generate `Eq::eq(&self, other: &Self) -> bool` and `ne` for a struct.
+    fn generate_derive_eq(&mut self, decl: &StructDecl) -> Result<(), String> {
+        let struct_ty = self
+            .struct_types
+            .get(&decl.name)
+            .copied()
+            .ok_or_else(|| format!("struct type '{}' not declared", decl.name))?;
+
+        // Generate eq
+        let eq_fn_name = Self::trait_method_name(&Type::Struct(decl.name.clone()), "Eq", "eq");
+        let param_types = [
+            self.context.ptr_type(AddressSpace::default()).into(),
+            self.context.ptr_type(AddressSpace::default()).into(),
+        ];
+        let ret_ty: BasicTypeEnum = self.bool_type.into();
+        let eq_fn_type = ret_ty.fn_type(&param_types, false);
+
+        let eq_fn = if self.module.get_function(&eq_fn_name).is_none() {
+            let fn_val = self.module.add_function(&eq_fn_name, eq_fn_type, None);
+            let entry = self.context.append_basic_block(fn_val, "entry");
+            self.builder.position_at_end(entry);
+
+            let params = fn_val.get_params();
+            let self_struct = self
+                .builder
+                .build_load(struct_ty, params[0].into_pointer_value(), "self")
+                .map_err(|e| format!("failed to load self for eq: {}", e))?;
+            let other_struct = self
+                .builder
+                .build_load(struct_ty, params[1].into_pointer_value(), "other")
+                .map_err(|e| format!("failed to load other for eq: {}", e))?;
+
+            let mut result_val = self.bool_type.const_int(1, false);
+
+            for (i, field) in decl.fields.iter().enumerate() {
+                let self_field = self
+                    .builder
+                    .build_extract_value(self_struct.into_struct_value(), i as u32, &field.name)
+                    .map_err(|e| format!("failed to extract self field '{}': {}", field.name, e))?;
+                let other_field = self
+                    .builder
+                    .build_extract_value(other_struct.into_struct_value(), i as u32, &field.name)
+                    .map_err(|e| {
+                        format!("failed to extract other field '{}': {}", field.name, e)
+                    })?;
+
+                let eq_trait_fn = Self::trait_method_name(&field.ty, "Eq", "eq");
+                let field_eq_fn = self.module.get_function(&eq_trait_fn).ok_or_else(|| {
+                    format!(
+                        "internal: eq function '{}' not found for field '{}'",
+                        eq_trait_fn, field.name
+                    )
+                })?;
+
+                // Store both field values to allocas and pass pointers to eq
+                let field_llvm_ty = self.type_to_llvm(&field.ty);
+                let self_alloca = self
+                    .builder
+                    .build_alloca(field_llvm_ty, &format!("{}_self", field.name))
+                    .map_err(|e| format!("failed to build alloca for eq: {}", e))?;
+                self.builder
+                    .build_store(self_alloca, self_field)
+                    .map_err(|e| format!("failed to store self field for eq: {}", e))?;
+                let other_alloca = self
+                    .builder
+                    .build_alloca(field_llvm_ty, &format!("{}_other", field.name))
+                    .map_err(|e| format!("failed to build alloca for eq: {}", e))?;
+                self.builder
+                    .build_store(other_alloca, other_field)
+                    .map_err(|e| format!("failed to store other field for eq: {}", e))?;
+
+                let field_result = self
+                    .builder
+                    .build_call(
+                        field_eq_fn,
+                        &[self_alloca.into(), other_alloca.into()],
+                        "field_eq",
+                    )
+                    .map_err(|e| format!("failed to call eq for field '{}': {}", field.name, e))?;
+                let field_result_bool = self.try_extract_result(field_result).into_int_value();
+
+                result_val = self
+                    .builder
+                    .build_and(result_val, field_result_bool, "and")
+                    .map_err(|e| format!("failed to build and for eq: {}", e))?;
+            }
+
+            self.builder
+                .build_return(Some(&BasicValueEnum::from(result_val)))
+                .map_err(|e| format!("failed to build eq return: {}", e))?;
+
+            fn_val
+        } else {
+            self.module.get_function(&eq_fn_name).unwrap()
+        };
+        let _ = eq_fn; // used for ne
+
+        self.impl_methods
+            .entry(decl.name.clone())
+            .or_default()
+            .push(("eq".to_string(), eq_fn_name.clone()));
+
+        // Generate ne: return !self.eq(other)
+        let ne_fn_name = Self::trait_method_name(&Type::Struct(decl.name.clone()), "Eq", "ne");
+        let ne_fn_type = ret_ty.fn_type(&param_types, false);
+
+        if self.module.get_function(&ne_fn_name).is_none() {
+            let fn_val = self.module.add_function(&ne_fn_name, ne_fn_type, None);
+            let entry = self.context.append_basic_block(fn_val, "entry");
+            self.builder.position_at_end(entry);
+
+            let params = fn_val.get_params();
+            let self_struct = self
+                .builder
+                .build_load(struct_ty, params[0].into_pointer_value(), "self")
+                .map_err(|e| format!("failed to load self for ne: {}", e))?;
+            let other_struct = self
+                .builder
+                .build_load(struct_ty, params[1].into_pointer_value(), "other")
+                .map_err(|e| format!("failed to load other for ne: {}", e))?;
+
+            let field_llvm_ty = self.type_to_llvm(&Type::Struct(decl.name.clone()));
+            let self_alloca = self
+                .builder
+                .build_alloca(field_llvm_ty, "ne_self")
+                .map_err(|e| format!("failed to build alloca for ne self: {}", e))?;
+            self.builder
+                .build_store(self_alloca, self_struct)
+                .map_err(|e| format!("failed to store self for ne: {}", e))?;
+            let other_alloca = self
+                .builder
+                .build_alloca(field_llvm_ty, "ne_other")
+                .map_err(|e| format!("failed to build alloca for ne other: {}", e))?;
+            self.builder
+                .build_store(other_alloca, other_struct)
+                .map_err(|e| format!("failed to store other for ne: {}", e))?;
+
+            let eq_result = self
+                .builder
+                .build_call(
+                    self.module.get_function(&eq_fn_name).unwrap(),
+                    &[self_alloca.into(), other_alloca.into()],
+                    "eq_call",
+                )
+                .map_err(|e| format!("failed to call eq for ne: {}", e))?;
+            let eq_val = self.try_extract_result(eq_result).into_int_value();
+
+            // ne = !eq (i1)
+            let ne_val = self
+                .builder
+                .build_not(eq_val, "ne")
+                .map_err(|e| format!("failed to build not for ne: {}", e))?;
+
+            self.builder
+                .build_return(Some(&BasicValueEnum::from(ne_val)))
+                .map_err(|e| format!("failed to build ne return: {}", e))?;
+        }
+
+        self.impl_methods
+            .entry(decl.name.clone())
+            .or_default()
+            .push(("ne".to_string(), ne_fn_name));
+
+        Ok(())
+    }
+
+    /// Generate `cmp` with lexicographic ordering for a struct.
+    fn generate_derive_ord(
+        &mut self,
+        decl: &StructDecl,
+        trait_name: &str,
+        cmp_name: &str,
+    ) -> Result<(), String> {
+        let struct_ty = self
+            .struct_types
+            .get(&decl.name)
+            .copied()
+            .ok_or_else(|| format!("struct type '{}' not declared", decl.name))?;
+
+        let fn_name =
+            Self::trait_method_name(&Type::Struct(decl.name.clone()), trait_name, cmp_name);
+        let param_types = [
+            self.context.ptr_type(AddressSpace::default()).into(),
+            self.context.ptr_type(AddressSpace::default()).into(),
+        ];
+        let ret_ty: BasicTypeEnum = self.i32_type.into();
+        let fn_type = ret_ty.fn_type(&param_types, false);
+
+        if self.module.get_function(&fn_name).is_some() {
+            return Ok(());
+        }
+
+        let fn_val = self.module.add_function(&fn_name, fn_type, None);
+        let entry = self.context.append_basic_block(fn_val, "entry");
+        self.builder.position_at_end(entry);
+
+        let params = fn_val.get_params();
+        let self_struct = self
+            .builder
+            .build_load(struct_ty, params[0].into_pointer_value(), "self")
+            .map_err(|e| format!("failed to load self for {}: {}", cmp_name, e))?;
+        let other_struct = self
+            .builder
+            .build_load(struct_ty, params[1].into_pointer_value(), "other")
+            .map_err(|e| format!("failed to load other for {}: {}", cmp_name, e))?;
+
+        // Pre-store structs into allocas and extract fields for each comparison
+        let struct_llvm_ty = self.type_to_llvm(&Type::Struct(decl.name.clone()));
+        let self_alloca = self
+            .builder
+            .build_alloca(struct_llvm_ty, "cmp_self")
+            .map_err(|e| format!("failed to build alloca for cmp self: {}", e))?;
+        self.builder
+            .build_store(self_alloca, self_struct)
+            .map_err(|e| format!("failed to store self for cmp: {}", e))?;
+        let other_alloca = self
+            .builder
+            .build_alloca(struct_llvm_ty, "cmp_other")
+            .map_err(|e| format!("failed to build alloca for cmp other: {}", e))?;
+        self.builder
+            .build_store(other_alloca, other_struct)
+            .map_err(|e| format!("failed to store other for cmp: {}", e))?;
+
+        let num_fields = decl.fields.len();
+        // We'll use the entry block for the first field comparison
+        // and create blocks for subsequent fields
+
+        // If no fields, return 0
+        if num_fields == 0 {
+            self.builder
+                .build_return(Some(&BasicValueEnum::from(self.i32_type.const_zero())))
+                .map_err(|e| format!("failed to build empty struct cmp return: {}", e))?;
+
+            self.impl_methods
+                .entry(decl.name.clone())
+                .or_default()
+                .push((cmp_name.to_string(), fn_name));
+            return Ok(());
+        }
+
+        // Process the first field in the entry block
+        let mut current_block = self.builder.get_insert_block().unwrap();
+        let mut next_block: Option<inkwell::basic_block::BasicBlock<'ctx>> = None;
+
+        for (i, field) in decl.fields.iter().enumerate() {
+            let is_last = i == num_fields - 1;
+
+            // Create the next block (for when cmp == 0)
+            if !is_last {
+                let check_next = self
+                    .context
+                    .append_basic_block(fn_val, &format!("field_{}", i));
+                next_block = Some(check_next);
+            }
+
+            // Position builder at current block
+            self.builder.position_at_end(current_block);
+
+            // Load self and other structs from allocas
+            let self_loaded = self
+                .builder
+                .build_load(struct_ty, self_alloca, "self_reload")
+                .map_err(|e| format!("failed to reload self: {}", e))?;
+            let other_loaded = self
+                .builder
+                .build_load(struct_ty, other_alloca, "other_reload")
+                .map_err(|e| format!("failed to reload other: {}", e))?;
+
+            let self_field = self
+                .builder
+                .build_extract_value(self_loaded.into_struct_value(), i as u32, &field.name)
+                .map_err(|e| format!("failed to extract self field '{}': {}", field.name, e))?;
+            let other_field = self
+                .builder
+                .build_extract_value(other_loaded.into_struct_value(), i as u32, &field.name)
+                .map_err(|e| format!("failed to extract other field '{}': {}", field.name, e))?;
+
+            let cmp_trait_fn = Self::trait_method_name(&field.ty, trait_name, cmp_name);
+            let field_cmp_fn = self.module.get_function(&cmp_trait_fn).ok_or_else(|| {
+                format!(
+                    "internal: {} function '{}' not found for field '{}'",
+                    cmp_name, cmp_trait_fn, field.name
+                )
+            })?;
+
+            let field_llvm_ty = self.type_to_llvm(&field.ty);
+            let self_field_alloca = self
+                .builder
+                .build_alloca(field_llvm_ty, &format!("{}_self", field.name))
+                .map_err(|e| format!("failed to build alloca for cmp: {}", e))?;
+            self.builder
+                .build_store(self_field_alloca, self_field)
+                .map_err(|e| format!("failed to store self field for cmp: {}", e))?;
+            let other_field_alloca = self
+                .builder
+                .build_alloca(field_llvm_ty, &format!("{}_other", field.name))
+                .map_err(|e| format!("failed to build alloca for cmp: {}", e))?;
+            self.builder
+                .build_store(other_field_alloca, other_field)
+                .map_err(|e| format!("failed to store other field for cmp: {}", e))?;
+
+            let field_result = self
+                .builder
+                .build_call(
+                    field_cmp_fn,
+                    &[self_field_alloca.into(), other_field_alloca.into()],
+                    &format!("field_{}_cmp", i),
+                )
+                .map_err(|e| {
+                    format!(
+                        "failed to call {} for field '{}': {}",
+                        cmp_name, field.name, e
+                    )
+                })?;
+            let cmp_result = self.try_extract_result(field_result).into_int_value();
+
+            if is_last {
+                // Last field: return the comparison result directly
+                self.builder
+                    .build_return(Some(&BasicValueEnum::from(cmp_result)))
+                    .map_err(|e| format!("failed to build cmp return: {}", e))?;
+            } else {
+                // Not last: check if result != 0 and return early
+                let is_nonzero = self
+                    .builder
+                    .build_int_compare(
+                        inkwell::IntPredicate::NE,
+                        cmp_result,
+                        self.i32_type.const_zero(),
+                        "is_nonzero",
+                    )
+                    .map_err(|e| format!("failed to compare cmp result: {}", e))?;
+
+                let ret_block = self
+                    .context
+                    .append_basic_block(fn_val, &format!("ret_field_{}", i));
+                self.builder.position_at_end(ret_block);
+                self.builder
+                    .build_return(Some(&BasicValueEnum::from(cmp_result)))
+                    .map_err(|e| format!("failed to build early return: {}", e))?;
+
+                // Branch from current block
+                self.builder.position_at_end(current_block);
+                self.builder
+                    .build_conditional_branch(is_nonzero, ret_block, next_block.unwrap())
+                    .map_err(|e| format!("failed to build conditional branch: {}", e))?;
+
+                current_block = next_block.unwrap();
+            }
+        }
+
+        self.impl_methods
+            .entry(decl.name.clone())
+            .or_default()
+            .push((cmp_name.to_string(), fn_name));
+
+        Ok(())
+    }
+
+    pub fn compile_module(&mut self, program: &Program) -> Result<(), String> {
+        // Phase 0: Declare struct types (opaque → set body)
+        for decl in &program.structs {
+            let struct_type = self.context.opaque_struct_type(&decl.name);
+            let field_types: Vec<BasicTypeEnum<'ctx>> = decl
+                .fields
+                .iter()
+                .map(|f| self.type_to_llvm(&f.ty))
+                .collect();
+            struct_type.set_body(&field_types, false);
+            self.struct_fields
+                .insert(decl.name.clone(), decl.fields.clone());
+            self.struct_types.insert(decl.name.clone(), struct_type);
+        }
+
+        // Phase 0.25: Generate builtin trait implementations for primitives
+        self.generate_primitive_trait_impls()?;
+
+        // Phase 0.5: Process impl blocks and declare impl methods
+        for decl in &program.impls {
+            let type_name = match &decl.impl_type {
+                Type::Struct(name) => name.clone(),
+                Type::SelfType => "Self".to_string(),
+                _ => {
+                    return Err(format!(
+                        "impl target must be a struct type or Self, got {:?}",
+                        decl.impl_type
+                    ));
+                }
+            };
+            for method in &decl.methods {
+                let mangled_name = if let Some(ref trait_name) = decl.trait_name {
+                    format!("__trait_{}_{}_{}", trait_name, method.name, type_name)
+                } else {
+                    format!("{}::{}/{}", type_name, method.name, method.params.len())
+                };
+
+                // Declare the method function
+                let mut method_func = method.clone();
+                method_func.name = mangled_name.clone();
+                self.declare_function(&method_func)?;
+
+                // Register in impl_methods
+                self.impl_methods
+                    .entry(type_name.clone())
+                    .or_default()
+                    .push((method.name.clone(), mangled_name));
+            }
+        }
+
+        // Phase 0.75: Process #[derive(...)] on structs
+        for decl in &program.structs {
+            self.process_struct_derives(decl, program)?;
+        }
+
+        // Phase 1: Declare all functions
+        for func in &program.funcs {
+            self.declare_function(func)?;
+        }
+
+        // Phase 2: Compile bodies for non-extern functions
+        for func in &program.funcs {
+            if !func.is_extern {
+                self.compile_function_body(func)?;
+            }
+        }
+
+        // Phase 2b: Compile impl method bodies
+        for decl in &program.impls {
+            let type_name = match &decl.impl_type {
+                Type::Struct(name) => name.clone(),
+                Type::SelfType => "Self".to_string(),
+                _ => continue,
+            };
+            let self_type = Type::Struct(type_name.clone());
+            for method in &decl.methods {
+                let mangled_name = if let Some(ref trait_name) = decl.trait_name {
+                    format!("__trait_{}_{}_{}", trait_name, method.name, type_name)
+                } else {
+                    format!("{}::{}/{}", type_name, method.name, method.params.len())
+                };
+
+                let mut method_func = method.clone();
+                method_func.name = mangled_name;
+                // Resolve SelfType to the actual struct type
+                Self::resolve_self_type(&mut method_func, &self_type);
+                self.compile_function_body(&method_func)?;
+            }
+        }
+
         Ok(())
     }
 
@@ -93,22 +1158,29 @@ impl<'ctx> CodeGen<'ctx> {
     }
 
     pub fn compile_to_object(&self, path: &Path) -> Result<(), String> {
-        Target::initialize_native(&InitializationConfig::default())
-            .map_err(|e| format!("failed to initialize native target: {}", e))?;
-
         let triple = TargetMachine::get_default_triple();
-        let target = Target::from_triple(&triple)
-            .map_err(|e| format!("failed to get target for native triple: {}", e))?;
+        self.compile_to_object_for_triple(&triple, path)
+    }
+
+    pub fn compile_to_object_for_triple(
+        &self,
+        triple: &TargetTriple,
+        path: &Path,
+    ) -> Result<(), String> {
+        Target::initialize_all(&InitializationConfig::default());
+
+        let target = Target::from_triple(triple)
+            .map_err(|e| format!("failed to get target for triple: {}", e))?;
         let machine = target
             .create_target_machine(
-                &triple,
+                triple,
                 "",
                 "",
-                OptimizationLevel::Default,
+                self.opt_level,
                 RelocMode::PIC,
                 CodeModel::Default,
             )
-            .ok_or("failed to create target machine")?;
+            .ok_or_else(|| format!("failed to create target machine for '{}'", triple))?;
 
         machine
             .write_to_file(&self.module, FileType::Object, path)
@@ -116,13 +1188,14 @@ impl<'ctx> CodeGen<'ctx> {
         Ok(())
     }
 
-    pub fn link_executable(obj_path: &Path, exe_path: &Path) -> Result<(), String> {
-        let output = std::process::Command::new("cc")
+    pub fn link_executable(args: &[&str], obj_path: &Path, exe_path: &Path) -> Result<(), String> {
+        let output = std::process::Command::new(args[0])
+            .args(&args[1..])
             .arg(obj_path)
             .arg("-o")
             .arg(exe_path)
             .output()
-            .map_err(|e| format!("failed to run cc: {}", e))?;
+            .map_err(|e| format!("failed to run '{}': {}", args[0], e))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -131,68 +1204,1008 @@ impl<'ctx> CodeGen<'ctx> {
         Ok(())
     }
 
-    fn compile_function(&mut self, func: &Function) -> Result<(), String> {
-        let fn_type = self.i32_type.fn_type(&[], false);
-        let function = self.module.add_function(&func.name, fn_type, None);
+    fn type_to_llvm(&self, ty: &Type) -> BasicTypeEnum<'ctx> {
+        match ty {
+            Type::Bool => self.bool_type.into(),
+            Type::I8 => self.i8_type.into(),
+            Type::I16 => self.i16_type.into(),
+            Type::I32 => self.i32_type.into(),
+            Type::I64 => self.i64_type.into(),
+            Type::U8 => self.i8_type.into(),
+            Type::U16 => self.i16_type.into(),
+            Type::U32 => self.i32_type.into(),
+            Type::U64 => self.i64_type.into(),
+            Type::Isize => self.ptr_int_type.into(),
+            Type::Usize => self.ptr_int_type.into(),
+            Type::F32 => self.f32_type.into(),
+            Type::F64 => self.f64_type.into(),
+            Type::Never => {
+                panic!("Never type cannot be used as a value type");
+            }
+            Type::Tuple(elems) => {
+                let llvm_elems: Vec<BasicTypeEnum<'ctx>> =
+                    elems.iter().map(|t| self.type_to_llvm(t)).collect();
+                self.context.struct_type(&llvm_elems, false).into()
+            }
+            Type::Unit => self.context.struct_type(&[], false).into(),
+            Type::Str => {
+                let elems: [BasicTypeEnum; 2] = [
+                    self.context.ptr_type(AddressSpace::default()).into(),
+                    self.i64_type.into(),
+                ];
+                self.context.struct_type(&elems, false).into()
+            }
+            Type::Ref { inner, .. } if **inner == Type::Str => {
+                let elems: [BasicTypeEnum; 2] = [
+                    self.context.ptr_type(AddressSpace::default()).into(),
+                    self.i64_type.into(),
+                ];
+                self.context.struct_type(&elems, false).into()
+            }
+            Type::Ref { .. } => self.context.ptr_type(AddressSpace::default()).into(),
+            Type::Ptr { .. } => self.context.ptr_type(AddressSpace::default()).into(),
+            Type::Struct(name) => self
+                .struct_types
+                .get(name)
+                .copied()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "unknown struct type '{}' — known types: {:?}",
+                        name,
+                        self.struct_types.keys().collect::<Vec<_>>()
+                    )
+                })
+                .into(),
+            Type::SelfType => {
+                panic!("SelfType used outside of impl context");
+            }
+        }
+    }
 
-        let entry = self.context.append_basic_block(function, "entry");
+    fn type_to_metadata_type(&self, ty: &Type) -> BasicMetadataTypeEnum<'ctx> {
+        match ty {
+            Type::Ref { .. } => self.type_to_llvm(ty).into(),
+            Type::Ptr { .. } => self.context.ptr_type(AddressSpace::default()).into(),
+            Type::Str => self.type_to_llvm(ty).into(),
+            _ => self.type_to_llvm(ty).into(),
+        }
+    }
+
+    fn is_signed(ty: &Type) -> bool {
+        matches!(
+            ty,
+            Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::Isize
+        )
+    }
+
+    #[allow(dead_code)]
+    fn is_bool(ty: &Type) -> bool {
+        matches!(ty, Type::Bool)
+    }
+
+    fn is_float(ty: &Type) -> bool {
+        matches!(ty, Type::F32 | Type::F64)
+    }
+
+    /// Compute the type of an expression, using the symbol table for variable lookups.
+    fn expr_type(&self, expr: &Expr) -> Type {
+        match expr {
+            Expr::MethodCall {
+                expr: receiver,
+                method,
+                ..
+            } => {
+                // Try to determine return type from method definition
+                let receiver_type = self.expr_type(receiver);
+                if let Type::Ref { inner, .. } = &receiver_type
+                    && **inner == Type::Str
+                    && method == "len"
+                {
+                    return Type::Usize;
+                }
+                // For struct/primitive methods, look up return type from impl methods
+                let type_name = match &receiver_type {
+                    Type::Struct(name) => Some(name.clone()),
+                    Type::Ref { inner, .. } => match inner.as_ref() {
+                        Type::Struct(name) => Some(name.clone()),
+                        _ => Self::primitive_type_name(inner).map(|s| s.to_string()),
+                    },
+                    _ => Self::primitive_type_name(&receiver_type).map(|s| s.to_string()),
+                };
+                if let Some(type_name) = type_name
+                    && let Some(methods) = self.impl_methods.get(&type_name)
+                    && methods.iter().any(|(name, _)| name == method)
+                {
+                    // clone/default return Self, eq/ne return bool, cmp returns i32
+                    if method == "clone" || method == "default" {
+                        return receiver_type;
+                    }
+                    if method == "eq" || method == "ne" {
+                        return Type::Bool;
+                    }
+                    return Type::I32;
+                }
+                Self::literal_type(expr)
+            }
+            Expr::Ident(name) => {
+                if self.consts.contains_key(name) {
+                    return Type::I32;
+                }
+                if let Some((_, _, ty)) = self.symbols.get(name) {
+                    return ty.clone();
+                }
+                Type::I32
+            }
+            Expr::Member {
+                expr: inner,
+                index,
+                field,
+            } => {
+                let parent_ty = self.expr_type(inner);
+                // Resolve struct types to their inner type for field access
+                let resolved_ty = match &parent_ty {
+                    Type::Ref { inner, .. } => inner.as_ref(),
+                    Type::Struct(_) => &parent_ty,
+                    _ => &parent_ty,
+                };
+                match resolved_ty {
+                    Type::Tuple(elems) => {
+                        if *index < elems.len() {
+                            return elems[*index].clone();
+                        }
+                        Type::I32
+                    }
+                    Type::Ref {
+                        inner: ref_inner, ..
+                    } if **ref_inner == Type::Str => {
+                        // &str is a fat pointer {ptr, len}
+                        match index {
+                            0 => Type::Ptr {
+                                inner: Box::new(Type::I8),
+                                is_mut: false,
+                            },
+                            1 => Type::Usize,
+                            _ => Type::I32,
+                        }
+                    }
+                    Type::Struct(name) => {
+                        if let Some(field_name) = field
+                            && let Some(fields) = self.struct_fields.get(name)
+                            && let Some(f) = fields.iter().find(|f| f.name == *field_name)
+                        {
+                            f.ty.clone()
+                        } else if *index < usize::MAX {
+                            // Tuple-like access on struct (not typical)
+                            if let Some(fields) = self.struct_fields.get(name)
+                                && *index < fields.len()
+                            {
+                                return fields[*index].ty.clone();
+                            }
+                            Type::I32
+                        } else {
+                            Type::I32
+                        }
+                    }
+                    _ => Type::I32,
+                }
+            }
+            Expr::If {
+                then_block,
+                else_block,
+                else_ifs,
+                ..
+            } => {
+                // Determine result type from then/else blocks
+                then_block
+                    .tail_expr
+                    .as_ref()
+                    .map(|e| self.expr_type(e))
+                    .or_else(|| {
+                        else_block
+                            .as_ref()
+                            .and_then(|b| b.tail_expr.as_ref().map(|e| self.expr_type(e)))
+                    })
+                    .or_else(|| {
+                        else_ifs
+                            .first()
+                            .and_then(|(_, b)| b.tail_expr.as_ref().map(|e| self.expr_type(e)))
+                    })
+                    .unwrap_or(Type::I32)
+            }
+            Expr::Call { callee, args } => {
+                let arg_types: Vec<Type> = args.iter().map(|a| self.expr_type(a)).collect();
+                // Try direct lookup, then overloaded
+                let name = if self.module.get_function(callee).is_some() {
+                    callee.clone()
+                } else if let Some(mangled) = self.overloads.get(callee).and_then(|overloads| {
+                    overloads
+                        .iter()
+                        .find(|(_, params)| params == &arg_types)
+                        .map(|(mangled, _)| mangled.clone())
+                }) {
+                    mangled
+                } else {
+                    callee.clone()
+                };
+                self.fn_return_types
+                    .get(&name)
+                    .cloned()
+                    .unwrap_or(Type::I32)
+            }
+            Expr::QualifiedCall {
+                module,
+                callee,
+                args,
+            } => {
+                let qualified_name = format!("{}::{}", module, callee);
+                let mangled_name = format!("{}::{}/{}", module, callee, args.len());
+                let name = if self.module.get_function(&qualified_name).is_some() {
+                    qualified_name
+                } else if self.module.get_function(&mangled_name).is_some() {
+                    mangled_name
+                } else {
+                    qualified_name
+                };
+                self.fn_return_types
+                    .get(&name)
+                    .cloned()
+                    .unwrap_or(Type::I32)
+            }
+            Expr::Binary { op, lhs, rhs, .. }
+                if !matches!(
+                    op,
+                    BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge
+                ) =>
+            {
+                let lhs_ty = self.expr_type(lhs);
+                let rhs_ty = self.expr_type(rhs);
+                fn type_width(ty: &Type) -> u32 {
+                    match ty {
+                        Type::Bool => 1,
+                        Type::I8 | Type::U8 => 8,
+                        Type::I16 | Type::U16 => 16,
+                        Type::I32 | Type::U32 => 32,
+                        Type::I64 | Type::U64 | Type::Isize | Type::Usize => 64,
+                        _ => 32,
+                    }
+                }
+                if type_width(&lhs_ty) >= type_width(&rhs_ty) {
+                    lhs_ty
+                } else {
+                    rhs_ty
+                }
+            }
+            _ => Self::literal_type(expr),
+        }
+    }
+
+    fn literal_type(expr: &Expr) -> Type {
+        match expr {
+            Expr::BoolLit(_) => Type::Bool,
+            Expr::IntLit(_) => Type::I32,
+            Expr::FloatLit(_) => Type::F64,
+            Expr::StrLit(_) => Type::Ref {
+                inner: Box::new(Type::Str),
+                is_mut: false,
+            },
+            Expr::Ref { expr, is_mut } => Type::Ref {
+                inner: Box::new(Self::literal_type(expr)),
+                is_mut: *is_mut,
+            },
+            Expr::Deref(expr) => {
+                let inner_ty = Self::literal_type(expr);
+                match inner_ty {
+                    Type::Ptr { inner, .. } => *inner,
+                    Type::Ref { inner, .. } => *inner,
+                    _ => Type::I32,
+                }
+            }
+            Expr::Assign { value, .. } => Self::literal_type(value),
+            Expr::Cast { to_type, .. } => to_type.clone(),
+            Expr::Tuple(elems) => Type::Tuple(elems.iter().map(Self::literal_type).collect()),
+            Expr::Unit => Type::Unit,
+            Expr::MethodCall { expr, method, .. } => {
+                let receiver_ty = Self::literal_type(expr);
+                // clone() returns Self
+                if method == "clone" {
+                    return receiver_ty;
+                }
+                // cmp returns i32
+                if method == "cmp" {
+                    return Type::I32;
+                }
+                // eq/ne return bool
+                if method == "eq" || method == "ne" {
+                    return Type::Bool;
+                }
+                // default() returns Self
+                if method == "default" {
+                    return receiver_ty;
+                }
+                Type::Usize
+            }
+            Expr::StructLit { struct_name, .. } => Type::Struct(struct_name.clone()),
+            Expr::Binary {
+                op: BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge,
+                ..
+            } => Type::Bool,
+            _ => Type::I32,
+        }
+    }
+
+    fn declare_function(&mut self, func: &Function) -> Result<(), String> {
+        let param_types: Vec<BasicMetadataTypeEnum<'ctx>> = func
+            .params
+            .iter()
+            .map(|p| self.type_to_metadata_type(&p.ty))
+            .collect();
+        let is_never = matches!(&func.return_type, Some(Type::Never));
+
+        // Determine if variadic — currently only printf
+        let is_variadic = func.name == "printf";
+
+        let use_void_return = is_never || (func.name != "main" && func.return_type.is_none());
+        let fn_type = if use_void_return {
+            let void_type = self.context.void_type();
+            void_type.fn_type(&param_types, is_variadic)
+        } else {
+            let ret_type: BasicTypeEnum = match &func.return_type {
+                Some(ty) => self.type_to_llvm(ty),
+                None => self.i32_type.into(),
+            };
+            if is_variadic {
+                ret_type.fn_type(&param_types, true)
+            } else {
+                ret_type.fn_type(&param_types, false)
+            }
+        };
+
+        if self.module.get_function(&func.name).is_none() {
+            let fn_val = self.module.add_function(&func.name, fn_type, None);
+            if is_never {
+                let kind_id = Attribute::get_named_enum_kind_id("noreturn");
+                let attr = self.context.create_enum_attribute(kind_id, 0);
+                fn_val.add_attribute(inkwell::attributes::AttributeLoc::Function, attr);
+            }
+        }
+        // Store return type for expr_type resolution
+        let ret_type = func.return_type.clone().unwrap_or(Type::I32);
+        self.fn_return_types.insert(func.name.clone(), ret_type);
+        // Store parameter types for argument coercion
+        let param_tys: Vec<Type> = func.params.iter().map(|p| p.ty.clone()).collect();
+        self.fn_param_types.insert(func.name.clone(), param_tys);
+        Ok(())
+    }
+
+    fn compile_function_body(&mut self, func: &Function) -> Result<(), String> {
+        let fn_val = self
+            .module
+            .get_function(&func.name)
+            .ok_or_else(|| format!("function '{}' not declared", func.name))?;
+
+        let entry = self.context.append_basic_block(fn_val, "entry");
         self.builder.position_at_end(entry);
+
+        // Allocate and store parameters
+        let param_values = fn_val.get_params();
+        for (i, param) in func.params.iter().enumerate() {
+            let llvm_ty = self.type_to_llvm(&param.ty);
+            let alloca = self
+                .builder
+                .build_alloca(llvm_ty, &param.name)
+                .map_err(|e| format!("failed to build alloca for param '{}': {}", param.name, e))?;
+            self.builder
+                .build_store(alloca, param_values[i])
+                .map_err(|e| format!("failed to store param '{}': {}", param.name, e))?;
+            self.symbols
+                .insert(param.name.clone(), (alloca, false, param.ty.clone()));
+        }
 
         for stmt in &func.body.stmts {
             self.compile_stmt(stmt)?;
         }
 
-        self.builder
-            .build_return(Some(&self.i32_type.const_zero()))
-            .map_err(|e| format!("failed to build return: {}", e))?;
+        // Check if the current block is already terminated (e.g. by a return statement)
+        let already_terminated = self
+            .builder
+            .get_insert_block()
+            .is_none_or(|bb| bb.get_terminator().is_some());
+
+        if !already_terminated {
+            if let Some(tail_expr) = &func.body.tail_expr {
+                let val = self.compile_expr(tail_expr)?;
+                self.builder
+                    .build_return(Some(&val))
+                    .map_err(|e| format!("failed to build return for tail expr: {}", e))?;
+            } else {
+                let is_never = matches!(&func.return_type, Some(Type::Never));
+                if is_never {
+                    self.builder
+                        .build_unreachable()
+                        .map_err(|e| format!("failed to build unreachable: {}", e))?;
+                } else if func.name == "main" {
+                    let zero_value: BasicValueEnum<'ctx> = self.i32_type.const_zero().into();
+                    self.builder
+                        .build_return(Some(&zero_value))
+                        .map_err(|e| format!("failed to build return: {}", e))?;
+                } else if let Some(ret_ty) = &func.return_type {
+                    let llvm_ret_ty = self.type_to_llvm(ret_ty);
+                    let default_ret: BasicValueEnum<'ctx> = match llvm_ret_ty {
+                        BasicTypeEnum::IntType(int_ty) => int_ty.const_zero().into(),
+                        BasicTypeEnum::FloatType(float_ty) => float_ty.const_float(0.0).into(),
+                        BasicTypeEnum::StructType(struct_ty) => struct_ty.get_undef().into(),
+                        _ => self.i32_type.const_zero().into(),
+                    };
+                    self.builder
+                        .build_return(Some(&default_ret))
+                        .map_err(|e| format!("failed to build return: {}", e))?;
+                } else {
+                    self.builder
+                        .build_return(None)
+                        .map_err(|e| format!("failed to build return: {}", e))?;
+                }
+            }
+        }
 
         Ok(())
     }
 
     fn compile_stmt(&mut self, stmt: &Stmt) -> Result<(), String> {
         match stmt {
-            Stmt::Let { name, init, .. } => {
+            Stmt::Let {
+                name,
+                is_mut,
+                type_ann,
+                init,
+                ..
+            } => {
+                let ty = type_ann.clone().unwrap_or_else(|| self.expr_type(init));
+                let llvm_ty = self.type_to_llvm(&ty);
                 let alloca = self
                     .builder
-                    .build_alloca(self.i32_type, name)
+                    .build_alloca(llvm_ty, name)
                     .map_err(|e| format!("failed to build alloca: {}", e))?;
-                let value = self.compile_expr(init)?;
+                let mut value = self.compile_expr(init)?;
+                if let Some(ann_ty) = type_ann {
+                    let inferred = self.expr_type(init);
+                    if ann_ty != &inferred {
+                        value = self.emit_cast(value, ann_ty)?;
+                    }
+                }
                 self.builder
                     .build_store(alloca, value)
                     .map_err(|e| format!("failed to build store: {}", e))?;
-                self.symbols.insert(name.clone(), alloca);
+                self.symbols.insert(name.clone(), (alloca, *is_mut, ty));
+                Ok(())
+            }
+            Stmt::Const { name, init, .. } => {
+                let raw = self.const_eval(init)?;
+                self.consts.insert(name.clone(), raw);
                 Ok(())
             }
             Stmt::Expr(expr) => {
                 self.compile_expr(expr)?;
                 Ok(())
             }
+            Stmt::Return { value, .. } => {
+                match value {
+                    Some(expr) => {
+                        let val = self.compile_expr(expr)?;
+                        self.builder
+                            .build_return(Some(&val))
+                            .map_err(|e| format!("failed to build return: {}", e))?;
+                    }
+                    None => {
+                        self.builder
+                            .build_return(None)
+                            .map_err(|e| format!("failed to build return: {}", e))?;
+                    }
+                }
+                // After return, insert unreachable so LLVM knows subsequent code is dead
+                self.builder
+                    .build_unreachable()
+                    .map_err(|e| format!("failed to build unreachable after return: {}", e))?;
+                Ok(())
+            }
         }
+    }
+
+    /// Compile a block's statements and return the value of its tail expression (if any).
+    fn compile_block_get_value(
+        &mut self,
+        block: &Block,
+    ) -> Result<Option<BasicValueEnum<'ctx>>, String> {
+        for stmt in &block.stmts {
+            self.compile_stmt(stmt)?;
+        }
+        if let Some(tail_expr) = &block.tail_expr {
+            let val = self.compile_expr(tail_expr)?;
+            Ok(Some(val))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Compile a comparison operator via trait method calls (Eq::eq, Eq::ne, Ord::cmp).
+    fn compile_trait_comparison(
+        &mut self,
+        op: &BinOp,
+        lhs: &Expr,
+        rhs: &Expr,
+        lhs_val: BasicValueEnum<'ctx>,
+        rhs_val: BasicValueEnum<'ctx>,
+    ) -> Result<BasicValueEnum<'ctx>, String> {
+        let lhs_type = self.expr_type(lhs);
+        let rhs_type = self.expr_type(rhs);
+
+        // Promote both to the wider type for comparison
+        let (promoted_lhs, promoted_rhs, common_type) =
+            if let (BasicValueEnum::IntValue(lhs_i), BasicValueEnum::IntValue(rhs_i)) =
+                (lhs_val, rhs_val)
+            {
+                let lhs_w = lhs_i.get_type().get_bit_width();
+                let rhs_w = rhs_i.get_type().get_bit_width();
+                if lhs_w > rhs_w {
+                    let ext_rhs = self
+                        .builder
+                        .build_int_z_extend(rhs_i, lhs_i.get_type(), "cmp_ext")
+                        .map_err(|e| format!("failed to extend cmp rhs: {}", e))?;
+                    (lhs_i.into(), ext_rhs.into(), lhs_type.clone())
+                } else if rhs_w > lhs_w {
+                    let ext_lhs = self
+                        .builder
+                        .build_int_z_extend(lhs_i, rhs_i.get_type(), "cmp_ext")
+                        .map_err(|e| format!("failed to extend cmp lhs: {}", e))?;
+                    (ext_lhs.into(), rhs_i.into(), rhs_type.clone())
+                } else {
+                    (lhs_val, rhs_val, lhs_type.clone())
+                }
+            } else {
+                (lhs_val, rhs_val, lhs_type.clone())
+            };
+
+        // Store both values to allocas for passing as references
+        let common_llvm_ty = self.type_to_llvm(&common_type);
+        let lhs_alloca = self
+            .builder
+            .build_alloca(common_llvm_ty, "cmp_lhs")
+            .map_err(|e| format!("failed to build cmp lhs alloca: {}", e))?;
+        self.builder
+            .build_store(lhs_alloca, promoted_lhs)
+            .map_err(|e| format!("failed to store cmp lhs: {}", e))?;
+        let rhs_alloca = self
+            .builder
+            .build_alloca(common_llvm_ty, "cmp_rhs")
+            .map_err(|e| format!("failed to build cmp rhs alloca: {}", e))?;
+        self.builder
+            .build_store(rhs_alloca, promoted_rhs)
+            .map_err(|e| format!("failed to store cmp rhs: {}", e))?;
+
+        // Use the common type for trait method lookup
+        let lhs_type = common_type;
+
+        match op {
+            BinOp::Eq | BinOp::Neq => {
+                let trait_name = "Eq";
+                let method_name = match op {
+                    BinOp::Eq => "eq",
+                    BinOp::Neq => "ne",
+                    _ => unreachable!(),
+                };
+                let fn_name = Self::trait_method_name(&lhs_type, trait_name, method_name);
+                let fn_val = self.module.get_function(&fn_name).ok_or_else(|| {
+                    format!(
+                        "internal: {}::{} not found for type {:?}",
+                        trait_name, method_name, lhs_type
+                    )
+                })?;
+                let result = self
+                    .builder
+                    .build_call(
+                        fn_val,
+                        &[lhs_alloca.into(), rhs_alloca.into()],
+                        "trait_eq_call",
+                    )
+                    .map_err(|e| {
+                        format!("failed to call {}::{}: {}", trait_name, method_name, e)
+                    })?;
+                Ok(self.try_extract_result(result))
+            }
+            _ => {
+                // Lt, Gt, Le, Ge via Ord::cmp
+                let fn_name = Self::trait_method_name(&lhs_type, "Ord", "cmp");
+                let fn_val = self.module.get_function(&fn_name).ok_or_else(|| {
+                    format!("internal: Ord::cmp not found for type {:?}", lhs_type)
+                })?;
+                let result = self
+                    .builder
+                    .build_call(
+                        fn_val,
+                        &[lhs_alloca.into(), rhs_alloca.into()],
+                        "trait_cmp_call",
+                    )
+                    .map_err(|e| format!("failed to call Ord::cmp: {}", e))?;
+                let cmp_result = self.try_extract_result(result).into_int_value();
+                let pred = match op {
+                    BinOp::Lt => inkwell::IntPredicate::SLT,
+                    BinOp::Gt => inkwell::IntPredicate::SGT,
+                    BinOp::Le => inkwell::IntPredicate::SLE,
+                    BinOp::Ge => inkwell::IntPredicate::SGE,
+                    _ => unreachable!(),
+                };
+                let result = self
+                    .builder
+                    .build_int_compare(pred, cmp_result, self.i32_type.const_zero(), "cmp_result")
+                    .map_err(|e| format!("failed to build cmp compare with zero: {}", e))?;
+                Ok(result.into())
+            }
+        }
+    }
+
+    /// Compile the else-if chain storing results into result_alloca.
+    fn compile_else_chain_store(
+        &mut self,
+        else_ifs: &[(Expr, Block)],
+        else_block: &Option<Block>,
+        parent_fn: inkwell::values::FunctionValue<'ctx>,
+        merge_bb: inkwell::basic_block::BasicBlock<'ctx>,
+        result_alloca: inkwell::values::PointerValue<'ctx>,
+        _result_type: &Type,
+    ) -> Result<(), String> {
+        if let Some((elif_cond, elif_body)) = else_ifs.first() {
+            let cond_val = self.compile_expr(elif_cond)?;
+            let cond_i1 = match cond_val {
+                BasicValueEnum::IntValue(v) => {
+                    if v.get_type().get_bit_width() != 1 {
+                        self.builder
+                            .build_int_truncate(v, self.bool_type, "elif_cond_i1")
+                            .map_err(|e| format!("failed to trunc elif cond to i1: {}", e))?
+                    } else {
+                        v
+                    }
+                }
+                _ => {
+                    return Err("else-if condition must be a boolean or integer".to_string());
+                }
+            };
+
+            let then_bb = self.context.append_basic_block(parent_fn, "elif_then");
+            let rest_bb = self.context.append_basic_block(parent_fn, "elif_rest");
+
+            self.builder
+                .build_conditional_branch(cond_i1, then_bb, rest_bb)
+                .map_err(|e| format!("failed to build elif branch: {}", e))?;
+
+            // Compile the elif body
+            self.builder.position_at_end(then_bb);
+            if let Some(val) = self.compile_block_get_value(elif_body)? {
+                self.builder
+                    .build_store(result_alloca, val)
+                    .map_err(|e| format!("failed to store elif result: {}", e))?;
+            }
+            let then_terminated = self
+                .builder
+                .get_insert_block()
+                .unwrap()
+                .get_terminator()
+                .is_some();
+            if !then_terminated {
+                self.builder
+                    .build_unconditional_branch(merge_bb)
+                    .map_err(|e| format!("failed to branch from elif to merge: {}", e))?;
+            }
+
+            // Compile remaining else-ifs / else block
+            self.builder.position_at_end(rest_bb);
+            self.compile_else_chain_store(
+                &else_ifs[1..],
+                else_block,
+                parent_fn,
+                merge_bb,
+                result_alloca,
+                _result_type,
+            )?;
+        } else if let Some(el_block) = else_block
+            && let Some(val) = self.compile_block_get_value(el_block)?
+        {
+            self.builder
+                .build_store(result_alloca, val)
+                .map_err(|e| format!("failed to store else result: {}", e))?;
+        }
+        Ok(())
     }
 
     fn compile_expr(&mut self, expr: &Expr) -> Result<BasicValueEnum<'ctx>, String> {
         match expr {
+            Expr::BoolLit(val) => Ok(self
+                .bool_type
+                .const_int(if *val { 1 } else { 0 }, false)
+                .into()),
             Expr::IntLit(val) => Ok(self.i32_type.const_int(*val as u64, true).into()),
+            Expr::FloatLit(val) => Ok(self.f64_type.const_float(*val).into()),
+            Expr::StrLit(s) => {
+                let ptr = self
+                    .builder
+                    .build_global_string_ptr(s, "str")
+                    .map_err(|e| format!("failed to build string literal: {}", e))?;
+                let ptr_val = ptr.as_pointer_value();
+                // Build { ptr, len } struct
+                let len = s.len() as u64;
+                let len_val = self.i64_type.const_int(len, false);
+                let elems: [BasicTypeEnum; 2] = [
+                    self.context.ptr_type(AddressSpace::default()).into(),
+                    self.i64_type.into(),
+                ];
+                let struct_ty = self.context.struct_type(&elems, false);
+                let str_struct = struct_ty.get_undef();
+                let str_struct = self
+                    .builder
+                    .build_insert_value(str_struct, ptr_val, 0, "str_ptr")
+                    .map_err(|e| format!("failed to build str ptr insert: {}", e))?;
+                let str_struct = self
+                    .builder
+                    .build_insert_value(str_struct, len_val, 1, "str_len")
+                    .map_err(|e| format!("failed to build str len insert: {}", e))?;
+                Ok(str_struct.into_struct_value().into())
+            }
             Expr::Ident(name) => {
-                if let Some(ptr) = self.symbols.get(name) {
+                if let Some(val) = self.consts.get(name) {
+                    return Ok(self.i32_type.const_int(*val as u64, true).into());
+                }
+                if let Some((ptr, _, ty)) = self.symbols.get(name) {
+                    let llvm_ty = self.type_to_llvm(ty);
                     let val = self
                         .builder
-                        .build_load(self.i32_type, *ptr, name)
+                        .build_load(llvm_ty, *ptr, name)
                         .map_err(|e| format!("failed to build load: {}", e))?;
                     Ok(val)
                 } else {
                     Err(format!("undefined variable '{}'", name))
                 }
             }
-            Expr::Call { callee, arg } => {
-                if callee == "print" {
-                    let arg_val = self.compile_expr(arg)?;
-                    let int_val = arg_val.into_int_value();
-                    self.emit_printf(int_val)?;
-                    Ok(self.i32_type.const_zero().into())
-                } else {
-                    Err(format!("unknown function '{}'", callee))
+            Expr::Assign { target, value } => match target.as_ref() {
+                Expr::Ident(name) => {
+                    if self.consts.contains_key(name) {
+                        return Err(format!("cannot assign to constant '{}'", name));
+                    }
+                    let (ptr, is_mut, _) = self
+                        .symbols
+                        .get(name)
+                        .map(|(p, m, t)| (*p, *m, t.clone()))
+                        .ok_or_else(|| format!("undefined variable '{}'", name))?;
+                    if !is_mut {
+                        return Err(format!("cannot assign to immutable variable '{}'", name));
+                    }
+                    let val = self.compile_expr(value)?;
+                    self.builder
+                        .build_store(ptr, val)
+                        .map_err(|e| format!("failed to build store: {}", e))?;
+                    Ok(val)
                 }
+                Expr::Deref(inner) => {
+                    let ptr = self.compile_expr(inner)?;
+                    let ptr = ptr.into_pointer_value();
+                    let val = self.compile_expr(value)?;
+                    self.builder
+                        .build_store(ptr, val)
+                        .map_err(|e| format!("failed to build store through deref: {}", e))?;
+                    Ok(val)
+                }
+                Expr::Member {
+                    expr: member_expr,
+                    index,
+                    field,
+                } => {
+                    let parent_ptr_val = self.compile_expr(member_expr)?;
+                    let parent_ptr = parent_ptr_val.into_pointer_value();
+                    let parent_type = self.expr_type(member_expr);
+
+                    let (struct_ty, struct_name) = match &parent_type {
+                        Type::Ref { inner, is_mut } => {
+                            if !is_mut {
+                                return Err("cannot assign to field through immutable reference"
+                                    .to_string());
+                            }
+                            match inner.as_ref() {
+                                Type::Struct(name) => {
+                                    let st =
+                                        self.struct_types.get(name).copied().ok_or_else(|| {
+                                            format!("unknown struct type '{}'", name)
+                                        })?;
+                                    (st, name.clone())
+                                }
+                                _ => {
+                                    return Err(
+                                        "cannot access field on non-struct type".to_string()
+                                    );
+                                }
+                            }
+                        }
+                        Type::Struct(name) => {
+                            let st = self
+                                .struct_types
+                                .get(name)
+                                .copied()
+                                .ok_or_else(|| format!("unknown struct type '{}'", name))?;
+                            (st, name.clone())
+                        }
+                        _ => return Err("cannot assign to field on non-struct type".to_string()),
+                    };
+
+                    let field_idx = if let Some(field_name) = field {
+                        let fields = self
+                            .struct_fields
+                            .get(&struct_name)
+                            .ok_or_else(|| format!("unknown struct '{}'", struct_name))?;
+                        fields
+                            .iter()
+                            .position(|f| f.name == *field_name)
+                            .ok_or_else(|| {
+                                format!("struct '{}' has no field '{}'", struct_name, field_name)
+                            })? as u32
+                    } else {
+                        *index as u32
+                    };
+
+                    let field_ptr = self
+                        .builder
+                        .build_struct_gep(struct_ty, parent_ptr, field_idx, "field_ptr")
+                        .map_err(|e| {
+                            format!("failed to get field pointer for assignment: {}", e)
+                        })?;
+                    let mut val = self.compile_expr(value)?;
+                    // Coerce to the field's declared type
+                    if let Some(fields) = self.struct_fields.get(&struct_name)
+                        && let Some(field_def) = fields.get(field_idx as usize)
+                    {
+                        let field_llvm_ty = self.type_to_llvm(&field_def.ty);
+                        if val.get_type() != field_llvm_ty {
+                            val = self.emit_cast(val, &field_def.ty)?;
+                        }
+                    }
+                    self.builder
+                        .build_store(field_ptr, val)
+                        .map_err(|e| format!("failed to store field value: {}", e))?;
+                    Ok(val)
+                }
+                _ => Err("invalid assignment target".to_string()),
+            },
+            Expr::Ref { expr, .. } => {
+                if let Expr::Ident(name) = expr.as_ref() {
+                    if let Some((ptr, _, _)) = self.symbols.get(name) {
+                        Ok((*ptr).into())
+                    } else {
+                        Err(format!("undefined variable '{}'", name))
+                    }
+                } else {
+                    let ty = Self::literal_type(expr);
+                    let llvm_ty = self.type_to_llvm(&ty);
+                    let alloca = self
+                        .builder
+                        .build_alloca(llvm_ty, "ref_temp")
+                        .map_err(|e| format!("failed to build ref temp alloca: {}", e))?;
+                    let val = self.compile_expr(expr)?;
+                    self.builder
+                        .build_store(alloca, val)
+                        .map_err(|e| format!("failed to store ref temp: {}", e))?;
+                    Ok(alloca.into())
+                }
+            }
+            Expr::Deref(expr) => {
+                let ptr_val = self.compile_expr(expr)?;
+                let ptr = ptr_val.into_pointer_value();
+                // Determine pointee type
+                let pointee_ty = Self::literal_type(expr);
+                let pointee_llvm_ty = self.type_to_llvm(match &pointee_ty {
+                    Type::Ref { inner, .. } => inner,
+                    Type::Ptr { inner, .. } => inner,
+                    _ => &pointee_ty,
+                });
+                let val = self
+                    .builder
+                    .build_load(pointee_llvm_ty, ptr, "deref")
+                    .map_err(|e| format!("failed to build deref load: {}", e))?;
+                Ok(val)
+            }
+            Expr::Call { callee, args } => {
+                let arg_types: Vec<Type> = args.iter().map(|a| self.expr_type(a)).collect();
+                let fn_val = self
+                    .resolve_function(callee, &arg_types)
+                    .ok_or_else(|| format!("unknown function '{}'", callee))?;
+                let mut arg_values = self.compile_args_vec(args)?;
+                // Coerce arguments to match declared parameter types
+                if let Some(param_tys) = self.fn_param_types.get(callee) {
+                    for (i, arg_val) in arg_values.iter_mut().enumerate() {
+                        if let Some(param_ty) = param_tys.get(i) {
+                            let param_llvm_ty = self.type_to_llvm(param_ty);
+                            // Compare types by extracting BasicValueEnum
+                            let bv = match arg_val {
+                                BasicMetadataValueEnum::IntValue(v) => BasicValueEnum::IntValue(*v),
+                                BasicMetadataValueEnum::FloatValue(v) => {
+                                    BasicValueEnum::FloatValue(*v)
+                                }
+                                BasicMetadataValueEnum::PointerValue(v) => {
+                                    BasicValueEnum::PointerValue(*v)
+                                }
+                                BasicMetadataValueEnum::StructValue(v) => {
+                                    BasicValueEnum::StructValue(*v)
+                                }
+                                &mut _ => continue,
+                            };
+                            if bv.get_type() != param_llvm_ty {
+                                let cast = self.emit_cast(bv, param_ty)?;
+                                *arg_val = match cast {
+                                    BasicValueEnum::IntValue(v) => v.into(),
+                                    BasicValueEnum::FloatValue(v) => v.into(),
+                                    BasicValueEnum::PointerValue(v) => v.into(),
+                                    BasicValueEnum::StructValue(v) => v.into(),
+                                    _ => continue,
+                                };
+                            }
+                        }
+                    }
+                }
+                let result = self
+                    .builder
+                    .build_call(fn_val, &arg_values, "call")
+                    .map_err(|e| format!("failed to build call to '{}': {}", callee, e))?;
+                Ok(self.try_extract_result(result))
+            }
+            Expr::QualifiedCall {
+                module,
+                callee,
+                args,
+            } => {
+                let qualified_name = format!("{}::{}", module, callee);
+                let mangled_name = format!("{}::{}/{}", module, callee, args.len());
+                let arg_types: Vec<Type> = args.iter().map(|a| self.expr_type(a)).collect();
+                // Try direct lookup first, then mangled name (for impl methods), then overload map
+                let fn_val = self
+                    .module
+                    .get_function(&qualified_name)
+                    .or_else(|| self.module.get_function(&mangled_name))
+                    .or_else(|| self.resolve_function(&qualified_name, &arg_types))
+                    .or_else(|| self.resolve_function(callee, &arg_types))
+                    .or_else(|| self.resolve_function(&mangled_name, &arg_types))
+                    .ok_or_else(|| format!("unknown function '{}'", qualified_name))?;
+                let mut arg_values = self.compile_args_vec(args)?;
+                // Coerce arguments to match declared parameter types
+                let resolved_name = fn_val.get_name().to_string_lossy().to_string();
+                if let Some(param_tys) = self.fn_param_types.get(&resolved_name) {
+                    for (i, arg_val) in arg_values.iter_mut().enumerate() {
+                        if let Some(param_ty) = param_tys.get(i) {
+                            let param_llvm_ty = self.type_to_llvm(param_ty);
+                            let bv = match arg_val {
+                                BasicMetadataValueEnum::IntValue(v) => BasicValueEnum::IntValue(*v),
+                                BasicMetadataValueEnum::FloatValue(v) => {
+                                    BasicValueEnum::FloatValue(*v)
+                                }
+                                BasicMetadataValueEnum::PointerValue(v) => {
+                                    BasicValueEnum::PointerValue(*v)
+                                }
+                                BasicMetadataValueEnum::StructValue(v) => {
+                                    BasicValueEnum::StructValue(*v)
+                                }
+                                &mut _ => continue,
+                            };
+                            if bv.get_type() != param_llvm_ty {
+                                let cast = self.emit_cast(bv, param_ty)?;
+                                *arg_val = match cast {
+                                    BasicValueEnum::IntValue(v) => v.into(),
+                                    BasicValueEnum::FloatValue(v) => v.into(),
+                                    BasicValueEnum::PointerValue(v) => v.into(),
+                                    BasicValueEnum::StructValue(v) => v.into(),
+                                    _ => continue,
+                                };
+                            }
+                        }
+                    }
+                }
+                let result = self
+                    .builder
+                    .build_call(fn_val, &arg_values, "call")
+                    .map_err(|e| format!("failed to build call to '{}': {}", qualified_name, e))?;
+                Ok(self.try_extract_result(result))
             }
             Expr::Binary { op, lhs, rhs } => {
                 let lhs_val = self.compile_expr(lhs)?;
@@ -200,6 +2213,33 @@ impl<'ctx> CodeGen<'ctx> {
 
                 let lhs_int = lhs_val.into_int_value();
                 let rhs_int = rhs_val.into_int_value();
+                // Promote both operands to the wider integer width
+                let lhs_ty = lhs_int.get_type();
+                let rhs_ty = rhs_int.get_type();
+                let lhs_width = lhs_ty.get_bit_width();
+                let rhs_width = rhs_ty.get_bit_width();
+                let common_ty = if lhs_width > rhs_width {
+                    lhs_ty
+                } else {
+                    rhs_ty
+                };
+                let lhs_int = if lhs_width < common_ty.get_bit_width() {
+                    self.builder
+                        .build_int_z_extend(lhs_int, common_ty, "lhs_ext")
+                        .map_err(|e| format!("failed to extend lhs: {}", e))?
+                } else {
+                    lhs_int
+                };
+                let rhs_int = if rhs_width < common_ty.get_bit_width() {
+                    self.builder
+                        .build_int_z_extend(rhs_int, common_ty, "rhs_ext")
+                        .map_err(|e| format!("failed to extend rhs: {}", e))?
+                } else {
+                    rhs_int
+                };
+                // If one is narrower, it was zero-extended; truncate result back to original wider width if needed
+                let result_width = common_ty.get_bit_width();
+                let _ = result_width;
 
                 let result = match op {
                     BinOp::Add => self
@@ -222,30 +2262,881 @@ impl<'ctx> CodeGen<'ctx> {
                         .build_int_signed_div(lhs_int, rhs_int, "tmp")
                         .map_err(|e| format!("failed to build div: {}", e))?
                         .into(),
+                    // Comparisons use trait methods
+                    _ => return self.compile_trait_comparison(op, lhs, rhs, lhs_val, rhs_val),
                 };
                 Ok(result)
+            }
+            Expr::Tuple(elems) => {
+                let compiled: Vec<BasicValueEnum<'ctx>> = elems
+                    .iter()
+                    .map(|e| self.compile_expr(e))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let llvm_elems: Vec<BasicTypeEnum<'ctx>> =
+                    compiled.iter().map(|v| v.get_type()).collect();
+                let struct_ty = self.context.struct_type(&llvm_elems, false);
+                let initial: inkwell::values::AggregateValueEnum<'ctx> =
+                    struct_ty.get_undef().into();
+                let mut result = initial;
+                for (i, val) in compiled.iter().enumerate() {
+                    result = self
+                        .builder
+                        .build_insert_value(result, *val, i as u32, "tuple_elem")
+                        .map_err(|e| format!("failed to build tuple elem {}: {}", i, e))?;
+                }
+                Ok(result.into_struct_value().into())
+            }
+            Expr::Unit => {
+                let unit_ty = self.context.struct_type(&[], false);
+                Ok(unit_ty.get_undef().into())
+            }
+            Expr::Member {
+                expr, index, field, ..
+            } => {
+                let mut val = self.compile_expr(expr)?;
+                // If the result is a pointer, load the struct first
+                if val.is_pointer_value() {
+                    let ptr = val.into_pointer_value();
+                    // Determine struct type from the expression type
+                    let ty = self.expr_type(expr);
+                    match &ty {
+                        Type::Ref { inner, .. } => {
+                            let llvm_ty = self.type_to_llvm(inner);
+                            val = self
+                                .builder
+                                .build_load(llvm_ty, ptr, "struct_deref")
+                                .map_err(|e| {
+                                    format!("failed to load struct for field access: {}", e)
+                                })?;
+                        }
+                        Type::Struct(_name) => {
+                            let llvm_ty = self.type_to_llvm(&ty);
+                            val = self
+                                .builder
+                                .build_load(llvm_ty, ptr, "struct_deref")
+                                .map_err(|e| {
+                                    format!("failed to load struct for field access: {}", e)
+                                })?;
+                        }
+                        _ => {}
+                    }
+                }
+                match val {
+                    BasicValueEnum::StructValue(sv) => {
+                        let struct_ty = sv.get_type();
+                        let effective_index = if let Some(field_name) = field {
+                            // Look up field index from struct type definition
+                            // Infer the struct name from the expression type
+                            let parent_ty = self.expr_type(expr);
+                            let struct_name = match &parent_ty {
+                                Type::Struct(name) => name.clone(),
+                                Type::Ref { inner, .. } => match inner.as_ref() {
+                                    Type::Struct(name) => name.clone(),
+                                    _ => {
+                                        return Err(format!(
+                                            "cannot access field '{}' on non-struct type",
+                                            field_name
+                                        ));
+                                    }
+                                },
+                                _ => {
+                                    return Err(format!(
+                                        "cannot access field '{}' on non-struct type",
+                                        field_name
+                                    ));
+                                }
+                            };
+                            let fields = self
+                                .struct_fields
+                                .get(&struct_name)
+                                .ok_or_else(|| format!("unknown struct '{}'", struct_name))?;
+                            let idx = fields
+                                .iter()
+                                .position(|f| f.name == *field_name)
+                                .ok_or_else(|| {
+                                    format!(
+                                        "struct '{}' has no field '{}'",
+                                        struct_name, field_name
+                                    )
+                                })?;
+                            idx as u32
+                        } else {
+                            *index as u32
+                        };
+                        let field_count = struct_ty.count_fields();
+                        if (effective_index as usize) >= field_count as usize {
+                            return Err(format!(
+                                "field index {} out of bounds; struct has {} fields",
+                                effective_index, field_count
+                            ));
+                        }
+                        let extracted = self
+                            .builder
+                            .build_extract_value(sv, effective_index, "member")
+                            .map_err(|e| format!("failed to extract struct field: {}", e))?;
+                        Ok(extracted)
+                    }
+                    _ => Err("cannot access member of non-struct value".to_string()),
+                }
+            }
+            Expr::MethodCall {
+                expr: receiver,
+                method,
+                args,
+            } => {
+                // Special case: .len() on strings
+                if method == "len" && args.is_empty() {
+                    let val = self.compile_expr(receiver)?;
+                    match val {
+                        BasicValueEnum::StructValue(sv) => {
+                            // &str/str is a { ptr, i64 } struct; field 1 is byte length
+                            let len = self
+                                .builder
+                                .build_extract_value(sv, 1, "str_len")
+                                .map_err(|e| format!("failed to extract str length: {}", e))?;
+                            return Ok(len);
+                        }
+                        _ => {
+                            return Err("cannot call .len() on a non-string value".to_string());
+                        }
+                    }
+                }
+
+                // Determine receiver type
+                let receiver_type = self.expr_type(receiver);
+                let (type_name, _is_ref) = match &receiver_type {
+                    Type::Struct(name) => (name.clone(), false),
+                    Type::Ref { inner, .. } => match inner.as_ref() {
+                        Type::Struct(name) => (name.clone(), true),
+                        Type::Bool => ("bool".to_string(), true),
+                        Type::I8 => ("i8".to_string(), true),
+                        Type::I16 => ("i16".to_string(), true),
+                        Type::I32 => ("i32".to_string(), true),
+                        Type::I64 => ("i64".to_string(), true),
+                        Type::U8 => ("u8".to_string(), true),
+                        Type::U16 => ("u16".to_string(), true),
+                        Type::U32 => ("u32".to_string(), true),
+                        Type::U64 => ("u64".to_string(), true),
+                        Type::Usize => ("usize".to_string(), true),
+                        Type::Isize => ("isize".to_string(), true),
+                        Type::F32 => ("f32".to_string(), true),
+                        Type::F64 => ("f64".to_string(), true),
+                        _ => {
+                            return Err(format!(
+                                "cannot call method '{}' on type {:?}",
+                                method, receiver_type
+                            ));
+                        }
+                    },
+                    Type::Bool => ("bool".to_string(), false),
+                    Type::I8 => ("i8".to_string(), false),
+                    Type::I16 => ("i16".to_string(), false),
+                    Type::I32 => ("i32".to_string(), false),
+                    Type::I64 => ("i64".to_string(), false),
+                    Type::U8 => ("u8".to_string(), false),
+                    Type::U16 => ("u16".to_string(), false),
+                    Type::U32 => ("u32".to_string(), false),
+                    Type::U64 => ("u64".to_string(), false),
+                    Type::Usize => ("usize".to_string(), false),
+                    Type::Isize => ("isize".to_string(), false),
+                    Type::F32 => ("f32".to_string(), false),
+                    Type::F64 => ("f64".to_string(), false),
+                    _ => {
+                        return Err(format!(
+                            "cannot call method '{}' on type {:?}",
+                            method, receiver_type
+                        ));
+                    }
+                };
+
+                // Look up method
+                let methods = self.impl_methods.get(&type_name).ok_or_else(|| {
+                    format!("type '{}' has no methods (no impl block found)", type_name)
+                })?;
+
+                let mangled = methods
+                    .iter()
+                    .find(|(name, _)| name == method)
+                    .map(|(_, mangled)| mangled.clone())
+                    .ok_or_else(|| format!("type '{}' has no method '{}'", type_name, method))?;
+
+                let fn_val = self
+                    .module
+                    .get_function(&mangled)
+                    .ok_or_else(|| format!("internal: method '{}' not found in module", mangled))?;
+
+                // Compile receiver as first arg (pass pointer for &self)
+                let receiver_val = self.compile_expr(receiver)?;
+                let receiver_ptr = match receiver_val {
+                    BasicValueEnum::PointerValue(p) => p,
+                    _ => {
+                        // If receiver is a value, store to alloca and pass pointer
+                        let alloca = self
+                            .builder
+                            .build_alloca(receiver_val.get_type(), "method_self")
+                            .map_err(|e| {
+                                format!("failed to build alloca for method receiver: {}", e)
+                            })?;
+                        self.builder
+                            .build_store(alloca, receiver_val)
+                            .map_err(|e| {
+                                format!("failed to store receiver for method call: {}", e)
+                            })?;
+                        alloca
+                    }
+                };
+
+                let mut all_args = vec![receiver_ptr.into()];
+                for arg in args {
+                    let val = self.compile_expr(arg)?;
+                    all_args.push(val.into());
+                }
+
+                let result = self
+                    .builder
+                    .build_call(fn_val, &all_args, "method_call")
+                    .map_err(|e| format!("failed to build method call '{}': {}", method, e))?;
+                Ok(self.try_extract_result(result))
+            }
+            Expr::StructLit {
+                struct_name,
+                fields,
+                ..
+            } => {
+                let struct_type = self
+                    .struct_types
+                    .get(struct_name)
+                    .copied()
+                    .ok_or_else(|| format!("unknown struct '{}'", struct_name))?;
+                let struct_val: inkwell::values::AggregateValueEnum<'ctx> =
+                    struct_type.get_undef().into();
+                let mut result = struct_val;
+                // Pre-fetch struct field types for coercion
+                let struct_def_fields: Vec<Type> = self
+                    .struct_fields
+                    .get(struct_name)
+                    .map(|f| f.iter().map(|fd| fd.ty.clone()).collect())
+                    .unwrap_or_default();
+                for (i, (field_name, field_expr)) in fields.iter().enumerate() {
+                    let mut field_val = self.compile_expr(field_expr)?;
+                    // Coerce field value to the declared field type
+                    if let Some(field_ty) = struct_def_fields.get(i) {
+                        let field_llvm_ty = self.type_to_llvm(field_ty);
+                        if field_val.get_type() != field_llvm_ty {
+                            field_val = self.emit_cast(field_val, field_ty)?;
+                        }
+                    }
+                    result = self
+                        .builder
+                        .build_insert_value(result, field_val, i as u32, field_name)
+                        .map_err(|e| {
+                            format!("failed to insert struct field '{}': {}", field_name, e)
+                        })?;
+                }
+                match result {
+                    inkwell::values::AggregateValueEnum::StructValue(sv) => Ok(sv.into()),
+                    _ => Err(format!("expected struct value for '{}'", struct_name)),
+                }
+            }
+            Expr::Cast { expr, to_type } => {
+                let val = self.compile_expr(expr)?;
+                self.emit_cast(val, to_type)
+            }
+            Expr::If {
+                cond,
+                then_block,
+                else_ifs,
+                else_block,
+            } => {
+                let parent_fn = self
+                    .builder
+                    .get_insert_block()
+                    .unwrap()
+                    .get_parent()
+                    .unwrap();
+
+                let cond_val = self.compile_expr(cond)?;
+                let cond_i1 = match cond_val {
+                    BasicValueEnum::IntValue(v) => {
+                        if v.get_type().get_bit_width() != 1 {
+                            self.builder
+                                .build_int_truncate(v, self.bool_type, "cond_i1")
+                                .map_err(|e| format!("failed to trunc condition to i1: {}", e))?
+                        } else {
+                            v
+                        }
+                    }
+                    _ => {
+                        return Err("if condition must be a boolean or integer".to_string());
+                    }
+                };
+
+                // Determine result type from then/else blocks
+                let result_type = then_block
+                    .tail_expr
+                    .as_ref()
+                    .map(|e| self.expr_type(e))
+                    .or_else(|| {
+                        else_block
+                            .as_ref()
+                            .and_then(|b| b.tail_expr.as_ref().map(|e| self.expr_type(e)))
+                    })
+                    .or_else(|| {
+                        else_ifs
+                            .first()
+                            .and_then(|(_, b)| b.tail_expr.as_ref().map(|e| self.expr_type(e)))
+                    })
+                    .unwrap_or(Type::I32);
+                let result_llvm_ty = self.type_to_llvm(&result_type);
+
+                // Allocate a stack slot for the if result
+                let result_alloca = self
+                    .builder
+                    .build_alloca(result_llvm_ty, "if_result")
+                    .map_err(|e| format!("failed to build if result alloca: {}", e))?;
+
+                let then_bb = self.context.append_basic_block(parent_fn, "if_then");
+                let else_bb = self.context.append_basic_block(parent_fn, "if_else");
+                let merge_bb = self.context.append_basic_block(parent_fn, "if_merge");
+
+                self.builder
+                    .build_conditional_branch(cond_i1, then_bb, else_bb)
+                    .map_err(|e| format!("failed to build if branch: {}", e))?;
+
+                // Compile then block
+                self.builder.position_at_end(then_bb);
+                if let Some(then_val) = self.compile_block_get_value(then_block)? {
+                    self.builder
+                        .build_store(result_alloca, then_val)
+                        .map_err(|e| format!("failed to store then result: {}", e))?;
+                }
+                let then_terminated = self
+                    .builder
+                    .get_insert_block()
+                    .unwrap()
+                    .get_terminator()
+                    .is_some();
+                if !then_terminated {
+                    self.builder
+                        .build_unconditional_branch(merge_bb)
+                        .map_err(|e| format!("failed to branch to merge: {}", e))?;
+                }
+
+                // Compile else_ifs and else block
+                self.builder.position_at_end(else_bb);
+                self.compile_else_chain_store(
+                    else_ifs,
+                    else_block,
+                    parent_fn,
+                    merge_bb,
+                    result_alloca,
+                    &result_type,
+                )?;
+                let else_terminated = self
+                    .builder
+                    .get_insert_block()
+                    .unwrap()
+                    .get_terminator()
+                    .is_some();
+                if !else_terminated {
+                    self.builder
+                        .build_unconditional_branch(merge_bb)
+                        .map_err(|e| format!("failed to branch to merge from else: {}", e))?;
+                }
+
+                // Position at merge block and load result
+                self.builder.position_at_end(merge_bb);
+                let result = self
+                    .builder
+                    .build_load(result_llvm_ty, result_alloca, "if_result")
+                    .map_err(|e| format!("failed to load if result: {}", e))?;
+                Ok(result)
+            }
+            Expr::Loop { body } => {
+                let parent_fn = self
+                    .builder
+                    .get_insert_block()
+                    .unwrap()
+                    .get_parent()
+                    .unwrap();
+
+                let header_bb = self.context.append_basic_block(parent_fn, "loop_header");
+                let after_bb = self.context.append_basic_block(parent_fn, "loop_after");
+
+                self.builder
+                    .build_unconditional_branch(header_bb)
+                    .map_err(|e| format!("failed to branch to loop header: {}", e))?;
+
+                self.builder.position_at_end(header_bb);
+                self.compile_block_get_value(body)?;
+
+                // Branch back to header
+                let terminated = self
+                    .builder
+                    .get_insert_block()
+                    .unwrap()
+                    .get_terminator()
+                    .is_some();
+                if !terminated {
+                    self.builder
+                        .build_unconditional_branch(header_bb)
+                        .map_err(|e| format!("failed to branch back in loop: {}", e))?;
+                }
+
+                // Position at after block for subsequent code
+                self.builder.position_at_end(after_bb);
+
+                // Loop produces unit value
+                let unit_ty = self.context.struct_type(&[], false);
+                Ok(unit_ty.get_undef().into())
+            }
+            Expr::While { cond, body } => {
+                let parent_fn = self
+                    .builder
+                    .get_insert_block()
+                    .unwrap()
+                    .get_parent()
+                    .unwrap();
+
+                let cond_bb = self.context.append_basic_block(parent_fn, "while_cond");
+                let body_bb = self.context.append_basic_block(parent_fn, "while_body");
+                let after_bb = self.context.append_basic_block(parent_fn, "while_after");
+
+                self.builder
+                    .build_unconditional_branch(cond_bb)
+                    .map_err(|e| format!("failed to branch to while cond: {}", e))?;
+
+                // Condition block
+                self.builder.position_at_end(cond_bb);
+                let cond_val = self.compile_expr(cond)?;
+                let cond_i1 = match cond_val {
+                    BasicValueEnum::IntValue(v) => {
+                        if v.get_type().get_bit_width() != 1 {
+                            self.builder
+                                .build_int_truncate(v, self.bool_type, "while_cond_i1")
+                                .map_err(|e| format!("failed to trunc while cond to i1: {}", e))?
+                        } else {
+                            v
+                        }
+                    }
+                    _ => {
+                        return Err("while condition must be a boolean or integer".to_string());
+                    }
+                };
+                self.builder
+                    .build_conditional_branch(cond_i1, body_bb, after_bb)
+                    .map_err(|e| format!("failed to build while branch: {}", e))?;
+
+                // Body block
+                self.builder.position_at_end(body_bb);
+                self.compile_block_get_value(body)?;
+                let terminated = self
+                    .builder
+                    .get_insert_block()
+                    .unwrap()
+                    .get_terminator()
+                    .is_some();
+                if !terminated {
+                    self.builder
+                        .build_unconditional_branch(cond_bb)
+                        .map_err(|e| format!("failed to branch back in while: {}", e))?;
+                }
+
+                // Position at after block
+                self.builder.position_at_end(after_bb);
+
+                let unit_ty = self.context.struct_type(&[], false);
+                Ok(unit_ty.get_undef().into())
             }
         }
     }
 
-    fn emit_printf(&self, value: IntValue<'ctx>) -> Result<(), String> {
-        let printf_fn = self
-            .module
-            .get_function("printf")
-            .ok_or("printf not declared")?;
+    /// Resolve a function name by trying direct lookup first, then overload map.
+    fn resolve_function(
+        &self,
+        name: &str,
+        arg_types: &[Type],
+    ) -> Option<inkwell::values::FunctionValue<'ctx>> {
+        let n_args = arg_types.len();
+        // Try direct lookup first
+        if let Some(fn_val) = self.module.get_function(name) {
+            return Some(fn_val);
+        }
+        // Try overload map
+        if let Some(overloads) = self.overloads.get(name) {
+            // Filter by arg count
+            let candidates: Vec<&(String, Vec<Type>)> = overloads
+                .iter()
+                .filter(|(_, params)| params.len() == n_args)
+                .collect();
+            if candidates.len() == 1 {
+                return self.module.get_function(&candidates[0].0);
+            }
+            // Multiple candidates with same arg count: match by types
+            for (mangled, param_types) in candidates {
+                if param_types
+                    .iter()
+                    .zip(arg_types.iter())
+                    .all(|(p, a)| p == a)
+                {
+                    return self.module.get_function(mangled);
+                }
+            }
+        }
+        None
+    }
 
-        let fmt = self
-            .builder
-            .build_global_string_ptr("%d\n", "fmt")
-            .map_err(|e| format!("failed to build format string: {}", e))?;
+    fn compile_args_vec(
+        &mut self,
+        args: &[Expr],
+    ) -> Result<Vec<BasicMetadataValueEnum<'ctx>>, String> {
+        let mut values = Vec::with_capacity(args.len());
+        for arg in args {
+            let val = self.compile_expr(arg)?;
+            values.push(val.into());
+        }
+        Ok(values)
+    }
 
-        let fmt_ptr = fmt.as_pointer_value();
+    fn try_extract_result(
+        &self,
+        result: inkwell::values::CallSiteValue<'ctx>,
+    ) -> BasicValueEnum<'ctx> {
+        let any = result.as_any_value_enum();
+        match any {
+            inkwell::values::AnyValueEnum::IntValue(v) => v.into(),
+            inkwell::values::AnyValueEnum::FloatValue(v) => v.into(),
+            inkwell::values::AnyValueEnum::PointerValue(v) => v.into(),
+            inkwell::values::AnyValueEnum::StructValue(v) => v.into(),
+            _ => self.i32_type.const_zero().into(),
+        }
+    }
 
-        self.builder
-            .build_call(printf_fn, &[fmt_ptr.into(), value.into()], "printf_call")
-            .map_err(|e| format!("failed to build printf call: {}", e))?;
+    fn const_eval(&self, expr: &Expr) -> Result<i64, String> {
+        match expr {
+            Expr::BoolLit(val) => Ok(if *val { 1 } else { 0 }),
+            Expr::IntLit(val) => Ok(*val),
+            Expr::FloatLit(_) => {
+                Err("float literals are not supported in const initializers".to_string())
+            }
+            Expr::StrLit(_) => {
+                Err("string literals are not supported in const initializers".to_string())
+            }
+            Expr::Ident(name) => self
+                .consts
+                .get(name)
+                .copied()
+                .ok_or_else(|| format!("undefined constant '{}'", name)),
+            Expr::Binary { op, lhs, rhs } => {
+                let lhs = self.const_eval(lhs)?;
+                let rhs = self.const_eval(rhs)?;
+                match op {
+                    BinOp::Add => Ok(lhs + rhs),
+                    BinOp::Sub => Ok(lhs - rhs),
+                    BinOp::Mul => Ok(lhs * rhs),
+                    BinOp::Div => {
+                        if rhs == 0 {
+                            Err("division by zero in const expression".to_string())
+                        } else {
+                            Ok(lhs / rhs)
+                        }
+                    }
+                    BinOp::Eq => Ok(if lhs == rhs { 1 } else { 0 }),
+                    BinOp::Neq => Ok(if lhs != rhs { 1 } else { 0 }),
+                    BinOp::Lt => Ok(if lhs < rhs { 1 } else { 0 }),
+                    BinOp::Gt => Ok(if lhs > rhs { 1 } else { 0 }),
+                    BinOp::Le => Ok(if lhs <= rhs { 1 } else { 0 }),
+                    BinOp::Ge => Ok(if lhs >= rhs { 1 } else { 0 }),
+                }
+            }
+            Expr::Ref { .. } => {
+                Err("reference expressions are not supported in const initializers".to_string())
+            }
+            Expr::Deref(_) => {
+                Err("dereference expressions are not supported in const initializers".to_string())
+            }
+            Expr::Assign { .. } => {
+                Err("assignment is not supported in const initializers".to_string())
+            }
+            Expr::MethodCall { expr, method, args } => {
+                if method == "len" && args.is_empty() {
+                    if let Expr::StrLit(s) = expr.as_ref() {
+                        Ok(s.len() as i64)
+                    } else {
+                        Err("non-constant receiver for method call in const initializer"
+                            .to_string())
+                    }
+                } else {
+                    Err("non-constant method call in const initializer".to_string())
+                }
+            }
+            Expr::Cast { expr, .. } => self.const_eval(expr),
+            _ => Err("non-constant expression in const initializer".to_string()),
+        }
+    }
 
-        Ok(())
+    fn emit_cast(
+        &self,
+        val: BasicValueEnum<'ctx>,
+        to_type: &Type,
+    ) -> Result<BasicValueEnum<'ctx>, String> {
+        // Handle bool destination: truncate int to i1, compare float != 0.0
+        if *to_type == Type::Bool {
+            match val {
+                BasicValueEnum::IntValue(src_int) => {
+                    let src_ty = src_int.get_type();
+                    if src_ty.get_bit_width() == 1 {
+                        // Already i1, no-op
+                        return Ok(val);
+                    }
+                    return self
+                        .builder
+                        .build_int_truncate(src_int, self.bool_type, "cast")
+                        .map(|v| v.into())
+                        .map_err(|e| format!("int-to-bool trunc cast failed: {}", e));
+                }
+                BasicValueEnum::FloatValue(src_float) => {
+                    // Float != 0.0 → true
+                    let zero = self.f64_type.const_float(0.0);
+                    let src_f = src_float.get_type();
+                    let cmp = if src_f == self.f32_type {
+                        let zero_f32 = self.f32_type.const_float(0.0);
+                        self.builder
+                            .build_float_compare(
+                                inkwell::FloatPredicate::ONE,
+                                src_float,
+                                zero_f32,
+                                "cast",
+                            )
+                            .map_err(|e| format!("float-to-bool cast failed: {}", e))?
+                    } else {
+                        self.builder
+                            .build_float_compare(
+                                inkwell::FloatPredicate::ONE,
+                                src_float,
+                                zero,
+                                "cast",
+                            )
+                            .map_err(|e| format!("float-to-bool cast failed: {}", e))?
+                    };
+                    return Ok(cmp.into());
+                }
+                _ => {
+                    return Err("unsupported value type for cast to bool".to_string());
+                }
+            }
+        }
+
+        // Handle pointer↔integer conversions
+        if let BasicValueEnum::PointerValue(ptr_val) = val {
+            let is_int_dest = matches!(
+                to_type,
+                Type::I8
+                    | Type::I16
+                    | Type::I32
+                    | Type::I64
+                    | Type::U8
+                    | Type::U16
+                    | Type::U32
+                    | Type::U64
+                    | Type::Isize
+                    | Type::Usize
+            );
+            if is_int_dest {
+                // Always ptrtoint to ptr_int_type first (LLVM requirement)
+                let as_ptr_int = self
+                    .builder
+                    .build_ptr_to_int(ptr_val, self.ptr_int_type, "ptr_to_int")
+                    .map_err(|e| format!("ptr-to-int cast failed: {}", e))?;
+                let dst_width = match to_type {
+                    Type::I8 | Type::U8 => 8,
+                    Type::I16 | Type::U16 => 16,
+                    Type::I32 | Type::U32 => 32,
+                    Type::I64 | Type::U64 | Type::Isize | Type::Usize => 64,
+                    _ => 64,
+                };
+                let ptr_width = 64u32;
+                let result: BasicValueEnum<'ctx> = if dst_width < ptr_width {
+                    self.builder
+                        .build_int_truncate(
+                            as_ptr_int,
+                            match to_type {
+                                Type::I8 | Type::U8 => self.i8_type,
+                                Type::I16 | Type::U16 => self.i16_type,
+                                Type::I32 | Type::U32 => self.i32_type,
+                                _ => self.ptr_int_type,
+                            },
+                            "ptr_trunc",
+                        )
+                        .map(|v| v.into())
+                        .map_err(|e| format!("ptr-to-int truncation failed: {}", e))?
+                } else {
+                    as_ptr_int.into()
+                };
+                return Ok(result);
+            }
+        }
+        if matches!(to_type, Type::Ptr { .. }) {
+            if let BasicValueEnum::IntValue(src_int) = val {
+                let src_width = src_int.get_type().get_bit_width();
+                let ptr_width = self.ptr_int_type.get_bit_width();
+                let ptr_ty = self.context.ptr_type(AddressSpace::default());
+                if src_width < ptr_width {
+                    let extended = self
+                        .builder
+                        .build_int_z_extend(src_int, self.ptr_int_type, "int_to_ptr_ext")
+                        .map_err(|e| format!("failed to extend int for ptr cast: {}", e))?;
+                    return self
+                        .builder
+                        .build_int_to_ptr(extended, ptr_ty, "int_to_ptr")
+                        .map(|v| v.into())
+                        .map_err(|e| format!("int-to-ptr cast failed: {}", e));
+                } else {
+                    return self
+                        .builder
+                        .build_int_to_ptr(src_int, ptr_ty, "int_to_ptr")
+                        .map(|v| v.into())
+                        .map_err(|e| format!("int-to-ptr cast failed: {}", e));
+                }
+            }
+            // Pointer → same pointer (identity)
+            return Ok(val);
+        }
+
+        let is_dst_float = Self::is_float(to_type);
+        let dst_signed = Self::is_signed(to_type);
+        let dst_llvm = self.type_to_llvm(to_type);
+
+        match val {
+            BasicValueEnum::IntValue(src_int) => {
+                let src_ty = src_int.get_type();
+                let src_width = src_ty.get_bit_width();
+
+                // Handle bool source (i1) → wider int: always zext (unsigned)
+                if src_width == 1 && !is_dst_float {
+                    let dst_int = dst_llvm.into_int_type();
+                    return self
+                        .builder
+                        .build_int_z_extend(src_int, dst_int, "cast")
+                        .map(|v| v.into())
+                        .map_err(|e| format!("bool-to-int zext cast failed: {}", e));
+                }
+                // Handle bool source (i1) → float: zext to i32 first
+                if src_width == 1 && is_dst_float {
+                    let dst_f = match to_type {
+                        Type::F32 => self.f32_type,
+                        _ => self.f64_type,
+                    };
+                    let as_i32 = self
+                        .builder
+                        .build_int_z_extend(src_int, self.i32_type, "bool_to_i32")
+                        .map_err(|e| format!("bool-to-i32 cast failed: {}", e))?;
+                    return self
+                        .builder
+                        .build_unsigned_int_to_float(as_i32, dst_f, "cast")
+                        .map(|v| v.into())
+                        .map_err(|e| format!("bool-to-float cast failed: {}", e));
+                }
+
+                let dst_width = match to_type {
+                    Type::I8 | Type::U8 => 8,
+                    Type::I16 | Type::U16 => 16,
+                    Type::I32 | Type::U32 => 32,
+                    Type::I64 | Type::U64 | Type::Isize | Type::Usize => 64,
+                    Type::F32 | Type::F64 => 0,
+                    Type::Never => {
+                        return Err("cast to never type is not allowed".to_string());
+                    }
+                    Type::Tuple(_) | Type::Unit => {
+                        return Err("cannot cast to tuple or unit type".to_string());
+                    }
+                    Type::Str => {
+                        return Err("cannot cast to string type".to_string());
+                    }
+                    Type::Ref { .. } => return Err("cannot cast to reference type".to_string()),
+                    Type::Ptr { .. } => unreachable!(),
+                    Type::Struct(_) => return Err("cannot cast to struct type".to_string()),
+                    Type::SelfType => return Err("cannot cast to Self type".to_string()),
+                    // Bool caught by early return above, but keep for completeness
+                    Type::Bool => 1,
+                };
+
+                if is_dst_float {
+                    let dst_f = match to_type {
+                        Type::F32 => self.f32_type,
+                        _ => self.f64_type,
+                    };
+                    if src_ty == self.i32_type || dst_signed {
+                        self.builder
+                            .build_signed_int_to_float(src_int, dst_f, "cast")
+                            .map(|v| v.into())
+                            .map_err(|e| format!("int-to-float cast failed: {}", e))
+                    } else {
+                        self.builder
+                            .build_unsigned_int_to_float(src_int, dst_f, "cast")
+                            .map(|v| v.into())
+                            .map_err(|e| format!("uint-to-float cast failed: {}", e))
+                    }
+                } else if src_width < dst_width {
+                    if dst_signed {
+                        self.builder
+                            .build_int_s_extend(src_int, dst_llvm.into_int_type(), "cast")
+                            .map(|v| v.into())
+                            .map_err(|e| format!("int sext cast failed: {}", e))
+                    } else {
+                        self.builder
+                            .build_int_z_extend(src_int, dst_llvm.into_int_type(), "cast")
+                            .map(|v| v.into())
+                            .map_err(|e| format!("int zext cast failed: {}", e))
+                    }
+                } else if src_width > dst_width {
+                    self.builder
+                        .build_int_truncate(src_int, dst_llvm.into_int_type(), "cast")
+                        .map(|v| v.into())
+                        .map_err(|e| format!("int trunc cast failed: {}", e))
+                } else {
+                    self.builder
+                        .build_bit_cast(src_int, dst_llvm.into_int_type(), "cast")
+                        .map_err(|e| format!("int bitcast failed: {}", e))
+                }
+            }
+            BasicValueEnum::FloatValue(src_float) => {
+                if is_dst_float {
+                    let dst_f = match to_type {
+                        Type::F32 => self.f32_type,
+                        _ => self.f64_type,
+                    };
+                    let src_f = src_float.get_type();
+                    if src_f == dst_f {
+                        Ok(src_float.into())
+                    } else if src_f == self.f32_type {
+                        self.builder
+                            .build_float_ext(src_float, self.f64_type, "cast")
+                            .map(|v| v.into())
+                            .map_err(|e| format!("float ext cast failed: {}", e))
+                    } else {
+                        self.builder
+                            .build_float_trunc(src_float, self.f32_type, "cast")
+                            .map(|v| v.into())
+                            .map_err(|e| format!("float trunc cast failed: {}", e))
+                    }
+                } else {
+                    let dst_int = dst_llvm.into_int_type();
+                    if dst_signed {
+                        self.builder
+                            .build_float_to_signed_int(src_float, dst_int, "cast")
+                            .map(|v| v.into())
+                            .map_err(|e| format!("float-to-sint cast failed: {}", e))
+                    } else {
+                        self.builder
+                            .build_float_to_unsigned_int(src_float, dst_int, "cast")
+                            .map(|v| v.into())
+                            .map_err(|e| format!("float-to-uint cast failed: {}", e))
+                    }
+                }
+            }
+            _ => Err("unsupported value type for cast".to_string()),
+        }
     }
 }
 
@@ -270,7 +3161,7 @@ mod tests {
         let program = parser.parse_program().map_err(|e| e.msg)?;
 
         let context = Context::create();
-        let mut cg = CodeGen::new_jit(&context)?;
+        let mut cg = CodeGen::new_jit(&context, OptimizationLevel::None)?;
         cg.jit_run(&program)
     }
 
@@ -330,7 +3221,7 @@ mod tests {
         let program = parser.parse_program().expect("parse error");
 
         let context = Context::create();
-        let mut cg = CodeGen::new_native(&context);
+        let mut cg = CodeGen::new_native(&context, OptimizationLevel::None);
         assert!(cg.compile_module(&program).is_ok());
     }
 
@@ -343,7 +3234,744 @@ mod tests {
     }
 
     #[test]
-    fn test_jit_call_print() {
-        assert_eq!(jit("fn main() { print(42); }").unwrap(), 0);
+    fn test_jit_printf_extern() {
+        assert_eq!(
+            jit(
+                r#"extern "C" { fn printf(fmt: *const i8, ...) -> i32; } fn main() { printf("%d".0, 42); }"#
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_jit_mutable_var_assignment() {
+        assert_eq!(jit("fn main() { let mut x = 10; x = 20; }").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_jit_immutable_var_cannot_assign() {
+        let result = jit("fn main() { let x = 10; x = 20; }");
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().contains("cannot assign to immutable"),
+            "error should mention cannot assign to immutable"
+        );
+    }
+
+    #[test]
+    fn test_jit_assign_undefined_var() {
+        let result = jit("fn main() { x = 10; }");
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().contains("undefined variable"),
+            "error should mention undefined variable"
+        );
+    }
+
+    #[test]
+    fn test_jit_const_declaration() {
+        assert_eq!(jit("fn main() { const X = 42; }").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_jit_const_use() {
+        let result = jit("fn main() { const X = 42; let y = X; }");
+        assert!(
+            result.is_ok(),
+            "using const in expression failed: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_jit_const_in_arithmetic() {
+        let result = jit("fn main() { const BASE = 10; const SUM = BASE + 5; let x = SUM; }");
+        assert!(result.is_ok(), "const arithmetic failed: {:?}", result);
+    }
+
+    #[test]
+    fn test_jit_cannot_assign_to_const() {
+        let result = jit("fn main() { const X = 42; X = 99; }");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("cannot assign to constant"),
+            "error should mention 'cannot assign to constant': {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_jit_mutable_var_reassign_and_read() {
+        assert_eq!(jit("fn main() { let mut x = 5; x = x + 1; }").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_jit_multiple_mutable_vars() {
+        assert_eq!(
+            jit("fn main() { let mut a = 1; let mut b = 2; a = 3; b = a; }").unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_jit_assignment_inside_let_init() {
+        let result = jit("fn main() { let mut x = 0; let y = x = 5; }");
+        assert!(result.is_ok(), "assignment in let init: {:?}", result);
+    }
+
+    #[test]
+    fn test_compile_module_const() {
+        let src = "fn f() { const X = 42; }";
+        let mut lexer = Lexer::new(src);
+        let mut tokens = Vec::new();
+        loop {
+            let (token, span) = lexer.next_token().expect("lexer error");
+            tokens.push((token, span));
+            if matches!(tokens.last().unwrap().0, Token::Eof) {
+                break;
+            }
+        }
+        let mut parser = Parser::new(&tokens);
+        let program = parser.parse_program().expect("parse error");
+
+        let context = Context::create();
+        let mut cg = CodeGen::new_native(&context, OptimizationLevel::None);
+        assert!(cg.compile_module(&program).is_ok());
+    }
+
+    #[test]
+    fn test_jit_typed_let() {
+        assert_eq!(jit("fn main() { let x: i32 = 42; }").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_jit_float_literal() {
+        assert_eq!(jit("fn main() { let x: f64 = 3.14; }").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_jit_cast_int_to_i64() {
+        assert_eq!(jit("fn main() { let x: i64 = 42 as i64; }").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_jit_cast_int_to_u8() {
+        assert_eq!(jit("fn main() { let x: u8 = 300 as u8; }").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_jit_chain_cast() {
+        assert_eq!(
+            jit("fn main() { let x: u8 = 42 as i64 as u8; }").unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_jit_float_add_as_i32() {
+        assert_eq!(
+            jit("fn main() { let x: i32 = (3.14 as i32) + 1; }").unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_jit_u8_type() {
+        assert_eq!(jit("fn main() { let x: u8 = 200; }").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_jit_i16_type() {
+        assert_eq!(jit("fn main() { let x: i16 = 42; }").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_jit_u64_type() {
+        assert_eq!(jit("fn main() { let x: u64 = 42; }").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_jit_f32_type() {
+        assert_eq!(jit("fn main() { let x: f32 = 1.5; }").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_jit_float_to_int_cast() {
+        assert_eq!(jit("fn main() { let x: i32 = 3.99 as i32; }").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_jit_int_to_f64_cast() {
+        assert_eq!(jit("fn main() { let x: f64 = 42 as f64; }").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_jit_usize_type() {
+        assert_eq!(jit("fn main() { let x: usize = 42; }").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_jit_isize_type() {
+        assert_eq!(jit("fn main() { let x: isize = 42; }").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_jit_suffix_int_i32() {
+        assert_eq!(jit("fn main() { let x = 42i32; }").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_jit_suffix_int_u8() {
+        assert_eq!(jit("fn main() { let x = 255u8; }").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_jit_suffix_int_i64() {
+        assert_eq!(jit("fn main() { let x = 1000i64; }").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_jit_suffix_float_f64() {
+        assert_eq!(jit("fn main() { let x = 3.14f64; }").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_jit_suffix_float_f32() {
+        assert_eq!(jit("fn main() { let x = 1.5f32; }").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_jit_suffix_in_arithmetic() {
+        assert_eq!(jit("fn main() { let x = 10i64 + 20i32; }").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_jit_string_literal() {
+        assert_eq!(
+            jit(r#"extern "C" { fn printf(fmt: *const i8, ...) -> i32; } fn main() { printf("%s".0, "hello".0); }"#)
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_compile_module_typed() {
+        let src = "fn f() { let x: f64 = 3.14; }";
+        let mut lexer = Lexer::new(src);
+        let mut tokens = Vec::new();
+        loop {
+            let (token, span) = lexer.next_token().expect("lexer error");
+            tokens.push((token, span));
+            if matches!(tokens.last().unwrap().0, Token::Eof) {
+                break;
+            }
+        }
+        let mut parser = Parser::new(&tokens);
+        let program = parser.parse_program().expect("parse error");
+
+        let context = Context::create();
+        let mut cg = CodeGen::new_native(&context, OptimizationLevel::None);
+        assert!(cg.compile_module(&program).is_ok());
+    }
+
+    #[test]
+    fn test_jit_ref_deref_i32() {
+        assert_eq!(
+            jit("fn main() { let x = 42; let r = &x; let v = *r; }").unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_jit_mut_ref_deref_assign() {
+        assert_eq!(
+            jit("fn main() { let mut x = 10; let r = &mut x; *r = 20; }").unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_jit_ref_to_temp_expr() {
+        assert_eq!(jit("fn main() { let r = &(1+2); let v = *r; }").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_jit_deref_assign_through_mut_ref() {
+        let result = jit("fn main() { let mut x = 5; let r = &mut x; *r = *r + 1; }");
+        assert!(
+            result.is_ok(),
+            "deref assign through mut ref failed: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_jit_str_literal_type() {
+        // String literals compile successfully as &str
+        assert_eq!(
+            jit(r#"extern "C" { fn printf(fmt: *const i8, ...) -> i32; } fn main() { printf("%s".0, "hello".0); }"#)
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_jit_str_len_literal() {
+        // "hello".len() should compile and execute
+        assert!(jit("fn main() { \"hello\".len(); }").is_ok());
+    }
+
+    #[test]
+    fn test_jit_str_len_variable() {
+        assert!(jit("fn main() { let s = \"hello\"; s.len(); }").is_ok());
+    }
+
+    #[test]
+    fn test_jit_struct_create() {
+        assert_eq!(
+            jit("struct Point { x: i32, y: i32, }\nfn main() { let p = Point { x: 10, y: 20 }; }")
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_jit_struct_method_call() {
+        assert_eq!(
+            jit(
+                "struct Point { x: i32, y: i32, }\nimpl Point {\n    fn new(x: i32, y: i32) -> Point { Point { x: x, y: y }; }\n    fn area(&self) -> i32 { self.x * self.y; }\n}\nfn main() {\n    let p = Point { x: 3, y: 4 };\n    p.area();\n}\n"
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_jit_builtin_default() {
+        assert_eq!(
+            jit("fn main() { let x: i32 = 0i32; x.default(); }").unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_jit_builtin_clone() {
+        assert_eq!(
+            jit("fn main() { let x: i32 = 42; let y: i32 = x.clone(); }").unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_jit_builtin_eq() {
+        assert_eq!(
+            jit("fn main() { let a: i32 = 42; let b: i32 = 42; a.eq(&b); }").unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_jit_builtin_ne() {
+        assert_eq!(
+            jit("fn main() { let a: i32 = 42; let b: i32 = 43; a.ne(&b); }").unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_jit_builtin_cmp() {
+        assert_eq!(
+            jit("fn main() { let a: i32 = 42; let b: i32 = 43; a.cmp(&b); }").unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_jit_builtin_cmp_partial_cmp_removed() {
+        // partial_cmp was removed, but cmp still works
+    }
+
+    #[test]
+    fn test_jit_derive_default() {
+        assert_eq!(
+            jit(
+                "#[derive(Default)]\nstruct Point { x: i32, y: i32, }\nfn main() { let p = Point { x: 10, y: 20 }; p.default(); }"
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_jit_derive_clone() {
+        assert_eq!(
+            jit(
+                "#[derive(Clone)]\nstruct Point { x: i32, y: i32, }\nfn main() { let p = Point { x: 10, y: 20 }; let c = p.clone(); }"
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_jit_derive_eq() {
+        assert_eq!(
+            jit(
+                "#[derive(Eq)]\nstruct Point { x: i32, y: i32, }\nfn main() { let a = Point { x: 10, y: 20 }; let b = Point { x: 10, y: 20 }; let r = a.eq(&b); }"
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            jit(
+                "#[derive(Eq)]\nstruct Point { x: i32, y: i32, }\nfn main() { let a = Point { x: 10, y: 20 }; let b = Point { x: 99, y: 20 }; let r = a.ne(&b); }"
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_jit_derive_ord() {
+        assert_eq!(
+            jit(
+                "#[derive(Ord)]\nstruct Point { x: i32, y: i32, }\nfn main() { let a = Point { x: 10, y: 20 }; let b = Point { x: 5, y: 30 }; let r = a.cmp(&b); }"
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_jit_derive_multi_trait() {
+        assert_eq!(
+            jit(
+                "#[derive(Default, Clone, Eq)]\nstruct Point { x: i32, y: i32, }\nfn main() { let p = Point { x: 10, y: 20 }; let c = p.clone(); c.eq(&p); }"
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_jit_derive_default_zeroed() {
+        let result = jit(
+            "#[derive(Default)]\nstruct Point { x: i32, y: i32, }\nfn main() { let p = Point { x: 10, y: 20 }; p.default(); }",
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_jit_derive_non_default_field_fails() {
+        // Testing that it errors at compile time.
+        // We need to check the error message too.
+        let result = jit(
+            "struct NonDefault { x: i32, }\n#[derive(Default)]\nstruct Wrapper { f: NonDefault, }\nfn main() {}",
+        );
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().contains("does not implement Default"),
+            "error should mention field doesn't implement Default"
+        );
+    }
+
+    #[test]
+    fn test_jit_bool_decl() {
+        assert_eq!(
+            jit("fn main() { let x: bool = true; let y: bool = false; }").unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_jit_bool_eq() {
+        assert_eq!(
+            jit("fn main() { let a: bool = true; let b: bool = true; a.eq(&b); }").unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_jit_bool_ne() {
+        assert_eq!(
+            jit("fn main() { let a: bool = true; let b: bool = false; a.ne(&b); }").unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_jit_bool_cmp() {
+        assert_eq!(
+            jit("fn main() { let a: bool = true; let b: bool = false; a.cmp(&b); }").unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_jit_bool_default() {
+        assert_eq!(
+            jit("fn main() { let x: bool = true; x.default(); }").unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_jit_bool_clone() {
+        assert_eq!(
+            jit("fn main() { let x: bool = true; let y: bool = x.clone(); }").unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_jit_i32_eq_returns_bool() {
+        assert_eq!(
+            jit("fn main() { let a: i32 = 42; let b: i32 = 42; a.eq(&b); }").unwrap(),
+            0
+        );
+        assert_eq!(
+            jit("fn main() { let a: i32 = 42; let b: i32 = 43; a.ne(&b); }").unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_jit_bool_in_struct() {
+        assert_eq!(
+            jit(
+                "#[derive(Eq)]\nstruct Pair { a: bool, b: bool, }\nfn main() { let p = Pair { a: true, b: false }; let q = Pair { a: true, b: false }; p.eq(&q); }"
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_jit_bool_cast_to_i32() {
+        assert_eq!(jit("fn main() { let x: i32 = true as i32; }").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_jit_i32_cast_to_bool() {
+        assert_eq!(jit("fn main() { let x: bool = 1 as bool; }").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_jit_comparison_eq() {
+        assert_eq!(jit("fn main() { 1 == 1; }").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_jit_comparison_neq() {
+        assert_eq!(jit("fn main() { 1 != 2; }").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_jit_comparison_lt() {
+        assert_eq!(jit("fn main() { 1 < 2; }").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_jit_comparison_gt() {
+        assert_eq!(jit("fn main() { 2 > 1; }").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_jit_comparison_le() {
+        assert_eq!(jit("fn main() { 1 <= 2; }").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_jit_comparison_ge() {
+        assert_eq!(jit("fn main() { 2 >= 2; }").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_jit_if_as_stmt() {
+        assert_eq!(jit("fn main() { if 1 { 2 } else { 3 }; }").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_jit_if_else_as_stmt() {
+        // if as expression statement with ; — result discarded, main returns 0
+        assert_eq!(jit("fn main() { if 0 { 2 } else { 3 }; }").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_jit_if_else_if() {
+        // if as expression statement with ;
+        assert_eq!(
+            jit("fn main() { if 0 { 1 } else if 1 { 2 } else { 3 }; }").unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_jit_loop_infinite() {
+        // loop with return to escape
+        assert_eq!(jit("fn main() { return 42; }").unwrap(), 42);
+    }
+
+    #[test]
+    fn test_jit_while_as_stmt() {
+        assert_eq!(jit("fn main() { while 0 { 1 } }").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_jit_explicit_return() {
+        assert_eq!(jit("fn main() -> i32 { return 42; }").unwrap(), 42);
+    }
+
+    #[test]
+    fn test_jit_implicit_return() {
+        assert_eq!(jit("fn main() -> i32 { 42 }").unwrap(), 42);
+    }
+
+    #[test]
+    fn test_jit_return_in_if() {
+        assert_eq!(
+            jit("fn main() -> i32 { if 1 { return 42; } else { return 0; }; 0 }").unwrap(),
+            42
+        );
+    }
+
+    #[test]
+    fn test_jit_while_with_if_break() {
+        // while with a return inside
+        assert_eq!(
+            jit("fn main() -> i32 { while 1 { return 42; } }").unwrap(),
+            42
+        );
+    }
+
+    #[test]
+    fn test_jit_nested_if() {
+        // nested if as expression statement with ;
+        assert_eq!(
+            jit("fn main() { if 1 { if 0 { 1 } else { 2 } }; }").unwrap(),
+            0
+        );
+    }
+
+    const STRING_MALLOC: &str = r#"extern "C" {
+    fn malloc(size: usize) -> *mut u8;
+    fn realloc(ptr: *mut u8, new_size: usize) -> *mut u8;
+    fn free(ptr: *mut u8);
+    fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut u8;
+}"#;
+
+    const STRING_STRUCT: &str = r#"struct String {
+    ptr: *mut u8,
+    len: usize,
+    cap: usize,
+}"#;
+
+    const STRING_IMPL: &str = concat!(
+        "impl String {\n",
+        "    fn new() -> String {\n",
+        "        String { ptr: 0 as *mut u8, len: 0, cap: 0 }\n",
+        "    }\n",
+        "    fn with_capacity(cap: usize) -> String {\n",
+        "        let ptr = if cap == 0 { 0 as *mut u8 } else { malloc(cap) };\n",
+        "        String { ptr: ptr, len: 0, cap: cap }\n",
+        "    }\n",
+        "    fn len(&self) -> usize {\n",
+        "        self.len\n",
+        "    }\n",
+        "    fn capacity(&self) -> usize {\n",
+        "        self.cap\n",
+        "    }\n",
+        "    fn is_empty(&self) -> bool {\n",
+        "        self.len == 0\n",
+        "    }\n",
+        "    fn clear(&mut self) {\n",
+        "        self.len = 0;\n",
+        "    }\n",
+        "    fn push_str(&mut self, s: &str) {\n",
+        "        let new_len = self.len + s.1;\n",
+        "        if new_len > self.cap {\n",
+        "            let ptr = malloc(new_len);\n",
+        "            memcpy(ptr, self.ptr, self.len);\n",
+        "            if self.cap > 0 {\n",
+        "                free(self.ptr);\n",
+        "            };\n",
+        "            self.ptr = ptr;\n",
+        "            self.cap = new_len;\n",
+        "        };\n",
+        "        memcpy((self.ptr as usize + self.len) as *mut u8, s.0, s.1);\n",
+        "        self.len = new_len;\n",
+        "    }\n",
+        "    fn drop(&mut self) {\n",
+        "        if self.cap > 0 {\n",
+        "            free(self.ptr);\n",
+        "            self.ptr = 0 as *mut u8;\n",
+        "            self.len = 0;\n",
+        "            self.cap = 0;\n",
+        "        };\n",
+        "    }\n",
+        "}\n",
+    );
+
+    fn string_prog(body: &str) -> String {
+        format!(
+            r#"{} {} {} fn main() {{ {} }}"#,
+            STRING_MALLOC, STRING_STRUCT, STRING_IMPL, body
+        )
+    }
+
+    #[test]
+    fn test_jit_string_new() {
+        assert_eq!(jit(&string_prog("let s = String::new();")).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_jit_string_with_capacity() {
+        assert_eq!(
+            jit(&string_prog("let s = String::with_capacity(10);")).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_jit_string_len_capacity() {
+        assert_eq!(
+            jit(&string_prog(
+                "let s = String::new(); s.len(); s.capacity();"
+            ))
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_jit_string_push_str() {
+        assert_eq!(
+            jit(&string_prog(
+                "let mut s = String::new(); s.push_str(\"hello\");"
+            ))
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_jit_string_clear() {
+        assert_eq!(
+            jit(&string_prog(
+                "let mut s = String::with_capacity(10); s.clear();"
+            ))
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_jit_string_is_empty() {
+        assert_eq!(
+            jit(&string_prog("let s = String::new(); s.is_empty();")).unwrap(),
+            0
+        );
     }
 }

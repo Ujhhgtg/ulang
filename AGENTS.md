@@ -4,6 +4,8 @@
 
 **ulang** — a tiny compiled language targeting `.u` source files. It compiles via LLVM (through the `inkwell` crate) to either JIT execution or native executables. The language is minimal: functions, `let` bindings, integer arithmetic, and a `print()` builtin. All values are `i32`.
 
+**Design goal**: ulang's grammar & syntax should mostly be a subset of Rust, with minimal modifications. When adding new features, prefer Rust-compatible syntax over novel inventions.
+
 ## Architecture & Data Flow
 
 ```none

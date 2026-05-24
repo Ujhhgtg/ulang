@@ -1,0 +1,80 @@
+use std::io::println;
+
+// Demonstrate #[derive(...)] attributes on structs.
+// Derive traits: Default, Clone, Eq, Ord
+#[derive(Default, Clone, Eq, Ord)]
+struct Point {
+    x: i32,
+    y: i32,
+}
+
+// Demonstrate bool fields with derive
+#[derive(Default, Clone, Eq, Ord)]
+struct Flags {
+    active: bool,
+    visible: bool,
+}
+
+fn main() {
+    // Create a Point with literal syntax
+    let p = Point { x: 3, y: 4 };
+
+    // Derive(Clone) — clone the struct
+    let cloned = p.clone();
+    println(cloned.x);
+    println(cloned.y);
+
+    // Derive(Default) — create a zeroed struct
+    let zero = p.default();
+    println(zero.x);
+    println(zero.y);
+
+    // Derive(Eq) — equality comparison
+    let a = Point { x: 10, y: 20 };
+    let b = Point { x: 10, y: 20 };
+    let neq = Point { x: 99, y: 20 };
+
+    // eq returns bool (1 if equal, 0 if not); cast to i32 for printing
+    let eq_result = a.eq(&b) as i32;
+    println(eq_result);
+
+    // ne returns bool (1 if not equal, 0 if equal)
+    let ne_result = a.ne(&neq) as i32;
+    println(ne_result);
+
+    // Derive(Ord) — ordering comparison
+    // cmp returns -1, 0, or 1 (sign of difference)
+    let lower = Point { x: 1, y: 100 };
+    let higher = Point { x: 5, y: 0 };
+
+    // lower.cmp(&higher): because lower.x (1) < higher.x (5), returns -1
+    let cmp1 = lower.cmp(&higher);
+    println(cmp1);
+
+    // higher.cmp(&higher): equal (same value), returns 0
+    let cmp2 = higher.cmp(&higher);
+    println(cmp2);
+
+    // higher.cmp(&lower): because higher.x (5) > lower.x (1), returns 1
+    let cmp3 = higher.cmp(&lower);
+    println(cmp3);
+
+    // Bool fields in struct
+    let f1 = Flags { active: true, visible: false };
+    let f2 = Flags { active: true, visible: false };
+    let f3 = Flags { active: false, visible: true };
+
+    // Eq with bool fields — eq returns bool
+    let flags_eq = f1.eq(&f2) as i32;
+    println(flags_eq);
+
+    let flags_ne = f1.ne(&f3) as i32;
+    println(flags_ne);
+
+    // Default for bool struct — false, false
+    let default_f = f1.default();
+    let default_active = default_f.active as i32;
+    let default_visible = default_f.visible as i32;
+    println(default_active);
+    println(default_visible);
+}

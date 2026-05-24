@@ -1,0 +1,58 @@
+use std::io::println;
+
+// Struct, impl, trait, and builtin trait example
+
+struct Point {
+    x: i32,
+    y: i32,
+}
+
+// Inherent impl — methods on Point
+impl Point {
+    fn new(x: i32, y: i32) -> Point {
+        Point { x: x, y: y };
+    }
+
+    fn area(&self) -> i32 {
+        self.x * self.y;
+    }
+}
+
+// Define a trait
+trait Drawable {
+    fn draw(&self);
+}
+
+// Implement the trait for Point
+impl Drawable for Point {
+    fn draw(&self) {
+        let _bg: i32 = 0i32.default();
+    }
+}
+
+fn main() {
+    // Struct literal with field shorthand
+    let p = Point { x: 3, y: 4 };
+
+    // Method call — dispatches to impl Point::area
+    p.area();
+
+    // Field access
+    println(p.x * p.y);
+
+    // Builtin Ord::cmp — sign of (self - other)
+    let px = p.x;
+    let py = p.y;
+    println(px.cmp(&py));
+
+    // Builtin Clone::clone
+    let cloned = p.x.clone();
+    println(cloned);
+
+    // Builtin Default::default
+    let zero: i32 = 0i32.default();
+    println(zero);
+
+    // Trait method dispatch — calls Drawable::draw for Point
+    p.draw();
+}

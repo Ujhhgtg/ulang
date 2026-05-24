@@ -1,0 +1,9 @@
+extern "C" {
+    fn printf(fmt: *const i8, ...) -> i32;
+    fn abort() -> !;
+}
+
+fn panic(msg: *const i8) -> ! {
+    printf("panicked: %s\n".0, msg);
+    abort();
+}

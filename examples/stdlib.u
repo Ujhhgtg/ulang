@@ -1,0 +1,17 @@
+// Using standard library modules: io, process, panic
+use std::io::print;
+use std::io::println;
+use std::process::exit;
+
+fn main() {
+    // Print without newline
+    print(1);
+    print(2);
+    // Print with newline
+    println(3);
+
+    // Arithmetic expressions
+    let a = 2 + 3 * 4;    // 14 (multiplication has precedence)
+    let b = (2 + 3) * 4;  // 20 (parentheses override)
+    println(a + b);
+}

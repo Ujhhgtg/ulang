@@ -4,6 +4,8 @@
 
 **ulang** — a tiny compiled language targeting `.u` source files. It compiles via LLVM (through the `inkwell` crate) to either JIT execution or native executables. The language is minimal: functions, `let` bindings, integer arithmetic, and a `print()` builtin. All values are `i32`.
 
+**Target Platform**: ulang officially supports targeting Linux only. Support for Windows and other operating systems is only guaranteed when using `cosmocc` as the linker. The standard library is written specifically for Linux, making direct use of Linux syscalls, POSIX calls, and `libc`.
+
 **Design goal**: ulang's grammar & syntax should mostly be a subset of Rust, with minimal modifications. When adding new features, prefer Rust-compatible syntax over novel inventions.
 
 ## Architecture & Data Flow
@@ -80,7 +82,7 @@ The default output for `build` is `a.out`; override with `-o <path>`.
 
 ## Runtime/Tooling Preferences
 
-- **Required**: Rust toolchain (edition 2024), LLVM 22 (via `inkwell`), `cc` linker (system `cc` for native builds).
+- **Required**: Linux operating system (targeting Linux is required; Windows and other OS support is only guaranteed when using `cosmocc` as the linker), Rust toolchain (edition 2024), LLVM 22 (via `inkwell`), `cc` linker (system `cc` for native builds).
 - **Package manager**: Cargo.
 - **Formatter**: `cargo fmt` (default).
 - **Linter**: `cargo clippy` (default).

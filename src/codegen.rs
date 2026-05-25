@@ -77,14 +77,13 @@ impl<'ctx> CodeGen<'ctx> {
             .create_jit_execution_engine(opt)
             .map_err(|e| format!("failed to create JIT engine: {}", e))?;
         let builder = context.create_builder();
-        let i32_type = context.i32_type();
 
         Ok(Self {
             context,
             module,
             builder,
             execution_engine: Some(execution_engine),
-            i32_type,
+            i32_type: context.i32_type(),
             bool_type: context.bool_type(),
             i8_type: context.i8_type(),
             i16_type: context.i16_type(),
@@ -115,14 +114,13 @@ impl<'ctx> CodeGen<'ctx> {
     pub fn new_native(context: &'ctx Context, opt: OptimizationLevel) -> Self {
         let module = context.create_module("ulang");
         let builder = context.create_builder();
-        let i32_type = context.i32_type();
 
         Self {
             context,
             module,
             builder,
             execution_engine: None,
-            i32_type,
+            i32_type: context.i32_type(),
             bool_type: context.bool_type(),
             i8_type: context.i8_type(),
             i16_type: context.i16_type(),
@@ -463,11 +461,156 @@ impl<'ctx> CodeGen<'ctx> {
                     .push(("cmp".to_string(), fn_name));
             }
 
+            // Add, Sub, Mul, Div for numeric primitives
+            if ty != &Type::Bool {
+                for (trait_name, method_name) in [
+                    ("Add", "add"),
+                    ("Sub", "sub"),
+                    ("Mul", "mul"),
+                    ("Div", "div"),
+                ] {
+                    let fn_name = format!("__builtin_{}_{}_{}", trait_name, method_name, ty_name);
+                    let param_types = [
+                        self.context.ptr_type(AddressSpace::default()).into(),
+                        self.context.ptr_type(AddressSpace::default()).into(),
+                    ];
+                    let ret_ty: BasicTypeEnum = llvm_ty;
+                    let fn_type = ret_ty.fn_type(&param_types, false);
+                    if self.module.get_function(&fn_name).is_none() {
+                        let fn_val = self.module.add_function(&fn_name, fn_type, None);
+                        let entry = self.context.append_basic_block(fn_val, "entry");
+                        self.builder.position_at_end(entry);
+                        let params = fn_val.get_params();
+                        let self_loaded = self
+                            .builder
+                            .build_load(llvm_ty, params[0].into_pointer_value(), "self")
+                            .map_err(|e| format!("failed to load self: {}", e))?;
+                        let other_loaded = self
+                            .builder
+                            .build_load(llvm_ty, params[1].into_pointer_value(), "other")
+                            .map_err(|e| format!("failed to load other: {}", e))?;
+
+                        let res: BasicValueEnum<'ctx> = match trait_name {
+                            "Add" => {
+                                if is_float {
+                                    self.builder
+                                        .build_float_add(
+                                            self_loaded.into_float_value(),
+                                            other_loaded.into_float_value(),
+                                            "add",
+                                        )
+                                        .map_err(|e| format!("failed to build float add: {}", e))?
+                                        .into()
+                                } else {
+                                    self.builder
+                                        .build_int_add(
+                                            self_loaded.into_int_value(),
+                                            other_loaded.into_int_value(),
+                                            "add",
+                                        )
+                                        .map_err(|e| format!("failed to build int add: {}", e))?
+                                        .into()
+                                }
+                            }
+                            "Sub" => {
+                                if is_float {
+                                    self.builder
+                                        .build_float_sub(
+                                            self_loaded.into_float_value(),
+                                            other_loaded.into_float_value(),
+                                            "sub",
+                                        )
+                                        .map_err(|e| format!("failed to build float sub: {}", e))?
+                                        .into()
+                                } else {
+                                    self.builder
+                                        .build_int_sub(
+                                            self_loaded.into_int_value(),
+                                            other_loaded.into_int_value(),
+                                            "sub",
+                                        )
+                                        .map_err(|e| format!("failed to build int sub: {}", e))?
+                                        .into()
+                                }
+                            }
+                            "Mul" => {
+                                if is_float {
+                                    self.builder
+                                        .build_float_mul(
+                                            self_loaded.into_float_value(),
+                                            other_loaded.into_float_value(),
+                                            "mul",
+                                        )
+                                        .map_err(|e| format!("failed to build float mul: {}", e))?
+                                        .into()
+                                } else {
+                                    self.builder
+                                        .build_int_mul(
+                                            self_loaded.into_int_value(),
+                                            other_loaded.into_int_value(),
+                                            "mul",
+                                        )
+                                        .map_err(|e| format!("failed to build int mul: {}", e))?
+                                        .into()
+                                }
+                            }
+                            "Div" => {
+                                if is_float {
+                                    self.builder
+                                        .build_float_div(
+                                            self_loaded.into_float_value(),
+                                            other_loaded.into_float_value(),
+                                            "div",
+                                        )
+                                        .map_err(|e| format!("failed to build float div: {}", e))?
+                                        .into()
+                                } else if Self::is_signed(ty) {
+                                    self.builder
+                                        .build_int_signed_div(
+                                            self_loaded.into_int_value(),
+                                            other_loaded.into_int_value(),
+                                            "div",
+                                        )
+                                        .map_err(|e| format!("failed to build signed div: {}", e))?
+                                        .into()
+                                } else {
+                                    self.builder
+                                        .build_int_unsigned_div(
+                                            self_loaded.into_int_value(),
+                                            other_loaded.into_int_value(),
+                                            "div",
+                                        )
+                                        .map_err(|e| {
+                                            format!("failed to build unsigned div: {}", e)
+                                        })?
+                                        .into()
+                                }
+                            }
+                            _ => unreachable!(),
+                        };
+
+                        self.builder.build_return(Some(&res)).map_err(|e| {
+                            format!("failed to build {} return: {}", method_name, e)
+                        })?;
+                    }
+                    self.impl_methods
+                        .entry(ty_name.to_string())
+                        .or_default()
+                        .push((method_name.to_string(), fn_name));
+                }
+            }
+
             // Register in trait_impls
-            let traits: HashSet<String> = ["Default", "Clone", "Copy", "Eq", "Ord"]
+            let mut traits: HashSet<String> = ["Default", "Clone", "Copy", "Eq", "Ord"]
                 .iter()
                 .map(|s| s.to_string())
                 .collect();
+            if ty != &Type::Bool {
+                traits.insert("Add".to_string());
+                traits.insert("Sub".to_string());
+                traits.insert("Mul".to_string());
+                traits.insert("Div".to_string());
+            }
             self.trait_impls.insert(ty_name.to_string(), traits);
         }
         Ok(())
@@ -1590,19 +1733,18 @@ impl<'ctx> CodeGen<'ctx> {
             Expr::EnumLit {
                 enum_name, payload, ..
             } => {
-                if one_param_enums.contains(enum_name) {
-                    if let Some(payload_expr) = payload {
+                if one_param_enums.contains(enum_name)
+                    && let Some(payload_expr) = payload {
                         let payload_ty = Self::literal_type(payload_expr);
                         // Only for primitive payloads (skip type params like T)
                         if Self::is_concrete_type(&payload_ty) {
                             let key =
-                                Self::mangle_generic_instance(enum_name, &[payload_ty.clone()]);
+                                Self::mangle_generic_instance(enum_name, std::slice::from_ref(&payload_ty));
                             if seen.insert(key) {
                                 instances.push((enum_name.clone(), vec![payload_ty]));
                             }
                         }
                     }
-                }
             }
             Expr::If {
                 cond,
@@ -2375,11 +2517,10 @@ impl<'ctx> CodeGen<'ctx> {
                 } else {
                     qualified_name
                 };
-                if let Some(methods) = self.impl_methods.get(module) {
-                    if let Some((_, mangled)) = methods.iter().find(|(name, _)| name == callee) {
+                if let Some(methods) = self.impl_methods.get(module)
+                    && let Some((_, mangled)) = methods.iter().find(|(name, _)| name == callee) {
                         name = mangled.clone();
                     }
-                }
                 self.fn_return_types
                     .get(&name)
                     .cloned()
@@ -2848,12 +2989,19 @@ impl<'ctx> CodeGen<'ctx> {
                     _ => unreachable!(),
                 };
                 let fn_name = Self::trait_method_name(&lhs_type, trait_name, method_name);
-                let fn_val = self.module.get_function(&fn_name).ok_or_else(|| {
-                    format!(
-                        "internal: {}::{} not found for type {:?}",
-                        trait_name, method_name, lhs_type
-                    )
-                })?;
+                let type_name = Self::type_to_mangled_name(&lhs_type);
+                let trait_mangled_name =
+                    format!("__trait_{}_{}_{}", trait_name, method_name, type_name);
+                let fn_val = self
+                    .module
+                    .get_function(&fn_name)
+                    .or_else(|| self.module.get_function(&trait_mangled_name))
+                    .ok_or_else(|| {
+                        format!(
+                            "internal: {}::{} not found for type {:?}",
+                            trait_name, method_name, lhs_type
+                        )
+                    })?;
                 let result = self
                     .builder
                     .build_call(
@@ -2869,9 +3017,15 @@ impl<'ctx> CodeGen<'ctx> {
             _ => {
                 // Lt, Gt, Le, Ge via Ord::cmp
                 let fn_name = Self::trait_method_name(&lhs_type, "Ord", "cmp");
-                let fn_val = self.module.get_function(&fn_name).ok_or_else(|| {
-                    format!("internal: Ord::cmp not found for type {:?}", lhs_type)
-                })?;
+                let type_name = Self::type_to_mangled_name(&lhs_type);
+                let trait_mangled_name = format!("__trait_Ord_cmp_{}", type_name);
+                let fn_val = self
+                    .module
+                    .get_function(&fn_name)
+                    .or_else(|| self.module.get_function(&trait_mangled_name))
+                    .ok_or_else(|| {
+                        format!("internal: Ord::cmp not found for type {:?}", lhs_type)
+                    })?;
                 let result = self
                     .builder
                     .build_call(
@@ -2895,6 +3049,95 @@ impl<'ctx> CodeGen<'ctx> {
                 Ok(result.into())
             }
         }
+    }
+
+    /// Compile an arithmetic operator via trait method calls (Add::add, Sub::sub, Mul::mul, Div::div).
+    fn compile_trait_arithmetic(
+        &mut self,
+        op: &BinOp,
+        lhs: &Expr,
+        rhs: &Expr,
+        lhs_val: BasicValueEnum<'ctx>,
+        rhs_val: BasicValueEnum<'ctx>,
+    ) -> Result<BasicValueEnum<'ctx>, String> {
+        let lhs_type = self.expr_type(lhs);
+        let rhs_type = self.expr_type(rhs);
+
+        // Promote both to the wider type if they are integers
+        let (promoted_lhs, promoted_rhs, common_type) =
+            if let (BasicValueEnum::IntValue(lhs_i), BasicValueEnum::IntValue(rhs_i)) =
+                (lhs_val, rhs_val)
+            {
+                let lhs_w = lhs_i.get_type().get_bit_width();
+                let rhs_w = rhs_i.get_type().get_bit_width();
+                if lhs_w > rhs_w {
+                    let ext_rhs = self
+                        .builder
+                        .build_int_z_extend(rhs_i, lhs_i.get_type(), "arith_ext")
+                        .map_err(|e| format!("failed to extend arith rhs: {}", e))?;
+                    (lhs_i.into(), ext_rhs.into(), lhs_type.clone())
+                } else if rhs_w > lhs_w {
+                    let ext_lhs = self
+                        .builder
+                        .build_int_z_extend(lhs_i, rhs_i.get_type(), "arith_ext")
+                        .map_err(|e| format!("failed to extend arith lhs: {}", e))?;
+                    (ext_lhs.into(), rhs_i.into(), rhs_type.clone())
+                } else {
+                    (lhs_val, rhs_val, lhs_type.clone())
+                }
+            } else {
+                (lhs_val, rhs_val, lhs_type.clone())
+            };
+
+        // Store both values to allocas for passing as references
+        let common_llvm_ty = self.type_to_llvm(&common_type);
+        let lhs_alloca = self
+            .builder
+            .build_alloca(common_llvm_ty, "arith_lhs")
+            .map_err(|e| format!("failed to build arith lhs alloca: {}", e))?;
+        self.builder
+            .build_store(lhs_alloca, promoted_lhs)
+            .map_err(|e| format!("failed to store arith lhs: {}", e))?;
+        let rhs_alloca = self
+            .builder
+            .build_alloca(common_llvm_ty, "arith_rhs")
+            .map_err(|e| format!("failed to build arith rhs alloca: {}", e))?;
+        self.builder
+            .build_store(rhs_alloca, promoted_rhs)
+            .map_err(|e| format!("failed to store arith rhs: {}", e))?;
+
+        let (trait_name, method_name) = match op {
+            BinOp::Add => ("Add", "add"),
+            BinOp::Sub => ("Sub", "sub"),
+            BinOp::Mul => ("Mul", "mul"),
+            BinOp::Div => ("Div", "div"),
+            _ => return Err(format!("unsupported arithmetic operator {:?}", op)),
+        };
+
+        let type_name = Self::type_to_mangled_name(&common_type);
+        let builtin_name = format!("__builtin_{}_{}_{}", trait_name, method_name, type_name);
+        let trait_name_mangled = format!("__trait_{}_{}_{}", trait_name, method_name, type_name);
+
+        let fn_val = self
+            .module
+            .get_function(&builtin_name)
+            .or_else(|| self.module.get_function(&trait_name_mangled))
+            .ok_or_else(|| {
+                format!(
+                    "type '{:?}' does not implement trait '{}' (method '{}' not found)",
+                    common_type, trait_name, method_name
+                )
+            })?;
+
+        let result = self
+            .builder
+            .build_call(
+                fn_val,
+                &[lhs_alloca.into(), rhs_alloca.into()],
+                "trait_arith_call",
+            )
+            .map_err(|e| format!("failed to call {}::{}: {}", trait_name, method_name, e))?;
+        Ok(self.try_extract_result(result))
     }
 
     /// Compile the else-if chain storing results into result_alloca.
@@ -3513,14 +3756,12 @@ impl<'ctx> CodeGen<'ctx> {
                     .or_else(|| self.resolve_function(&mangled_name, &arg_types));
 
                 // If not resolved directly, try looking up in impl_methods
-                if resolved_fn_val.is_none() {
-                    if let Some(methods) = self.impl_methods.get(module) {
-                        if let Some((_, mangled)) = methods.iter().find(|(name, _)| name == callee)
+                if resolved_fn_val.is_none()
+                    && let Some(methods) = self.impl_methods.get(module)
+                        && let Some((_, mangled)) = methods.iter().find(|(name, _)| name == callee)
                         {
                             resolved_fn_val = self.module.get_function(mangled);
                         }
-                    }
-                }
 
                 let fn_val = resolved_fn_val
                     .ok_or_else(|| format!("unknown function '{}'", qualified_name))?;
@@ -3781,59 +4022,11 @@ impl<'ctx> CodeGen<'ctx> {
                 let lhs_val = self.compile_expr(lhs)?;
                 let rhs_val = self.compile_expr(rhs)?;
 
-                let lhs_int = lhs_val.into_int_value();
-                let rhs_int = rhs_val.into_int_value();
-                // Promote both operands to the wider integer width
-                let lhs_ty = lhs_int.get_type();
-                let rhs_ty = rhs_int.get_type();
-                let lhs_width = lhs_ty.get_bit_width();
-                let rhs_width = rhs_ty.get_bit_width();
-                let common_ty = if lhs_width > rhs_width {
-                    lhs_ty
-                } else {
-                    rhs_ty
-                };
-                let lhs_int = if lhs_width < common_ty.get_bit_width() {
-                    self.builder
-                        .build_int_z_extend(lhs_int, common_ty, "lhs_ext")
-                        .map_err(|e| format!("failed to extend lhs: {}", e))?
-                } else {
-                    lhs_int
-                };
-                let rhs_int = if rhs_width < common_ty.get_bit_width() {
-                    self.builder
-                        .build_int_z_extend(rhs_int, common_ty, "rhs_ext")
-                        .map_err(|e| format!("failed to extend rhs: {}", e))?
-                } else {
-                    rhs_int
-                };
-                // If one is narrower, it was zero-extended; truncate result back to original wider width if needed
-                let result_width = common_ty.get_bit_width();
-                let _ = result_width;
-
                 let result = match op {
-                    BinOp::Add => self
-                        .builder
-                        .build_int_add(lhs_int, rhs_int, "tmp")
-                        .map_err(|e| format!("failed to build add: {}", e))?
-                        .into(),
-                    BinOp::Sub => self
-                        .builder
-                        .build_int_sub(lhs_int, rhs_int, "tmp")
-                        .map_err(|e| format!("failed to build sub: {}", e))?
-                        .into(),
-                    BinOp::Mul => self
-                        .builder
-                        .build_int_mul(lhs_int, rhs_int, "tmp")
-                        .map_err(|e| format!("failed to build mul: {}", e))?
-                        .into(),
-                    BinOp::Div => self
-                        .builder
-                        .build_int_signed_div(lhs_int, rhs_int, "tmp")
-                        .map_err(|e| format!("failed to build div: {}", e))?
-                        .into(),
-                    // Comparisons use trait methods
-                    _ => return self.compile_trait_comparison(op, lhs, rhs, lhs_val, rhs_val),
+                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
+                        self.compile_trait_arithmetic(op, lhs, rhs, lhs_val, rhs_val)?
+                    }
+                    _ => self.compile_trait_comparison(op, lhs, rhs, lhs_val, rhs_val)?,
                 };
                 Ok(result)
             }
@@ -4771,13 +4964,12 @@ impl<'ctx> CodeGen<'ctx> {
 
         // === Else block ===
         self.builder.position_at_end(else_bb);
-        if let Some(el_block) = else_block {
-            if let Some(val) = self.compile_block_get_value(el_block)? {
+        if let Some(el_block) = else_block
+            && let Some(val) = self.compile_block_get_value(el_block)? {
                 self.builder
                     .build_store(result_alloca, val)
                     .map_err(|e| format!("failed to store if_let else result: {}", e))?;
             }
-        }
         if self
             .builder
             .get_insert_block()

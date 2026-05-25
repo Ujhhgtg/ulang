@@ -533,3 +533,78 @@ fn test_command_invalid_path() {
         }"#
     ));
 }
+
+#[test]
+fn test_operator_overloading_custom() {
+    assert!(run_test(
+        "operator_overloading",
+        r#"
+        struct Point {
+            x: i32,
+            y: i32,
+        }
+
+        trait Add {
+            fn add(&self, other: &Self) -> Self;
+        }
+
+        impl Add for Point {
+            fn add(&self, other: &Point) -> Point {
+                Point {
+                    x: self.x + other.x,
+                    y: self.y + other.y,
+                }
+            }
+        }
+
+        fn main() -> i32 {
+            let p1 = Point { x: 10, y: 20 };
+            let p2 = Point { x: 1, y: 2 };
+            let p3 = p1 + p2;
+            if p3.x == 11 && p3.y == 22 {
+                return 0;
+            };
+            return 1;
+        }
+        "#
+    ));
+}
+
+#[test]
+fn test_operator_overloading_ord() {
+    assert!(run_test(
+        "operator_overloading_ord",
+        r#"
+        struct Point {
+            x: i32,
+            y: i32,
+        }
+
+        trait Ord {
+            fn cmp(&self, other: &Self) -> i32;
+        }
+
+        impl Ord for Point {
+            fn cmp(&self, other: &Point) -> i32 {
+                self.x.cmp(&other.x)
+            }
+        }
+
+        fn main() -> i32 {
+            let p1 = Point { x: 10, y: 20 };
+            let p2 = Point { x: 1, y: 2 };
+            let p3 = Point { x: 10, y: 5 };
+            if p2 < p1 {
+                if p1 > p2 {
+                    if p1 >= p3 {
+                        if p3 <= p1 {
+                            return 0;
+                        }
+                    }
+                }
+            };
+            return 1;
+        }
+        "#
+    ));
+}

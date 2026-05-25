@@ -1188,14 +1188,38 @@ impl<'a> Parser<'a> {
 
     /// Parse a primary expression followed by zero or more `as Type` casts.
     /// This binds tighter than binary operators: `a * b as i32` → `a * (b as i32)`
-    fn parse_primary_as(&mut self) -> Result<Expr, ParseError> {
-        // Handle prefix `!` operator (after postfix ops, so `!x.f` = `!(x.f)`)
+    fn parse_prefix(&mut self) -> Result<Expr, ParseError> {
+        if *self.peek_token() == Token::Ampersand {
+            self.advance(); // consume &
+            let is_mut = if *self.peek_token() == Token::Mut {
+                self.advance();
+                true
+            } else {
+                false
+            };
+            let expr = self.parse_prefix()?;
+            return Ok(Expr::Ref {
+                expr: Box::new(expr),
+                is_mut,
+            });
+        }
+        if *self.peek_token() == Token::Star {
+            self.advance(); // consume *
+            let expr = self.parse_prefix()?;
+            return Ok(Expr::Deref(Box::new(expr)));
+        }
         if *self.peek_token() == Token::Bang {
             self.advance(); // consume !
-            let expr = self.parse_primary_as()?;
+            let expr = self.parse_prefix()?;
             return Ok(Expr::UnaryNot(Box::new(expr)));
         }
-        let mut expr = self.parse_postfix()?;
+        self.parse_postfix()
+    }
+
+    /// Parse a primary expression followed by zero or more `as Type` casts.
+    /// This binds tighter than binary operators: `a * b as i32` → `a * (b as i32)`
+    fn parse_primary_as(&mut self) -> Result<Expr, ParseError> {
+        let mut expr = self.parse_prefix()?;
         while *self.peek_token() == Token::As {
             self.advance();
             let to_type = self.parse_type()?;
@@ -1471,26 +1495,6 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_primary(&mut self) -> Result<Expr, ParseError> {
-        // Handle prefix &, &mut, and * operators
-        if *self.peek_token() == Token::Ampersand {
-            self.advance(); // consume &
-            let is_mut = if *self.peek_token() == Token::Mut {
-                self.advance();
-                true
-            } else {
-                false
-            };
-            let expr = self.parse_primary()?;
-            return Ok(Expr::Ref {
-                expr: Box::new(expr),
-                is_mut,
-            });
-        }
-        if *self.peek_token() == Token::Star {
-            self.advance(); // consume *
-            let expr = self.parse_primary()?;
-            return Ok(Expr::Deref(Box::new(expr)));
-        }
         let is_primitive_type = match self.peek_token() {
             Token::Bool
             | Token::I8

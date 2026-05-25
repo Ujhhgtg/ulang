@@ -110,6 +110,10 @@ fn type_to_string(ty: &crate::ast::Type) -> String {
 }
 
 fn get_hover_text_from_program(program: &Program, name: &str) -> Option<String> {
+    get_hover_text_recursive(program, name)
+}
+
+fn get_hover_text_recursive(program: &Program, name: &str) -> Option<String> {
     // 1. Search functions
     if let Some(func) = program.funcs.iter().find(|f| f.name == name) {
         let params: Vec<String> = func
@@ -121,9 +125,11 @@ fn get_hover_text_from_program(program: &Program, name: &str) -> Option<String> 
             Some(ty) => format!(" -> {}", type_to_string(ty)),
             None => "".to_string(),
         };
+        let pub_str = if func.is_pub { "pub " } else { "" };
         let is_ext = if func.is_extern { "extern \"C\" " } else { "" };
         return Some(format!(
-            "```rust\n{}fn {}({}){}\n```",
+            "```rust\n{}{}fn {}({}){}\n```",
+            pub_str,
             is_ext,
             name,
             params.join(", "),
@@ -136,15 +142,20 @@ fn get_hover_text_from_program(program: &Program, name: &str) -> Option<String> 
         let fields: Vec<String> = st
             .fields
             .iter()
-            .map(|f| format!("    {}: {}", f.name, type_to_string(&f.ty)))
+            .map(|f| {
+                let f_pub = if f.is_pub { "pub " } else { "" };
+                format!("    {}{}: {}", f_pub, f.name, type_to_string(&f.ty))
+            })
             .collect();
+        let pub_str = if st.is_pub { "pub " } else { "" };
         let type_params = if st.type_params.is_empty() {
             "".to_string()
         } else {
             format!("<{}>", st.type_params.join(", "))
         };
         return Some(format!(
-            "```rust\nstruct {}{} {{\n{}\n}}\n```",
+            "```rust\n{}struct {}{} {{\n{}\n}}\n```",
+            pub_str,
             name,
             type_params,
             fields.join(",\n")
@@ -161,13 +172,15 @@ fn get_hover_text_from_program(program: &Program, name: &str) -> Option<String> 
                 None => format!("    {}", v.name),
             })
             .collect();
+        let pub_str = if en.is_pub { "pub " } else { "" };
         let type_params = if en.type_params.is_empty() {
             "".to_string()
         } else {
             format!("<{}>", en.type_params.join(", "))
         };
         return Some(format!(
-            "```rust\nenum {}{} {{\n{}\n}}\n```",
+            "```rust\n{}enum {}{} {{\n{}\n}}\n```",
+            pub_str,
             name,
             type_params,
             variants.join(",\n")
@@ -192,13 +205,15 @@ fn get_hover_text_from_program(program: &Program, name: &str) -> Option<String> 
                 format!("    fn {}({}){};", m.name, params.join(", "), ret)
             })
             .collect();
+        let pub_str = if tr.is_pub { "pub " } else { "" };
         let type_params = if tr.type_params.is_empty() {
             "".to_string()
         } else {
             format!("<{}>", tr.type_params.join(", "))
         };
         return Some(format!(
-            "```rust\ntrait {}{} {{\n{}\n}}\n```",
+            "```rust\n{}trait {}{} {{\n{}\n}}\n```",
+            pub_str,
             name,
             type_params,
             methods.join("\n")
@@ -207,13 +222,15 @@ fn get_hover_text_from_program(program: &Program, name: &str) -> Option<String> 
 
     // 5. Search type aliases
     if let Some(ta) = program.type_aliases.iter().find(|t| t.name == name) {
+        let pub_str = if ta.is_pub { "pub " } else { "" };
         let type_params = if ta.type_params.is_empty() {
             "".to_string()
         } else {
             format!("<{}>", ta.type_params.join(", "))
         };
         return Some(format!(
-            "```rust\ntype {}{} = {};\n```",
+            "```rust\n{}type {}{} = {};\n```",
+            pub_str,
             name,
             type_params,
             type_to_string(&ta.aliased_type)
@@ -237,13 +254,34 @@ fn get_hover_text_from_program(program: &Program, name: &str) -> Option<String> 
                 Some(t) => format!("{} for ", t),
                 None => "".to_string(),
             };
+            let pub_str = if method.is_pub { "pub " } else { "" };
             return Some(format!(
-                "```rust\nimpl {} {{\n    fn {}({}){}\n}}\n```",
+                "```rust\nimpl {} {{\n    {}fn {}({}){}\n}}\n```",
                 format!("{}{}", trait_str, type_name),
+                pub_str,
                 name,
                 params.join(", "),
                 ret
             ));
+        }
+    }
+
+    // 7. Search modules
+    if let Some(m) = program.modules.iter().find(|md| md.name == name) {
+        let pub_str = if m.is_pub { "pub " } else { "" };
+        return Some(format!(
+            "```rust\n{}mod {};\n```",
+            pub_str,
+            name
+        ));
+    }
+
+    // 8. Recursively search inside submodules
+    for m in &program.modules {
+        if let Some(ref body) = m.body {
+            if let Some(res) = get_hover_text_recursive(body, name) {
+                return Some(res);
+            }
         }
     }
 
@@ -304,7 +342,7 @@ fn find_definition_span(tokens: &[(Token, Span)], name: &str, hover_offset: usiz
     let mut i = 0;
     while i < tokens.len() {
         match &tokens[i].0 {
-            Token::Fn | Token::Struct | Token::Enum | Token::Trait | Token::Type => {
+            Token::Fn | Token::Struct | Token::Enum | Token::Trait | Token::Type | Token::Mod => {
                 if i + 1 < tokens.len() {
                     if let Token::Ident(ref id) = tokens[i + 1].0 {
                         if id == name {
@@ -485,6 +523,24 @@ fn handle_hover(documents: &HashMap<Url, DocumentState>, params: HoverParams) ->
     None
 }
 
+fn find_stdlib_dir() -> std::path::PathBuf {
+    if let Ok(val) = std::env::var("ULANG_STDLIB") {
+        return std::path::PathBuf::from(val);
+    }
+    if let Ok(mut dir) = std::env::current_dir() {
+        loop {
+            let candidate = dir.join("stdlib");
+            if candidate.is_dir() {
+                return candidate;
+            }
+            if !dir.pop() {
+                break;
+            }
+        }
+    }
+    std::path::PathBuf::from("stdlib")
+}
+
 fn handle_definition(
     documents: &HashMap<Url, DocumentState>,
     params: GotoDefinitionParams,
@@ -519,6 +575,39 @@ fn handle_definition(
             let end = offset_to_position(&doc.source, def_span.hi);
             let range = Range::new(start, end);
             return Some(GotoDefinitionResponse::Scalar(Location::new(url, range)));
+        }
+
+        // Fallback: Search the standard library
+        let stdlib_dir = find_stdlib_dir();
+        if let Ok(entries) = std::fs::read_dir(&stdlib_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().is_some_and(|e| e == "u") {
+                    if let Ok(src) = std::fs::read_to_string(&path) {
+                        let mut l = Lexer::new(&src);
+                        let mut t = Vec::new();
+                        loop {
+                            match l.next_token() {
+                                Ok((tok, span)) => {
+                                    t.push((tok, span));
+                                    if let Token::Eof = t.last().unwrap().0 {
+                                        break;
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        if let Some(def_span) = find_definition_span(&t, name, 0) {
+                            if let Ok(file_url) = Url::from_file_path(&path) {
+                                let start = offset_to_position(&src, def_span.lo);
+                                let end = offset_to_position(&src, def_span.hi);
+                                let range = Range::new(start, end);
+                                return Some(GotoDefinitionResponse::Scalar(Location::new(file_url, range)));
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -674,5 +763,69 @@ mod tests {
         let diags = get_diagnostics(src);
         assert_eq!(diags.len(), 1);
         assert!(diags[0].message.contains("Parse error"));
+    }
+
+    #[test]
+    fn test_lsp_pub_and_mod_hover() {
+        let src = r#"
+            pub mod mymod {
+                pub fn myfn() {}
+            }
+        "#;
+        let mut tokens = Vec::new();
+        let mut lexer = Lexer::new(src);
+        loop {
+            let (t, s) = lexer.next_token().unwrap();
+            tokens.push((t, s));
+            if tokens.last().unwrap().0 == Token::Eof {
+                break;
+            }
+        }
+        let mut parser = Parser::new(&tokens);
+        let prog = parser.parse_program().unwrap();
+
+        // 1. Check mod hover text
+        let mod_hover = get_hover_text_from_program(&prog, "mymod");
+        assert!(mod_hover.is_some());
+        let mod_text = mod_hover.unwrap();
+        assert!(mod_text.contains("pub mod mymod;"));
+
+        // 2. Check pub fn hover text inside submodules (recursive)
+        let fn_hover = get_hover_text_from_program(&prog, "myfn");
+        assert!(fn_hover.is_some());
+        let fn_text = fn_hover.unwrap();
+        assert!(fn_text.contains("pub fn myfn()"));
+
+        // 3. Check definition span for mod in find_definition_span
+        let def_span = find_definition_span(&tokens, "mymod", 0);
+        assert!(def_span.is_some());
+    }
+
+    #[test]
+    fn test_lsp_single_extern_hover() {
+        let src = r#"
+            pub extern "C" fn fork() -> i32;
+        "#;
+        let mut tokens = Vec::new();
+        let mut lexer = Lexer::new(src);
+        loop {
+            let (t, s) = lexer.next_token().unwrap();
+            tokens.push((t, s));
+            if tokens.last().unwrap().0 == Token::Eof {
+                break;
+            }
+        }
+        let mut parser = Parser::new(&tokens);
+        let prog = parser.parse_program().unwrap();
+
+        // 1. Check single extern hover text
+        let ext_hover = get_hover_text_from_program(&prog, "fork");
+        assert!(ext_hover.is_some());
+        let ext_text = ext_hover.unwrap();
+        assert!(ext_text.contains("pub extern \"C\" fn fork() -> i32"));
+
+        // 2. Check definition span for single extern
+        let def_span = find_definition_span(&tokens, "fork", 0);
+        assert!(def_span.is_some());
     }
 }

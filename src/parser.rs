@@ -49,20 +49,37 @@ impl<'a> Parser<'a> {
 
         loop {
             let attribs = self.parse_attrs()?;
+            let is_pub = if *self.peek_token() == Token::Pub {
+                self.advance();
+                true
+            } else {
+                false
+            };
 
             match self.peek_token() {
-                Token::Eof => break,
+                Token::Eof => {
+                    if is_pub {
+                        return Err(ParseError {
+                            span: self.tokens.get(self.pos).map(|(_, s)| *s).unwrap_or_else(|| Span::empty(self.last_span_end())),
+                            msg: "expected declaration after 'pub'".to_string(),
+                        });
+                    }
+                    break;
+                }
                 Token::Use => {
-                    uses.push(self.parse_use_decl()?);
+                    let decl = self.parse_use_decl(is_pub)?;
+                    uses.push(decl);
                 }
                 Token::Mod => {
-                    modules.push(self.parse_mod_decl()?);
+                    let decl = self.parse_mod_decl(is_pub)?;
+                    modules.push(decl);
                 }
                 Token::Extern => {
-                    self.parse_extern_block(&mut funcs)?;
+                    self.parse_extern(is_pub, &mut funcs)?;
                 }
                 Token::Enum => {
-                    let decl = self.parse_enum_decl(attribs)?;
+                    let mut decl = self.parse_enum_decl(attribs)?;
+                    decl.is_pub = is_pub;
                     // Check for duplicate name
                     if self.struct_names.contains(&decl.name)
                         || self.type_aliases.contains_key(&decl.name)
@@ -79,7 +96,8 @@ impl<'a> Parser<'a> {
                     enums.push(decl);
                 }
                 Token::Struct => {
-                    let decl = self.parse_struct_decl(attribs)?;
+                    let mut decl = self.parse_struct_decl(attribs)?;
+                    decl.is_pub = is_pub;
                     // Check for duplicate name with existing type alias
                     if self.type_aliases.contains_key(&decl.name) {
                         return Err(ParseError {
@@ -96,13 +114,22 @@ impl<'a> Parser<'a> {
                     structs.push(decl);
                 }
                 Token::Impl => {
+                    if is_pub {
+                        return Err(ParseError {
+                            span: self.tokens.get(self.pos).map(|(_, s)| *s).unwrap_or_else(|| Span::empty(self.last_span_end())),
+                            msg: "visibility modifiers cannot be applied to `impl` blocks".to_string(),
+                        });
+                    }
                     impls.push(self.parse_impl_decl()?);
                 }
                 Token::Trait => {
-                    traits.push(self.parse_trait_decl()?);
+                    let mut decl = self.parse_trait_decl()?;
+                    decl.is_pub = is_pub;
+                    traits.push(decl);
                 }
                 Token::Type => {
-                    let decl = self.parse_type_alias()?;
+                    let mut decl = self.parse_type_alias()?;
+                    decl.is_pub = is_pub;
                     // Check for duplicate name with existing struct
                     if self.struct_names.contains(&decl.name)
                         || funcs.iter().any(|f| f.name == decl.name)
@@ -123,7 +150,9 @@ impl<'a> Parser<'a> {
                     type_aliases.push(decl);
                 }
                 _ => {
-                    funcs.push(self.parse_function(attribs)?);
+                    let mut decl = self.parse_function(attribs)?;
+                    decl.is_pub = is_pub;
+                    funcs.push(decl);
                 }
             }
         }
@@ -144,7 +173,7 @@ impl<'a> Parser<'a> {
         Ok(program)
     }
 
-    fn parse_mod_decl(&mut self) -> Result<ModuleDecl, ParseError> {
+    fn parse_mod_decl(&mut self, is_pub: bool) -> Result<ModuleDecl, ParseError> {
         let lo = self.current_span_lo();
         self.expect(&Token::Mod)?;
         let name = match self.peek_token() {
@@ -169,6 +198,7 @@ impl<'a> Parser<'a> {
             return Ok(ModuleDecl {
                 name,
                 body: None,
+                is_pub,
                 span: Span::new(lo, hi),
             });
         }
@@ -186,36 +216,55 @@ impl<'a> Parser<'a> {
 
         while *self.peek_token() != Token::RBrace && *self.peek_token() != Token::Eof {
             let attribs = self.parse_attrs()?;
+            let is_nested_pub = if *self.peek_token() == Token::Pub {
+                self.advance();
+                true
+            } else {
+                false
+            };
             match self.peek_token() {
                 Token::Use => {
-                    uses.push(self.parse_use_decl()?);
+                    let decl = self.parse_use_decl(is_nested_pub)?;
+                    uses.push(decl);
                 }
                 Token::Mod => {
-                    modules.push(self.parse_mod_decl()?);
+                    let decl = self.parse_mod_decl(is_nested_pub)?;
+                    modules.push(decl);
                 }
                 Token::Extern => {
-                    self.parse_extern_block(&mut funcs)?;
+                    self.parse_extern(is_nested_pub, &mut funcs)?;
                 }
                 Token::Enum => {
-                    let decl = self.parse_enum_decl(attribs)?;
+                    let mut decl = self.parse_enum_decl(attribs)?;
+                    decl.is_pub = is_nested_pub;
                     self.enum_names.insert(decl.name.clone());
                     enums.push(decl);
                 }
                 Token::Struct => {
-                    let decl = self.parse_struct_decl(attribs)?;
+                    let mut decl = self.parse_struct_decl(attribs)?;
+                    decl.is_pub = is_nested_pub;
                     self.struct_defs
                         .insert(decl.name.clone(), decl.fields.clone());
                     self.struct_names.insert(decl.name.clone());
                     structs.push(decl);
                 }
                 Token::Impl => {
+                    if is_nested_pub {
+                        return Err(ParseError {
+                            span: self.tokens.get(self.pos).map(|(_, s)| *s).unwrap_or_else(|| Span::empty(self.last_span_end())),
+                            msg: "visibility modifiers cannot be applied to `impl` blocks".to_string(),
+                        });
+                    }
                     impls.push(self.parse_impl_decl()?);
                 }
                 Token::Trait => {
-                    traits.push(self.parse_trait_decl()?);
+                    let mut decl = self.parse_trait_decl()?;
+                    decl.is_pub = is_nested_pub;
+                    traits.push(decl);
                 }
                 Token::Type => {
-                    let decl = self.parse_type_alias()?;
+                    let mut decl = self.parse_type_alias()?;
+                    decl.is_pub = is_nested_pub;
                     let params = decl.type_params.clone();
                     let aliased = decl.aliased_type.clone();
                     self.type_aliases
@@ -223,7 +272,9 @@ impl<'a> Parser<'a> {
                     type_aliases.push(decl);
                 }
                 _ => {
-                    funcs.push(self.parse_function(attribs)?);
+                    let mut decl = self.parse_function(attribs)?;
+                    decl.is_pub = is_nested_pub;
+                    funcs.push(decl);
                 }
             }
         }
@@ -247,6 +298,7 @@ impl<'a> Parser<'a> {
         Ok(ModuleDecl {
             name,
             body: Some(program),
+            is_pub,
             span: Span::new(lo, hi),
         })
     }
@@ -327,7 +379,7 @@ impl<'a> Parser<'a> {
         Ok(attrs)
     }
 
-    fn parse_use_decl(&mut self) -> Result<Use, ParseError> {
+    fn parse_use_decl(&mut self, is_pub: bool) -> Result<Use, ParseError> {
         let lo = self.current_span_lo();
         self.expect(&Token::Use)?;
         let mut path = Vec::new();
@@ -367,11 +419,13 @@ impl<'a> Parser<'a> {
         let hi = self.last_span_end();
         Ok(Use {
             path,
+            is_pub,
+            module_path: Vec::new(),
             span: Span::new(lo, hi),
         })
     }
 
-    fn parse_extern_block(&mut self, funcs: &mut Vec<Function>) -> Result<(), ParseError> {
+    fn parse_extern(&mut self, is_pub: bool, funcs: &mut Vec<Function>) -> Result<(), ParseError> {
         self.expect(&Token::Extern)?;
         // Expect "C" string literal
         match self.peek_token() {
@@ -387,11 +441,35 @@ impl<'a> Parser<'a> {
                 });
             }
         }
-        self.expect(&Token::LBrace)?;
-        while *self.peek_token() != Token::RBrace && *self.peek_token() != Token::Eof {
-            funcs.push(self.parse_extern_fn()?);
+
+        if *self.peek_token() == Token::LBrace {
+            if is_pub {
+                let default = (Token::Eof, Span::empty(0));
+                let (_, span) = self.current().unwrap_or(&default);
+                return Err(ParseError {
+                    span: *span,
+                    msg: "visibility modifiers cannot be applied to `extern` blocks directly".to_string(),
+                });
+            }
+            self.expect(&Token::LBrace)?;
+            while *self.peek_token() != Token::RBrace && *self.peek_token() != Token::Eof {
+                let is_inner_pub = if *self.peek_token() == Token::Pub {
+                    self.advance();
+                    true
+                } else {
+                    false
+                };
+                let mut func = self.parse_extern_fn()?;
+                func.is_pub = is_inner_pub;
+                funcs.push(func);
+            }
+            self.expect(&Token::RBrace)?;
+        } else {
+            // Single extern fn declaration: extern "C" fn fork() -> i32;
+            let mut func = self.parse_extern_fn()?;
+            func.is_pub = is_pub;
+            funcs.push(func);
         }
-        self.expect(&Token::RBrace)?;
         Ok(())
     }
 
@@ -412,7 +490,7 @@ impl<'a> Parser<'a> {
             }
         };
         self.expect(&Token::LParen)?;
-        let params = self.parse_fn_params()?;
+        let params = self.parse_fn_params(true)?;
         // Check for optional variadic `...`
         let _is_variadic = if *self.peek_token() == Token::Ellipsis {
             self.advance();
@@ -444,6 +522,7 @@ impl<'a> Parser<'a> {
             body,
             is_extern: true,
             is_method: false,
+            is_pub: false,
             attribs: Vec::new(),
         })
     }
@@ -502,6 +581,7 @@ impl<'a> Parser<'a> {
                 name,
                 fields: Vec::new(),
                 type_params,
+                is_pub: false,
                 attribs,
                 span: Span::new(lo, hi),
             });
@@ -511,6 +591,12 @@ impl<'a> Parser<'a> {
         let mut fields = Vec::new();
         while *self.peek_token() != Token::RBrace && *self.peek_token() != Token::Eof {
             let field_lo = self.current_span_lo();
+            let is_field_pub = if *self.peek_token() == Token::Pub {
+                self.advance();
+                true
+            } else {
+                false
+            };
             let field_name = match self.peek_token() {
                 Token::Ident(s) => {
                     let s = s.clone();
@@ -531,6 +617,7 @@ impl<'a> Parser<'a> {
             fields.push(StructField {
                 name: field_name,
                 ty,
+                is_pub: is_field_pub,
                 span: field_span,
             });
             if *self.peek_token() == Token::Comma {
@@ -543,6 +630,7 @@ impl<'a> Parser<'a> {
             name,
             fields,
             type_params,
+            is_pub: false,
             attribs,
             span: Span::new(lo, hi),
         })
@@ -637,6 +725,7 @@ impl<'a> Parser<'a> {
             name,
             variants,
             type_params,
+            is_pub: false,
             attribs,
             span: Span::new(lo, hi),
         })
@@ -696,6 +785,7 @@ impl<'a> Parser<'a> {
             name,
             type_params,
             aliased_type,
+            is_pub: false,
             span: Span::new(lo, hi),
         })
     }
@@ -756,7 +846,14 @@ impl<'a> Parser<'a> {
         self.expect(&Token::LBrace)?;
         let mut methods = Vec::new();
         while *self.peek_token() != Token::RBrace && *self.peek_token() != Token::Eof {
+            let is_method_pub = if *self.peek_token() == Token::Pub {
+                self.advance();
+                true
+            } else {
+                false
+            };
             let mut func = self.parse_function(Vec::new())?;
+            func.is_pub = is_method_pub;
             func.is_method = true;
             methods.push(func);
         }
@@ -834,7 +931,7 @@ impl<'a> Parser<'a> {
                 }
             };
             self.expect(&Token::LParen)?;
-            let params = self.parse_fn_params()?;
+            let params = self.parse_fn_params(false)?;
             self.expect(&Token::RParen)?;
             let return_type = if *self.peek_token() == Token::RArrow {
                 self.advance();
@@ -855,6 +952,7 @@ impl<'a> Parser<'a> {
             name,
             type_params,
             methods,
+            is_pub: false,
             span: Span::new(lo, hi),
         })
     }
@@ -876,7 +974,7 @@ impl<'a> Parser<'a> {
             }
         };
         self.expect(&Token::LParen)?;
-        let params = self.parse_fn_params()?;
+        let params = self.parse_fn_params(false)?;
         self.expect(&Token::RParen)?;
         // Optional return type
         let return_type = if *self.peek_token() == Token::RArrow {
@@ -893,19 +991,42 @@ impl<'a> Parser<'a> {
             body,
             is_extern: false,
             is_method: false,
+            is_pub: false,
             attribs,
         })
     }
 
     /// Parse a comma-separated list of `name : type` parameters.
     /// Stops on `)` or `...`.
-    fn parse_fn_params(&mut self) -> Result<Vec<Param>, ParseError> {
+    fn parse_fn_params(&mut self, in_extern: bool) -> Result<Vec<Param>, ParseError> {
         let mut params = Vec::new();
-        if *self.peek_token() == Token::RParen || *self.peek_token() == Token::Ellipsis {
+        if *self.peek_token() == Token::Ellipsis {
+            if !in_extern {
+                let default = (Token::Eof, Span::empty(0));
+                let (_, span) = self.current().unwrap_or(&default);
+                return Err(ParseError {
+                    span: *span,
+                    msg: "variadic parameters '...' are only allowed in extern declarations".to_string(),
+                });
+            }
+            return Ok(params);
+        }
+        if *self.peek_token() == Token::RParen {
             return Ok(params);
         }
         loop {
-            if *self.peek_token() == Token::Ellipsis || *self.peek_token() == Token::RParen {
+            if *self.peek_token() == Token::Ellipsis {
+                if !in_extern {
+                    let default = (Token::Eof, Span::empty(0));
+                    let (_, span) = self.current().unwrap_or(&default);
+                    return Err(ParseError {
+                        span: *span,
+                        msg: "variadic parameters '...' are only allowed in extern declarations".to_string(),
+                    });
+                }
+                break;
+            }
+            if *self.peek_token() == Token::RParen {
                 break;
             }
             // Handle `&self` and `&mut self` shorthand
@@ -2967,6 +3088,23 @@ mod tests {
                 e.msg
             );
         }
+    }
+
+    #[test]
+    fn test_ellipsis_restrictions() {
+        // 1. Success inside extern declarations
+        assert!(parse("extern \"C\" fn printf(fmt: *const u8, ...);").is_ok());
+        assert!(parse("extern \"C\" { fn printf(fmt: *const u8, ...); }").is_ok());
+
+        // 2. Failure in standard functions
+        let res1 = parse("fn my_printf(fmt: *const u8, ...) {}");
+        assert!(res1.is_err());
+        assert!(res1.unwrap_err().msg.contains("variadic parameters '...' are only allowed in extern declarations"));
+
+        // 3. Failure in trait methods
+        let res2 = parse("trait MyTrait { fn my_printf(fmt: *const u8, ...); }");
+        assert!(res2.is_err());
+        assert!(res2.unwrap_err().msg.contains("variadic parameters '...' are only allowed in extern declarations"));
     }
 
     #[test]

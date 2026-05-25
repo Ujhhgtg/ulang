@@ -5,12 +5,12 @@ extern "C" {
     fn abort() -> !;
 }
 
-fn panic(msg: &str) -> ! {
+pub fn panic(msg: &str) -> ! {
     printf("panicked: %.*s\n".0, msg.1 as i32, msg.0);
     abort();
 }
 
-fn panic(s: String) -> ! {
+pub fn panic(s: String) -> ! {
     printf("panicked: %.*s\n".0, s.len() as i32, s.as_ptr());
     abort();
 }

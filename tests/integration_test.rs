@@ -702,7 +702,7 @@ fn test_inline_modules() {
         "inline_mod",
         r#"
         mod logging {
-            fn get_val() -> i32 { 42 }
+            pub fn get_val() -> i32 { 42 }
         }
         fn main() -> i32 {
             if logging::get_val() == 42 {
@@ -721,7 +721,7 @@ fn test_file_modules() {
     // Write the helper file directly in the temporary directory
     let dir = test_dir("file_mod");
     let mod_path = dir.join("helper.u");
-    std::fs::write(&mod_path, "fn get_val() -> i32 { 100 }\n").expect("write helper");
+    std::fs::write(&mod_path, "pub fn get_val() -> i32 { 100 }\n").expect("write helper");
 
     assert!(run_test(
         "file_mod",
@@ -732,6 +732,131 @@ fn test_file_modules() {
                 return 0;
             };
             return 1;
+        }
+        "#
+    ));
+}
+
+#[test]
+fn test_directory_module_mod_u() {
+    let dir = test_dir("dir_mod");
+    let subdir = dir.join("helper");
+    std::fs::create_dir_all(&subdir).expect("create helper dir");
+    let mod_path = subdir.join("mod.u");
+    std::fs::write(&mod_path, "pub fn get_val() -> i32 { 200 }\n").expect("write helper/mod.u");
+
+    assert!(run_test(
+        "dir_mod",
+        r#"
+        mod helper;
+        fn main() -> i32 {
+            if helper::get_val() == 200 {
+                return 0;
+            };
+            return 1;
+        }
+        "#
+    ));
+}
+
+#[test]
+fn test_visibility_failures() {
+    // 1. Private function call failure
+    assert!(run_test_expect_error(
+        "priv_call_fail",
+        r#"
+        mod mymod {
+            fn f() {}
+        }
+        fn main() {
+            mymod::f();
+        }
+        "#
+    ));
+}
+
+#[test]
+fn test_pub_struct_literal_construction() {
+    // Successful construction and field access when fields are pub
+    assert!(run_test(
+        "pub_struct_success",
+        r#"
+        mod mymod {
+            pub struct Foo {
+                pub x: i32,
+            }
+        }
+        fn main() -> i32 {
+            let f = mymod::Foo { x: 42 };
+            if f.x == 42 {
+                return 0;
+            };
+            return 1;
+        }
+        "#
+    ));
+
+    // Failed construction when field is private
+    assert!(run_test_expect_error(
+        "priv_struct_const_fail",
+        r#"
+        mod mymod {
+            pub struct Foo {
+                x: i32,
+            }
+        }
+        fn main() {
+            let f = mymod::Foo { x: 42 };
+        }
+        "#
+    ));
+
+    // Failed member access when field is private
+    assert!(run_test_expect_error(
+        "priv_struct_access_fail",
+        r#"
+        mod mymod {
+            pub struct Foo {
+                x: i32,
+            }
+            impl Foo {
+                pub fn new() -> Foo {
+                    Foo { x: 42 }
+                }
+            }
+        }
+        fn main() {
+            let f = mymod::Foo::new();
+            let val = f.x;
+        }
+        "#
+    ));
+}
+
+#[test]
+fn test_single_extern_functions() {
+    assert!(run_test(
+        "single_extern",
+        r#"
+        extern "C" fn fork() -> i32;
+        fn main() {
+            let x = 1;
+        }
+        "#
+    ));
+}
+
+#[test]
+fn test_pub_extern_functions() {
+    assert!(run_test(
+        "pub_extern",
+        r#"
+        mod mymod {
+            pub extern "C" fn fork() -> i32;
+        }
+        use mymod::fork;
+        fn main() {
+            let x = 1;
         }
         "#
     ));

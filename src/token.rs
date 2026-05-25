@@ -81,6 +81,7 @@ mod tests {
         assert_eq!(Token::Dot, Token::Dot);
         assert_eq!(Token::Ellipsis, Token::Ellipsis);
         assert_eq!(Token::Enum, Token::Enum);
+        assert_eq!(Token::Pub, Token::Pub);
         assert_eq!(Token::Struct, Token::Struct);
         assert_eq!(Token::Impl, Token::Impl);
         assert_eq!(Token::Type, Token::Type);
@@ -175,6 +176,7 @@ pub enum Token {
     Ampersand, // &
     Dot,       // .
     // Struct / Impl / Trait / Type / Enum keywords
+    Pub,
     Struct,
     Enum,
     Impl,

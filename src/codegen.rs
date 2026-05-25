@@ -68,6 +68,9 @@ pub struct CodeGen<'ctx> {
     current_monomorphization: Option<(String, String)>,
     // Maps base_name -> mangled_name for all monomorphized instances
     monomorphized_names: HashMap<String, String>,
+    pub visibility_map: HashMap<String, bool>,
+    pub field_visibility_map: HashMap<String, HashMap<String, bool>>,
+    pub current_module_path: Vec<String>,
 }
 
 impl<'ctx> CodeGen<'ctx> {
@@ -107,6 +110,9 @@ impl<'ctx> CodeGen<'ctx> {
             monomorphized: HashSet::new(),
             current_monomorphization: None,
             monomorphized_names: HashMap::new(),
+            visibility_map: HashMap::new(),
+            field_visibility_map: HashMap::new(),
+            current_module_path: Vec::new(),
             opt_level: opt,
         })
     }
@@ -144,8 +150,150 @@ impl<'ctx> CodeGen<'ctx> {
             monomorphized: HashSet::new(),
             current_monomorphization: None,
             monomorphized_names: HashMap::new(),
+            visibility_map: HashMap::new(),
+            field_visibility_map: HashMap::new(),
+            current_module_path: Vec::new(),
             opt_level: opt,
         }
+    }
+
+    fn get_module_path_for_item_name(&self, name: &str) -> Vec<String> {
+        let mut clean_name = name.to_string();
+        if clean_name.starts_with("__trait_") {
+            if let Some(idx) = clean_name.strip_prefix("__trait_") {
+                let parts: Vec<&str> = idx.split('_').collect();
+                if parts.len() >= 2 {
+                    let mut underscore_count = 0;
+                    let mut start_idx = 0;
+                    for (i, c) in name.char_indices() {
+                        if c == '_' {
+                            underscore_count += 1;
+                            if underscore_count == 4 {
+                                start_idx = i + 1;
+                                break;
+                            }
+                        }
+                    }
+                    if start_idx > 0 {
+                        clean_name = name[start_idx..].to_string();
+                    }
+                }
+            }
+        }
+        
+        let mut segs: Vec<String> = clean_name.split("::").map(|s| s.to_string()).collect();
+        if segs.is_empty() {
+            return Vec::new();
+        }
+        
+        if let Some(last) = segs.last_mut() {
+            if let Some(idx) = last.find('/') {
+                *last = last[..idx].to_string();
+            }
+            if let Some(idx) = last.find('$') {
+                *last = last[..idx].to_string();
+            }
+        }
+        
+        for (i, seg) in segs.iter().enumerate() {
+            if let Some(c) = seg.chars().next() {
+                if c.is_uppercase() {
+                    return segs[0..i].to_vec();
+                }
+            }
+        }
+        
+        if segs.len() > 1 {
+            segs[0..segs.len() - 1].to_vec()
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn check_visibility_of_path(&self, caller_path: &[String], target_name: &str) -> Result<(), String> {
+        let target_def_path = self.get_module_path_for_item_name(target_name);
+        let is_descendant = caller_path.len() >= target_def_path.len() && &caller_path[0..target_def_path.len()] == target_def_path;
+        if is_descendant {
+            return Ok(());
+        }
+        let base_target_name = if let Some(idx) = target_name.find('$') {
+            &target_name[..idx]
+        } else {
+            target_name
+        };
+        let is_pub = self.visibility_map.get(base_target_name).copied()
+            .or_else(|| self.visibility_map.get(target_name).copied())
+            .unwrap_or(true);
+        if !is_pub {
+            return Err(format!("error: '{}' is private and cannot be accessed from module '{}'", target_name, caller_path.join("::")));
+        }
+        Ok(())
+    }
+
+    fn check_visibility_of_type(&self, caller_path: &[String], ty: &Type) -> Result<(), String> {
+        match ty {
+            Type::Struct(name) => {
+                self.check_visibility_of_path(caller_path, name)?;
+            }
+            Type::GenericInstance(name, args) => {
+                self.check_visibility_of_path(caller_path, name)?;
+                for arg in args {
+                    self.check_visibility_of_type(caller_path, arg)?;
+                }
+            }
+            Type::Tuple(elems) => {
+                for elem in elems {
+                    self.check_visibility_of_type(caller_path, elem)?;
+                }
+            }
+            Type::Ref { inner, .. } | Type::Ptr { inner, .. } => {
+                self.check_visibility_of_type(caller_path, inner)?;
+            }
+            Type::Array { inner, .. } => {
+                self.check_visibility_of_type(caller_path, inner)?;
+            }
+            Type::Alias(name, args) => {
+                self.check_visibility_of_path(caller_path, name)?;
+                for arg in args {
+                    self.check_visibility_of_type(caller_path, arg)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn check_field_visibility(&self, caller_path: &[String], struct_name: &str, field_name: &str) -> Result<(), String> {
+        let target_def_path = self.get_module_path_for_item_name(struct_name);
+        let is_descendant = caller_path.len() >= target_def_path.len() && &caller_path[0..target_def_path.len()] == target_def_path;
+        if is_descendant {
+            return Ok(());
+        }
+        let is_pub = if let Some(fields) = self.field_visibility_map.get(struct_name) {
+            fields.get(field_name).copied().unwrap_or(true)
+        } else {
+            true
+        };
+        if !is_pub {
+            return Err(format!("error: field '{}' of struct '{}' is private and cannot be accessed from module '{}'", field_name, struct_name, caller_path.join("::")));
+        }
+        Ok(())
+    }
+
+    fn check_struct_literal_construction(&self, caller_path: &[String], struct_name: &str) -> Result<(), String> {
+        let target_def_path = self.get_module_path_for_item_name(struct_name);
+        let is_descendant = caller_path.len() >= target_def_path.len() && &caller_path[0..target_def_path.len()] == target_def_path;
+        if is_descendant {
+            return Ok(());
+        }
+        if let Some(fields) = self.field_visibility_map.get(struct_name) {
+            for (_, &is_pub) in fields {
+                if !is_pub {
+                    return Err(format!("error: cannot construct struct '{}' with private fields from module '{}'", struct_name, caller_path.join("::")));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn resolve_mangled_name(&self, base_name: &str) -> String {
@@ -1869,6 +2017,7 @@ impl<'ctx> CodeGen<'ctx> {
                     StructField {
                         name: f.name.clone(),
                         ty,
+                        is_pub: f.is_pub,
                         span: f.span,
                     }
                 })
@@ -1883,6 +2032,16 @@ impl<'ctx> CodeGen<'ctx> {
             self.struct_fields
                 .insert(mangled.clone(), substituted_fields);
             self.struct_types.insert(mangled.clone(), struct_type);
+
+            // Inherit visibility for monomorphized struct
+            if let Some(base_decl) = self.generic_struct_defs.get(base_name) {
+                self.visibility_map.insert(mangled.clone(), base_decl.is_pub);
+                let mut field_map = HashMap::new();
+                for field in &base_decl.fields {
+                    field_map.insert(field.name.clone(), field.is_pub);
+                }
+                self.field_visibility_map.insert(mangled.clone(), field_map);
+            }
         }
 
         // 1b. Create concrete LLVM struct type (generic enum)
@@ -1891,6 +2050,7 @@ impl<'ctx> CodeGen<'ctx> {
             let mut substituted_fields: Vec<StructField> = vec![StructField {
                 name: "__tag".to_string(),
                 ty: Type::I8,
+                is_pub: false,
                 span: Span::empty(0),
             }];
             for variant in &decl.variants {
@@ -1900,6 +2060,7 @@ impl<'ctx> CodeGen<'ctx> {
                     substituted_fields.push(StructField {
                         name: format!("__{}", variant.name),
                         ty,
+                        is_pub: false,
                         span: Span::empty(0),
                     });
                 }
@@ -1913,6 +2074,12 @@ impl<'ctx> CodeGen<'ctx> {
             self.struct_fields
                 .insert(mangled.clone(), substituted_fields);
             self.struct_types.insert(mangled.clone(), struct_type);
+
+            // Inherit visibility for monomorphized enum
+            if let Some(base_decl) = self.generic_enum_defs.get(base_name) {
+                self.visibility_map.insert(mangled.clone(), base_decl.is_pub);
+            }
+
             // Register concrete enum in enum_defs for variant lookup
             let mut concrete_decl = decl.clone();
             concrete_decl.name = mangled.clone();
@@ -1984,6 +2151,43 @@ impl<'ctx> CodeGen<'ctx> {
     }
 
     pub fn compile_module(&mut self, program: &Program) -> Result<(), String> {
+        // Populate visibility map
+        for func in &program.funcs {
+            self.visibility_map.insert(func.name.clone(), func.is_pub);
+        }
+        for decl in &program.structs {
+            self.visibility_map.insert(decl.name.clone(), decl.is_pub);
+            let mut field_map = HashMap::new();
+            for field in &decl.fields {
+                field_map.insert(field.name.clone(), field.is_pub);
+            }
+            self.field_visibility_map.insert(decl.name.clone(), field_map);
+        }
+        for decl in &program.enums {
+            self.visibility_map.insert(decl.name.clone(), decl.is_pub);
+        }
+        for decl in &program.traits {
+            self.visibility_map.insert(decl.name.clone(), decl.is_pub);
+        }
+        for decl in &program.type_aliases {
+            self.visibility_map.insert(decl.name.clone(), decl.is_pub);
+        }
+        for decl in &program.impls {
+            let type_name = match &decl.impl_type {
+                Type::Struct(name) => name.clone(),
+                Type::GenericInstance(name, _) => name.clone(),
+                _ => continue,
+            };
+            for method in &decl.methods {
+                let mangled_name = if let Some(ref trait_name) = decl.trait_name {
+                    format!("__trait_{}_{}_{}", trait_name, method.name, type_name)
+                } else {
+                    format!("{}::{}/{}", type_name, method.name, method.params.len())
+                };
+                self.visibility_map.insert(mangled_name, method.is_pub);
+            }
+        }
+
         // Phase 0: Create opaque struct types for ALL structs/enums
         for decl in &program.structs {
             if !decl.type_params.is_empty() {
@@ -2005,6 +2209,7 @@ impl<'ctx> CodeGen<'ctx> {
             let mut fields: Vec<StructField> = vec![StructField {
                 name: "__tag".to_string(),
                 ty: Type::I8,
+                is_pub: false,
                 span: Span::empty(0),
             }];
             for variant in &decl.variants {
@@ -2012,6 +2217,7 @@ impl<'ctx> CodeGen<'ctx> {
                     fields.push(StructField {
                         name: format!("__{}", variant.name),
                         ty: payload_ty.clone(),
+                        is_pub: false,
                         span: Span::empty(0),
                     });
                 }
@@ -2115,6 +2321,7 @@ impl<'ctx> CodeGen<'ctx> {
                     name: decl.name.clone(),
                     fields: f,
                     type_params: vec![],
+                    is_pub: decl.is_pub,
                     attribs: decl.attribs.clone(),
                     span: decl.span,
                 };
@@ -2816,6 +3023,16 @@ impl<'ctx> CodeGen<'ctx> {
     }
 
     fn compile_function_body(&mut self, func: &Function) -> Result<(), String> {
+        self.current_module_path = self.get_module_path_for_item_name(&func.name);
+
+        // Validate visibility of parameter and return types
+        for param in &func.params {
+            self.check_visibility_of_type(&self.current_module_path, &param.ty)?;
+        }
+        if let Some(ref ret) = func.return_type {
+            self.check_visibility_of_type(&self.current_module_path, ret)?;
+        }
+
         let fn_val = self
             .module
             .get_function(&func.name)
@@ -2897,6 +3114,9 @@ impl<'ctx> CodeGen<'ctx> {
                 init,
                 ..
             } => {
+                if let Some(ann_ty) = type_ann {
+                    self.check_visibility_of_type(&self.current_module_path, ann_ty)?;
+                }
                 let ty = type_ann.clone().unwrap_or_else(|| self.expr_type(init));
                 let llvm_ty = self.type_to_llvm(&ty);
                 let alloca = self
@@ -3574,6 +3794,10 @@ impl<'ctx> CodeGen<'ctx> {
                         _ => return Err("cannot assign to field on non-struct type".to_string()),
                     };
 
+                    if let Some(field_name) = field {
+                        self.check_field_visibility(&self.current_module_path, &struct_name, field_name)?;
+                    }
+
                     let field_idx = if let Some(field_name) = field {
                         let fields = self
                             .struct_fields
@@ -3722,6 +3946,9 @@ impl<'ctx> CodeGen<'ctx> {
                 Ok(val)
             }
             Expr::Call { callee, args } => {
+                if callee != "__builtin_size_of" {
+                    self.check_visibility_of_path(&self.current_module_path, callee)?;
+                }
                 // Handle __builtin_size_of intrinsic
                 if callee == "__builtin_size_of" && args.len() == 1 {
                     let arg_ty = self.expr_type(&args[0]);
@@ -3810,6 +4037,7 @@ impl<'ctx> CodeGen<'ctx> {
                 args,
             } => {
                 let qualified_name = format!("{}::{}", module, callee);
+                self.check_visibility_of_path(&self.current_module_path, &qualified_name)?;
                 let mangled_name = format!("{}::{}/{}", module, callee, args.len());
                 let arg_types: Vec<Type> = args.iter().map(|a| self.expr_type(a)).collect();
                 // For generic structs, also try the monomorphized name
@@ -4189,6 +4417,9 @@ impl<'ctx> CodeGen<'ctx> {
                                     ));
                                 }
                             };
+                            if let Some(field_name) = field {
+                                self.check_field_visibility(&self.current_module_path, &struct_name, field_name)?;
+                            }
                             let fields = self
                                 .struct_fields
                                 .get(&struct_name)
@@ -4309,6 +4540,8 @@ impl<'ctx> CodeGen<'ctx> {
                     .find(|(name, _)| name == method)
                     .map(|(_, mangled)| mangled.clone())
                     .ok_or_else(|| format!("type '{}' has no method '{}'", type_name, method))?;
+
+                self.check_visibility_of_path(&self.current_module_path, &mangled)?;
 
                 let fn_val = self
                     .module
@@ -4440,6 +4673,9 @@ impl<'ctx> CodeGen<'ctx> {
                 ..
             } => {
                 let actual_name = self.resolve_mangled_name(struct_name);
+                self.check_visibility_of_path(&self.current_module_path, &actual_name)?;
+                self.check_struct_literal_construction(&self.current_module_path, &actual_name)?;
+
                 let struct_type = self
                     .struct_types
                     .get(&actual_name)
@@ -4637,6 +4873,7 @@ impl<'ctx> CodeGen<'ctx> {
                 Ok(loaded)
             }
             Expr::Cast { expr, to_type } => {
+                self.check_visibility_of_type(&self.current_module_path, to_type)?;
                 let val = self.compile_expr(expr)?;
                 self.emit_cast(val, to_type)
             }
@@ -4916,6 +5153,7 @@ impl<'ctx> CodeGen<'ctx> {
                         .cloned()
                         .unwrap_or_else(|| enum_name.clone())
                 };
+                self.check_visibility_of_path(&self.current_module_path, &actual_name)?;
                 let struct_type = self
                     .struct_types
                     .get(&actual_name)

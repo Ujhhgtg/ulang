@@ -214,6 +214,7 @@ impl<'a> Lexer<'a> {
                     "match" => Token::Match,
                     "return" => Token::Return,
                     "enum" => Token::Enum,
+                    "pub" => Token::Pub,
                     "struct" => Token::Struct,
                     "type" => Token::Type,
                     "impl" => Token::Impl,
@@ -431,13 +432,14 @@ mod tests {
 
     #[test]
     fn test_keywords() {
-        let tokens = lex_all("fn let mut const mod");
+        let tokens = lex_all("fn let mut const mod pub");
         assert_eq!(tokens[0].0, Token::Fn);
         assert_eq!(tokens[1].0, Token::Let);
         assert_eq!(tokens[2].0, Token::Mut);
         assert_eq!(tokens[3].0, Token::Const);
         assert_eq!(tokens[4].0, Token::Mod);
-        assert!(matches!(tokens[5].0, Token::Eof));
+        assert_eq!(tokens[5].0, Token::Pub);
+        assert!(matches!(tokens[6].0, Token::Eof));
     }
 
     #[test]

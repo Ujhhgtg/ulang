@@ -1,8 +1,8 @@
-trait Eq {
+pub trait Eq {
     fn eq(&self, other: &Self) -> bool;
     fn ne(&self, other: &Self) -> bool;
 }
 
-trait Ord {
+pub trait Ord {
     fn cmp(&self, other: &Self) -> i32;
 }

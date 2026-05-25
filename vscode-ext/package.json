@@ -26,6 +26,13 @@
                 "configuration": "./language-configuration.json"
             }
         ],
+        "grammars": [
+            {
+                "language": "ulang",
+                "scopeName": "source.u",
+                "path": "./syntaxes/ulang.tmLanguage.json"
+            }
+        ],
         "configuration": {
             "title": "Ulang",
             "properties": {

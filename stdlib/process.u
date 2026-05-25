@@ -1,31 +1,31 @@
 use std::vec::Vec;
 use std::option::Option;
+use std::alloc::malloc;
+use std::alloc::free;
+use std::alloc::memcpy;
 
 extern "C" {
     fn _Exit(code: i32) -> !;
     fn fork() -> i32;
     fn execvp(file: *const u8, argv: *const *mut u8) -> i32;
     fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
-    fn malloc(size: usize) -> *mut u8;
-    fn free(ptr: *mut u8);
-    fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut u8;
 }
 
-fn exit() -> ! {
+pub fn exit() -> ! {
     _Exit(0);
 }
 
-fn exit(code: i32) -> ! {
+pub fn exit(code: i32) -> ! {
     _Exit(code);
 }
 
-struct Command {
+pub struct Command {
     program: *mut u8,
     args: Vec<*mut u8>,
 }
 
 impl Command {
-    fn to_c_str(s: &str) -> *mut u8 {
+    pub fn to_c_str(s: &str) -> *mut u8 {
         let len = s.1;
         let ptr = malloc(len + 1);
         memcpy(ptr, s.0, len);
@@ -33,7 +33,7 @@ impl Command {
         ptr
     }
 
-    fn new(program: &str) -> Command {
+    pub fn new(program: &str) -> Command {
         let prog_c = Command::to_c_str(program);
         let mut args_vec: Vec<*mut u8> = Vec {
             ptr: 0 as *mut u8,
@@ -47,30 +47,30 @@ impl Command {
         }
     }
 
-    fn arg(&mut self, arg: &str) -> &mut Command {
+    pub fn arg(&mut self, arg: &str) -> &mut Command {
         self.args.push(Command::to_c_str(arg));
         self
     }
 
-    fn args(&mut self, args: [&str; 1]) -> &mut Command {
+    pub fn args(&mut self, args: [&str; 1]) -> &mut Command {
         self.arg(args[0]);
         self
     }
 
-    fn args(&mut self, args: [&str; 2]) -> &mut Command {
+    pub fn args(&mut self, args: [&str; 2]) -> &mut Command {
         self.arg(args[0]);
         self.arg(args[1]);
         self
     }
 
-    fn args(&mut self, args: [&str; 3]) -> &mut Command {
+    pub fn args(&mut self, args: [&str; 3]) -> &mut Command {
         self.arg(args[0]);
         self.arg(args[1]);
         self.arg(args[2]);
         self
     }
 
-    fn args(&mut self, args: [&str; 4]) -> &mut Command {
+    pub fn args(&mut self, args: [&str; 4]) -> &mut Command {
         self.arg(args[0]);
         self.arg(args[1]);
         self.arg(args[2]);
@@ -78,7 +78,7 @@ impl Command {
         self
     }
 
-    fn args(&mut self, args: [&str; 5]) -> &mut Command {
+    pub fn args(&mut self, args: [&str; 5]) -> &mut Command {
         self.arg(args[0]);
         self.arg(args[1]);
         self.arg(args[2]);
@@ -87,7 +87,7 @@ impl Command {
         self
     }
 
-    fn args(&mut self, args: [&str; 6]) -> &mut Command {
+    pub fn args(&mut self, args: [&str; 6]) -> &mut Command {
         self.arg(args[0]);
         self.arg(args[1]);
         self.arg(args[2]);
@@ -97,7 +97,7 @@ impl Command {
         self
     }
 
-    fn args(&mut self, args: [&str; 7]) -> &mut Command {
+    pub fn args(&mut self, args: [&str; 7]) -> &mut Command {
         self.arg(args[0]);
         self.arg(args[1]);
         self.arg(args[2]);
@@ -108,7 +108,7 @@ impl Command {
         self
     }
 
-    fn args(&mut self, args: [&str; 8]) -> &mut Command {
+    pub fn args(&mut self, args: [&str; 8]) -> &mut Command {
         self.arg(args[0]);
         self.arg(args[1]);
         self.arg(args[2]);
@@ -120,7 +120,7 @@ impl Command {
         self
     }
 
-    fn spawn(&mut self) {
+    pub fn spawn(&mut self) {
         let pid = fork();
         if pid == 0 {
             let argc = self.args.len();
@@ -141,7 +141,7 @@ impl Command {
         }
     }
 
-    fn status(&mut self) -> i32 {
+    pub fn status(&mut self) -> i32 {
         let pid = fork();
         if pid == 0 {
             let argc = self.args.len();
@@ -176,7 +176,7 @@ impl Command {
         -1
     }
 
-    fn drop(&mut self) {
+    pub fn drop(&mut self) {
         while !self.args.is_empty() {
             let opt: Option<*mut u8> = self.args.pop();
             let arg_ptr = opt.unwrap();

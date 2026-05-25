@@ -1,15 +1,15 @@
-trait Add {
+pub trait Add {
     fn add(&self, other: &Self) -> Self;
 }
 
-trait Sub {
+pub trait Sub {
     fn sub(&self, other: &Self) -> Self;
 }
 
-trait Mul {
+pub trait Mul {
     fn mul(&self, other: &Self) -> Self;
 }
 
-trait Div {
+pub trait Div {
     fn div(&self, other: &Self) -> Self;
 }

@@ -1,47 +1,44 @@
 use std::vec::Vec;
+use std::alloc::malloc;
+use std::alloc::realloc;
+use std::alloc::free;
+use std::alloc::memcpy;
 
-extern "C" {
-    fn malloc(size: usize) -> *mut u8;
-    fn realloc(ptr: *mut u8, new_size: usize) -> *mut u8;
-    fn free(ptr: *mut u8);
-    fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut u8;
-}
-
-struct String {
-    vec: Vec<u8>,
+pub struct String {
+    pub vec: Vec<u8>,
 }
 
 impl String {
-    fn new() -> String {
+    pub fn new() -> String {
         String { vec: Vec::new() }
     }
 
-    fn with_capacity(cap: usize) -> String {
+    pub fn with_capacity(cap: usize) -> String {
         String { vec: Vec::with_capacity(cap) }
     }
 
-    fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         let v = self.vec;
         v.len()
     }
 
-    fn capacity(&self) -> usize {
+    pub fn capacity(&self) -> usize {
         let v = self.vec;
         v.capacity()
     }
     
-    fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         let v = self.vec;
         v.is_empty()
     }
 
-    fn clear(&mut self) {
+    pub fn clear(&mut self) {
         let mut v = self.vec;
         v.clear();
         self.vec = v;
     }
 
-    fn push_str(&mut self, s: &str) {
+    pub fn push_str(&mut self, s: &str) {
         let mut v = self.vec;
         let new_len = v.len + s.1;
         if new_len > v.cap {
@@ -62,12 +59,12 @@ impl String {
         self.vec = v;
     }
 
-    fn as_ptr(&self) -> *const u8 {
+    pub fn as_ptr(&self) -> *const u8 {
         let v = self.vec;
         v.as_ptr()
     }
 
-    fn drop(&mut self) {
+    pub fn drop(&mut self) {
         let mut v = self.vec;
         v.drop();
         self.vec = v;

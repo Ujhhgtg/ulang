@@ -13,6 +13,7 @@ pub struct Attribute {
 pub struct ModuleDecl {
     pub name: String,
     pub body: Option<Program>,
+    pub is_pub: bool,
     pub span: Span,
 }
 
@@ -33,6 +34,8 @@ pub struct Program {
 #[derive(Debug, Clone)]
 pub struct Use {
     pub path: Vec<String>,
+    pub is_pub: bool,
+    pub module_path: Vec<String>,
     pub span: Span,
 }
 
@@ -45,6 +48,7 @@ pub struct Function {
     pub body: Block,
     pub is_extern: bool,
     pub is_method: bool,
+    pub is_pub: bool,
     pub attribs: Vec<Attribute>,
 }
 
@@ -229,6 +233,7 @@ pub struct StructDecl {
     pub name: String,
     pub fields: Vec<StructField>,
     pub type_params: Vec<String>,
+    pub is_pub: bool,
     pub attribs: Vec<Attribute>,
     pub span: Span,
 }
@@ -238,6 +243,7 @@ pub struct StructDecl {
 pub struct StructField {
     pub name: String,
     pub ty: Type,
+    pub is_pub: bool,
     pub span: Span,
 }
 
@@ -247,6 +253,7 @@ pub struct TraitDecl {
     pub name: String,
     pub type_params: Vec<String>,
     pub methods: Vec<TraitMethodDef>,
+    pub is_pub: bool,
     pub span: Span,
 }
 
@@ -264,6 +271,7 @@ pub struct TypeAliasDecl {
     pub name: String,
     pub type_params: Vec<String>,
     pub aliased_type: Type,
+    pub is_pub: bool,
     pub span: Span,
 }
 
@@ -273,6 +281,7 @@ pub struct EnumDecl {
     pub name: String,
     pub variants: Vec<EnumVariant>,
     pub type_params: Vec<String>,
+    pub is_pub: bool,
     pub attribs: Vec<Attribute>,
     pub span: Span,
 }

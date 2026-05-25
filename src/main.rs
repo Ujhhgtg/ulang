@@ -13,7 +13,7 @@ use std::fs;
 use std::path::Path;
 use std::process;
 
-use crate::ast::{EnumDecl, Function, ImplDecl, Program, StructDecl, TraitDecl, Type};
+use crate::ast::{EnumDecl, Function, ImplDecl, Program, StructDecl, TraitDecl, Type, TypeAliasDecl};
 
 type OverloadMap = HashMap<String, Vec<(String, Vec<Type>)>>;
 use crate::token::{Span, Token};
@@ -672,6 +672,8 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
     let mut all_enums: HashMap<String, EnumDecl> = HashMap::new();
     let mut all_impls: Vec<ImplDecl> = Vec::new();
     let mut all_traits: HashMap<String, TraitDecl> = HashMap::new();
+    let mut all_aliases: HashMap<String, TypeAliasDecl> = HashMap::new();
+
     // Collect user-defined functions, structs, impls first
     for func in program.funcs {
         all_funcs.insert(func.name.clone(), func);
@@ -685,10 +687,11 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
     for decl in program.impls {
         all_impls.push(decl.clone());
     }
-
-    // Collect user-defined traits (user declarations take priority)
     for decl in program.traits {
         all_traits.entry(decl.name.clone()).or_insert(decl);
+    }
+    for decl in program.type_aliases {
+        all_aliases.insert(decl.name.clone(), decl);
     }
 
     // Cache all parsed stdlib modules
@@ -716,358 +719,684 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
         }
     }
 
-    // Resolve each use declaration
-    for use_decl in &program.uses {
-        let path = &use_decl.path;
-        if path[0] == "std" {
-            if no_std {
-                eprintln!(
-                    "error: use of std::{} requires the standard library (use --no-std)",
-                    path[1..].join("::")
-                );
-                process::exit(1);
+    // Resolve each use declaration using a fixed-point loop to support transitive re-exports and nested uses
+    let mut pending = program.uses.clone();
+    let mut progress = true;
+    while !pending.is_empty() && progress {
+        progress = false;
+        let mut unresolved = Vec::new();
+
+        for use_decl in pending {
+            let path = &use_decl.path;
+            if path.is_empty() {
+                continue;
             }
 
-            // Resolve stdlib/module_name.u
-            let module_name = &path[1];
-            let stdlib_path = stdlib_dir.join(format!("{}.u", module_name));
-
-            let stdlib_src = match fs::read_to_string(&stdlib_path) {
-                Ok(s) => s,
-                Err(_) => {
+            if path[0] == "std" {
+                if no_std {
                     eprintln!(
-                        "error: cannot find std::{} module at '{}'",
-                        module_name,
-                        stdlib_path.display()
+                        "error: use of std::{} requires the standard library (use --no-std)",
+                        path[1..].join("::")
                     );
                     process::exit(1);
                 }
-            };
 
-            let stdlib_prog = lex_and_parse(&stdlib_src, &stdlib_path.to_string_lossy());
-            all_stdlib_progs
-                .entry(module_name.clone())
-                .or_insert_with(|| stdlib_prog.clone());
+                // Resolve stdlib/module_name.u
+                let module_name = &path[1];
+                let stdlib_path = stdlib_dir.join(format!("{}.u", module_name));
 
-            // Recursively resolve this module's internal use declarations
-            // (e.g., io.u uses string.u/String which uses vec.u/Vec which uses option.u/Option)
-            let mut resolving_modules = HashSet::new();
-            resolving_modules.insert(module_name.clone());
-            resolve_module_uses(
-                &stdlib_prog,
-                &all_stdlib_progs,
-                &mut all_structs,
-                &mut all_enums,
-                &mut all_impls,
-                &mut all_funcs,
-                &mut all_overloads,
-                &canonical_struct_sources,
-                &mut resolving_modules,
-            );
-
-            // Process duplicates and build overload map for this module
-            let (module_funcs, module_overloads) = process_stdlib_functions(stdlib_prog.funcs);
-
-            if path.len() == 2 {
-                // Namespace import: use std::string;
-                // Import all functions, structs, traits, impls
-                for func in &module_funcs {
-                    let qualified_name = format!("{}::{}", module_name, func.name);
-                    all_funcs.entry(qualified_name).or_insert(func.clone());
-                }
-                // Register qualified overload names
-                for (base_name, overloads_list) in &module_overloads {
-                    let qualified_base = format!("{}::{}", module_name, base_name);
-                    let qualified_list: Vec<(String, Vec<Type>)> = overloads_list
-                        .iter()
-                        .map(|(mangled, params)| {
-                            (format!("{}::{}", module_name, mangled), params.clone())
-                        })
-                        .collect();
-                    all_overloads.insert(qualified_base, qualified_list);
-                }
-                // Import all structs from the module
-                for decl in stdlib_prog.structs {
-                    all_structs.entry(decl.name.clone()).or_insert(decl);
-                }
-                // Import all enums from the module
-                for decl in stdlib_prog.enums {
-                    all_enums.entry(decl.name.clone()).or_insert(decl);
-                }
-                // Import all impls from the module
-                for decl in stdlib_prog.impls {
-                    all_impls.push(decl);
-                }
-                // Import all traits from the module
-                for decl in stdlib_prog.traits {
-                    all_traits.entry(decl.name.clone()).or_insert(decl);
-                }
-                // Import all extern "C" functions from the module
-                for func in &module_funcs {
-                    if func.is_extern && !all_funcs.contains_key(&func.name) {
-                        all_funcs.insert(func.name.clone(), func.clone());
+                let stdlib_src = match fs::read_to_string(&stdlib_path) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        eprintln!(
+                            "error: cannot find std::{} module at '{}'",
+                            module_name,
+                            stdlib_path.display()
+                        );
+                        process::exit(1);
                     }
-                }
-            } else {
-                // Direct import: use std::string::String or std::io::println
-                let target_name = &path[2];
-                let qualified_name = format!("{}::{}", module_name, target_name);
+                };
 
-                // Check if target is a struct or enum in the module
-                let is_struct = stdlib_prog.structs.iter().any(|s| s.name == *target_name);
-                let is_enum = stdlib_prog.enums.iter().any(|e| e.name == *target_name);
+                let stdlib_prog = lex_and_parse(&stdlib_src, &stdlib_path.to_string_lossy());
+                all_stdlib_progs
+                    .entry(module_name.clone())
+                    .or_insert_with(|| stdlib_prog.clone());
 
-                if is_struct {
-                    // Import the struct
-                    for decl in stdlib_prog.structs {
-                        if decl.name == *target_name {
-                            all_structs.entry(decl.name.clone()).or_insert(decl);
-                            break;
-                        }
+                // Recursively resolve this module's internal use declarations
+                let mut resolving_modules = HashSet::new();
+                resolving_modules.insert(module_name.clone());
+                resolve_module_uses(
+                    &stdlib_prog,
+                    &all_stdlib_progs,
+                    &mut all_structs,
+                    &mut all_enums,
+                    &mut all_impls,
+                    &mut all_funcs,
+                    &mut all_overloads,
+                    &canonical_struct_sources,
+                    &mut resolving_modules,
+                );
+
+                // Process duplicates and build overload map for this module
+                let (module_funcs, module_overloads) = process_stdlib_functions(stdlib_prog.funcs.clone());
+
+                let prefix = if !use_decl.module_path.is_empty() {
+                    format!("{}::", use_decl.module_path.join("::"))
+                } else {
+                    String::new()
+                };
+
+                if path.len() == 2 {
+                    // Namespace import: use std::string;
+                    let imported_module_name = if prefix.is_empty() {
+                        module_name.clone()
+                    } else {
+                        format!("{}{}", prefix, module_name)
+                    };
+
+                    // Import all functions, structs, traits, impls
+                    for func in &module_funcs {
+                        let qualified_name = format!("{}::{}", imported_module_name, func.name);
+                        let mut new_func = func.clone();
+                        new_func.name = qualified_name.clone();
+                        new_func.is_pub = use_decl.is_pub;
+                        all_funcs.insert(qualified_name, new_func);
                     }
-                    // Recursively import struct dependencies (e.g., String depends on Vec)
-                    let mut dep_stack: Vec<String> = Vec::new();
-                    if let Some(decl) = all_structs.get(target_name) {
-                        for field in &decl.fields {
-                            dep_stack.extend(collect_struct_deps(&field.ty));
-                        }
+                    // Register qualified overload names
+                    for (base_name, overloads_list) in &module_overloads {
+                        let qualified_base = format!("{}::{}", imported_module_name, base_name);
+                        let qualified_list: Vec<(String, Vec<Type>)> = overloads_list
+                            .iter()
+                            .map(|(mangled, params)| {
+                                let base_end = mangled.find('$').unwrap_or(mangled.len());
+                                let suffix = &mangled[base_end..];
+                                (format!("{}{}", qualified_base, suffix), params.clone())
+                            })
+                            .collect();
+                        all_overloads.insert(qualified_base, qualified_list);
                     }
-                    // Also scan impl blocks for the target struct for additional deps
-                    for impl_decl in &all_impls {
-                        let impl_type_name = match &impl_decl.impl_type {
-                            Type::Struct(name) => name.clone(),
-                            Type::GenericInstance(name, _) => name.clone(),
-                            _ => continue,
+                    // Import all structs from the module
+                    for decl in &stdlib_prog.structs {
+                        let new_name = if prefix.is_empty() {
+                            decl.name.clone()
+                        } else {
+                            format!("{}{}", prefix, decl.name)
                         };
-                        if impl_type_name == *target_name {
-                            for method in &impl_decl.methods {
-                                for param in &method.params {
-                                    dep_stack.extend(collect_struct_deps(&param.ty));
-                                }
-                                if let Some(ref ret) = method.return_type {
-                                    dep_stack.extend(collect_struct_deps(ret));
-                                }
-                            }
-                        }
+                        let mut new_decl = decl.clone();
+                        new_decl.name = new_name.clone();
+                        new_decl.is_pub = use_decl.is_pub;
+                        all_structs.entry(new_name).or_insert(new_decl);
                     }
-                    while let Some(dep_name) = dep_stack.pop() {
-                        if all_structs.contains_key(&dep_name) {
-                            continue;
-                        }
-                        // Look up canonical source module for this struct
-                        if let Some(mod_name) = canonical_struct_sources.get(&dep_name)
-                            && let Some(candidate_prog) = all_stdlib_progs.get(mod_name)
-                            && let Some(dep_decl) =
-                                candidate_prog.structs.iter().find(|s| s.name == dep_name)
-                        {
-                            all_structs
-                                .entry(dep_name.clone())
-                                .or_insert_with(|| dep_decl.clone());
-                            // Add its own field deps
-                            for field in &dep_decl.fields {
-                                dep_stack.extend(collect_struct_deps(&field.ty));
-                            }
-                            // Import impls for this dependency
-                            for impl_decl in &candidate_prog.impls {
-                                let impl_type_name = match &impl_decl.impl_type {
-                                    Type::Struct(name) => name.clone(),
-                                    Type::GenericInstance(name, _) => name.clone(),
-                                    _ => continue,
-                                };
-                                if impl_type_name == dep_name {
-                                    all_impls.push(impl_decl.clone());
-                                }
-                            }
-                            // Also scan the dependency's impl methods for further deps
-                            for impl_decl in &candidate_prog.impls {
-                                let impl_type_name = match &impl_decl.impl_type {
-                                    Type::Struct(name) => name.clone(),
-                                    Type::GenericInstance(name, _) => name.clone(),
-                                    _ => continue,
-                                };
-                                if impl_type_name == dep_name {
-                                    for method in &impl_decl.methods {
-                                        for param in &method.params {
-                                            dep_stack.extend(collect_struct_deps(&param.ty));
-                                        }
-                                        if let Some(ref ret) = method.return_type {
-                                            dep_stack.extend(collect_struct_deps(ret));
-                                        }
-                                    }
-                                }
-                            }
-                            // Import ALL functions from the dependency module
-                            for func in &candidate_prog.funcs {
-                                if func.is_extern && !all_funcs.contains_key(&func.name) {
-                                    all_funcs.insert(func.name.clone(), func.clone());
-                                }
-                            }
-                            break;
-                        }
-                    }
-                    // Import all impl blocks for this struct
-                    for decl in stdlib_prog.impls {
-                        let impl_type_name = match &decl.impl_type {
-                            Type::Struct(name) => name.clone(),
-                            _ => continue,
+                    // Import all enums from the module
+                    for decl in &stdlib_prog.enums {
+                        let new_name = if prefix.is_empty() {
+                            decl.name.clone()
+                        } else {
+                            format!("{}{}", prefix, decl.name)
                         };
-                        if impl_type_name == *target_name {
-                            all_impls.push(decl);
-                        }
+                        let mut new_decl = decl.clone();
+                        new_decl.name = new_name.clone();
+                        new_decl.is_pub = use_decl.is_pub;
+                        all_enums.entry(new_name).or_insert(new_decl);
                     }
-                    // Import extern "C" declarations from the same module
+                    // Import all impls from the module
+                    for decl in &stdlib_prog.impls {
+                        let mut new_decl = decl.clone();
+                        match &mut new_decl.impl_type {
+                            Type::Struct(name) => {
+                                *name = format!("{}{}", prefix, name);
+                            }
+                            Type::GenericInstance(name, _) => {
+                                *name = format!("{}{}", prefix, name);
+                            }
+                            _ => {}
+                        }
+                        all_impls.push(new_decl);
+                    }
+                    // Import all traits from the module
+                    for decl in &stdlib_prog.traits {
+                        let new_name = if prefix.is_empty() {
+                            decl.name.clone()
+                        } else {
+                            format!("{}{}", prefix, decl.name)
+                        };
+                        let mut new_decl = decl.clone();
+                        new_decl.name = new_name.clone();
+                        new_decl.is_pub = use_decl.is_pub;
+                        all_traits.entry(new_name).or_insert(new_decl);
+                    }
+                    // Import all extern "C" functions from the module
                     for func in &module_funcs {
                         if func.is_extern && !all_funcs.contains_key(&func.name) {
                             all_funcs.insert(func.name.clone(), func.clone());
-                        }
-                    }
-                } else if is_enum {
-                    // Import the enum
-                    for decl in stdlib_prog.enums {
-                        if decl.name == *target_name {
-                            all_enums.entry(decl.name.clone()).or_insert(decl);
-                            break;
-                        }
-                    }
-                    // Import all impl blocks for this enum
-                    for decl in stdlib_prog.impls {
-                        let impl_type_name = match &decl.impl_type {
-                            Type::Struct(name) => name.clone(),
-                            Type::GenericInstance(name, _) => name.clone(),
-                            _ => continue,
-                        };
-                        if impl_type_name == *target_name {
-                            all_impls.push(decl);
-                        }
-                    }
-                    // Import extern "C" declarations from the same module
-                    for func in &module_funcs {
-                        if func.is_extern && !all_funcs.contains_key(&func.name) {
-                            all_funcs.insert(func.name.clone(), func.clone());
-                        }
-                    }
-                } else if stdlib_prog.traits.iter().any(|t| t.name == *target_name) {
-                    // Import the trait
-                    for decl in stdlib_prog.traits {
-                        if decl.name == *target_name {
-                            all_traits.entry(decl.name.clone()).or_insert(decl);
-                            break;
-                        }
-                    }
-                } else if let Some(overload_map) = module_overloads.get(target_name) {
-                    // Overloaded function — import all variants under mangled names
-                    // and register the overload map entry
-                    for func in &module_funcs {
-                        let base_end = func.name.find('$').unwrap_or(func.name.len());
-                        if func.name[..base_end] == *target_name {
-                            all_funcs
-                                .entry(func.name.clone())
-                                .or_insert_with(|| func.clone());
-                            let qualified_mangled = format!("{}::{}", module_name, func.name);
-                            all_funcs
-                                .entry(qualified_mangled)
-                                .or_insert_with(|| func.clone());
-                        }
-                        if func.is_extern {
-                            let en = func.name.clone();
-                            all_funcs.entry(en).or_insert_with(|| func.clone());
-                        }
-                    }
-                    all_overloads.insert(target_name.clone(), overload_map.clone());
-
-                    // Import struct types referenced by the overloaded function parameters.
-                    // Resolve them from any stdlib module (they may be defined in another module).
-                    let mut needed_structs: HashSet<String> = HashSet::new();
-                    let mut dep_modules: HashSet<String> = HashSet::new();
-                    for func in &module_funcs {
-                        let base_end = func.name.find('$').unwrap_or(func.name.len());
-                        if func.name[..base_end] == *target_name {
-                            for param in &func.params {
-                                needed_structs.extend(collect_struct_deps(&param.ty));
-                            }
-                            if let Some(ret) = &func.return_type {
-                                needed_structs.extend(collect_struct_deps(ret));
-                            }
-                        }
-                    }
-                    for struct_name in &needed_structs {
-                        if all_structs.contains_key(struct_name) {
-                            continue;
-                        }
-                        // Look up canonical source module for this struct
-                        if let Some(mod_name) = canonical_struct_sources.get(struct_name)
-                            && let Some(prog) = all_stdlib_progs.get(mod_name)
-                            && let Some(decl) = prog.structs.iter().find(|s| &s.name == struct_name)
-                        {
-                            all_structs
-                                .entry(struct_name.clone())
-                                .or_insert_with(|| decl.clone());
-                            dep_modules.insert(mod_name.clone());
-                        }
-                    }
-                    // Import extern "C" functions and impl blocks from dependency modules
-                    for mod_name in &dep_modules {
-                        if let Some(prog) = all_stdlib_progs.get(mod_name) {
-                            // Extern functions
-                            let (dep_funcs, _) = process_stdlib_functions(prog.funcs.clone());
-                            for func in &dep_funcs {
-                                if func.is_extern && !all_funcs.contains_key(&func.name) {
-                                    all_funcs.insert(func.name.clone(), func.clone());
-                                }
-                            }
-                            // Impl blocks
-                            for decl in &prog.impls {
-                                all_impls.push(decl.clone());
-                            }
                         }
                     }
                 } else {
-                    // Single function import
-                    let found = module_funcs.iter().find(|f| f.name == *target_name);
-                    match found {
-                        Some(func) => {
-                            if !all_funcs.contains_key(target_name) {
-                                all_funcs.insert(
-                                    target_name.clone(),
-                                    Function {
-                                        name: target_name.clone(),
-                                        ..func.clone()
-                                    },
-                                );
-                                all_funcs.insert(qualified_name, func.clone());
+                    // Direct import: use std::string::String or std::io::println
+                    let target_name = &path[2];
+
+                    // Check if target is a struct or enum in the module
+                    let is_struct = stdlib_prog.structs.iter().any(|s| s.name == *target_name);
+                    let is_enum = stdlib_prog.enums.iter().any(|e| e.name == *target_name);
+
+                    if is_struct {
+                        // Import the struct
+                        for decl in &stdlib_prog.structs {
+                            if decl.name == *target_name {
+                                let new_name = if prefix.is_empty() {
+                                    decl.name.clone()
+                                } else {
+                                    format!("{}{}", prefix, decl.name)
+                                };
+                                let mut new_decl = decl.clone();
+                                new_decl.name = new_name.clone();
+                                new_decl.is_pub = use_decl.is_pub;
+                                all_structs.entry(new_name).or_insert(new_decl);
+                                break;
                             }
-                            for other in &module_funcs {
-                                if other.name != *target_name
-                                    && other.is_extern
-                                    && !all_funcs.contains_key(&other.name)
-                                {
-                                    all_funcs.insert(other.name.clone(), other.clone());
+                        }
+                        // Recursively import struct dependencies (e.g., String depends on Vec)
+                        let mut dep_stack: Vec<String> = Vec::new();
+                        if let Some(decl) = stdlib_prog.structs.iter().find(|s| s.name == *target_name) {
+                            for field in &decl.fields {
+                                dep_stack.extend(collect_struct_deps(&field.ty));
+                            }
+                        }
+                        // Also scan impl blocks for the target struct for additional deps
+                        for impl_decl in &stdlib_prog.impls {
+                            let impl_type_name = match &impl_decl.impl_type {
+                                Type::Struct(name) => name.clone(),
+                                Type::GenericInstance(name, _) => name.clone(),
+                                _ => continue,
+                            };
+                            if impl_type_name == *target_name {
+                                for method in &impl_decl.methods {
+                                    for param in &method.params {
+                                        dep_stack.extend(collect_struct_deps(&param.ty));
+                                    }
+                                    if let Some(ref ret) = method.return_type {
+                                        dep_stack.extend(collect_struct_deps(ret));
+                                    }
                                 }
                             }
                         }
-                        None => {
-                            eprintln!(
-                                "error: '{}' not found in std::{}{}",
-                                target_name,
-                                module_name,
-                                if target_name.chars().next().unwrap_or(' ').is_uppercase() {
-                                    format!(
-                                        " (struct '{}' has impl methods, try 'use std::{}::{}{}')",
-                                        target_name,
-                                        module_name,
-                                        target_name,
-                                        " or 'use std::{}' for all items",
-                                    )
-                                } else {
-                                    String::new()
+                        while let Some(dep_name) = dep_stack.pop() {
+                            if all_structs.contains_key(&dep_name) {
+                                continue;
+                            }
+                            if let Some(mod_name) = canonical_struct_sources.get(&dep_name)
+                                && let Some(candidate_prog) = all_stdlib_progs.get(mod_name)
+                                && let Some(dep_decl) =
+                                    candidate_prog.structs.iter().find(|s| s.name == dep_name)
+                            {
+                                all_structs
+                                    .entry(dep_name.clone())
+                                    .or_insert_with(|| dep_decl.clone());
+                                for field in &dep_decl.fields {
+                                    dep_stack.extend(collect_struct_deps(&field.ty));
                                 }
-                            );
-                            process::exit(1);
+                                for impl_decl in &candidate_prog.impls {
+                                    let impl_type_name = match &impl_decl.impl_type {
+                                        Type::Struct(name) => name.clone(),
+                                        Type::GenericInstance(name, _) => name.clone(),
+                                        _ => continue,
+                                    };
+                                    if impl_type_name == dep_name {
+                                        all_impls.push(impl_decl.clone());
+                                    }
+                                }
+                                for impl_decl in &candidate_prog.impls {
+                                    let impl_type_name = match &impl_decl.impl_type {
+                                        Type::Struct(name) => name.clone(),
+                                        Type::GenericInstance(name, _) => name.clone(),
+                                        _ => continue,
+                                    };
+                                    if impl_type_name == dep_name {
+                                        for method in &impl_decl.methods {
+                                            for param in &method.params {
+                                                dep_stack.extend(collect_struct_deps(&param.ty));
+                                            }
+                                            if let Some(ref ret) = method.return_type {
+                                                dep_stack.extend(collect_struct_deps(ret));
+                                            }
+                                        }
+                                    }
+                                }
+                                for func in &candidate_prog.funcs {
+                                    if func.is_extern && !all_funcs.contains_key(&func.name) {
+                                        all_funcs.insert(func.name.clone(), func.clone());
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                        // Import all impl blocks for this struct
+                        for decl in &stdlib_prog.impls {
+                            let impl_type_name = match &decl.impl_type {
+                                Type::Struct(name) => name.clone(),
+                                _ => continue,
+                            };
+                            if impl_type_name == *target_name {
+                                let mut new_decl = decl.clone();
+                                let new_name = if prefix.is_empty() {
+                                    impl_type_name.clone()
+                                } else {
+                                    format!("{}{}", prefix, impl_type_name)
+                                };
+                                new_decl.impl_type = Type::Struct(new_name);
+                                all_impls.push(new_decl);
+                            }
+                        }
+                        // Import extern "C" declarations from the same module
+                        for func in &module_funcs {
+                            if func.is_extern && !all_funcs.contains_key(&func.name) {
+                                all_funcs.insert(func.name.clone(), func.clone());
+                            }
+                        }
+                    } else if is_enum {
+                        // Import the enum
+                        for decl in &stdlib_prog.enums {
+                            if decl.name == *target_name {
+                                let new_name = if prefix.is_empty() {
+                                    decl.name.clone()
+                                } else {
+                                    format!("{}{}", prefix, decl.name)
+                                };
+                                let mut new_decl = decl.clone();
+                                new_decl.name = new_name.clone();
+                                new_decl.is_pub = use_decl.is_pub;
+                                all_enums.entry(new_name).or_insert(new_decl);
+                                break;
+                            }
+                        }
+                        // Import all impl blocks for this enum
+                        for decl in &stdlib_prog.impls {
+                            let impl_type_name = match &decl.impl_type {
+                                Type::Struct(name) => name.clone(),
+                                Type::GenericInstance(name, _) => name.clone(),
+                                _ => continue,
+                            };
+                            if impl_type_name == *target_name {
+                                let mut new_decl = decl.clone();
+                                let new_name = if prefix.is_empty() {
+                                    impl_type_name.clone()
+                                } else {
+                                    format!("{}{}", prefix, impl_type_name)
+                                };
+                                match &mut new_decl.impl_type {
+                                    Type::Struct(name) => *name = new_name,
+                                    Type::GenericInstance(name, _) => *name = new_name,
+                                    _ => {}
+                                }
+                                all_impls.push(new_decl);
+                            }
+                        }
+                        // Import extern "C" declarations from the same module
+                        for func in &module_funcs {
+                            if func.is_extern && !all_funcs.contains_key(&func.name) {
+                                all_funcs.insert(func.name.clone(), func.clone());
+                            }
+                        }
+                    } else if stdlib_prog.traits.iter().any(|t| t.name == *target_name) {
+                        // Import the trait
+                        for decl in &stdlib_prog.traits {
+                            if decl.name == *target_name {
+                                let new_name = if prefix.is_empty() {
+                                    decl.name.clone()
+                                } else {
+                                    format!("{}{}", prefix, decl.name)
+                                };
+                                let mut new_decl = decl.clone();
+                                new_decl.name = new_name.clone();
+                                new_decl.is_pub = use_decl.is_pub;
+                                all_traits.entry(new_name).or_insert(new_decl);
+                                break;
+                            }
+                        }
+                    } else if let Some(overload_map) = module_overloads.get(target_name) {
+                        let new_name = if prefix.is_empty() {
+                            target_name.clone()
+                        } else {
+                            format!("{}{}", prefix, target_name)
+                        };
+                        for func in &module_funcs {
+                            let base_end = func.name.find('$').unwrap_or(func.name.len());
+                            if func.name[..base_end] == *target_name {
+                                let suffix = &func.name[base_end..];
+                                let mangled_name = format!("{}{}", new_name, suffix);
+                                let mut new_func = func.clone();
+                                new_func.name = mangled_name.clone();
+                                new_func.is_pub = use_decl.is_pub;
+                                all_funcs.insert(mangled_name, new_func);
+                                
+                                let qualified_mangled = format!("{}::{}", module_name, func.name);
+                                all_funcs.entry(qualified_mangled).or_insert(func.clone());
+                            }
+                            if func.is_extern {
+                                let en = func.name.clone();
+                                all_funcs.entry(en).or_insert_with(|| func.clone());
+                            }
+                        }
+                        let mapped_list: Vec<(String, Vec<Type>)> = overload_map
+                            .iter()
+                            .map(|(mangled, params)| {
+                                let base_end = mangled.find('$').unwrap_or(mangled.len());
+                                let suffix = &mangled[base_end..];
+                                (format!("{}{}", new_name, suffix), params.clone())
+                            })
+                            .collect();
+                        all_overloads.insert(new_name, mapped_list);
+
+                        let mut needed_structs: HashSet<String> = HashSet::new();
+                        let mut dep_modules: HashSet<String> = HashSet::new();
+                        for func in &module_funcs {
+                            let base_end = func.name.find('$').unwrap_or(func.name.len());
+                            if func.name[..base_end] == *target_name {
+                                for param in &func.params {
+                                    needed_structs.extend(collect_struct_deps(&param.ty));
+                                }
+                                if let Some(ret) = &func.return_type {
+                                    needed_structs.extend(collect_struct_deps(ret));
+                                }
+                            }
+                        }
+                        for struct_name in &needed_structs {
+                            if all_structs.contains_key(struct_name) {
+                                continue;
+                            }
+                            if let Some(mod_name) = canonical_struct_sources.get(struct_name)
+                                && let Some(prog) = all_stdlib_progs.get(mod_name)
+                                && let Some(decl) = prog.structs.iter().find(|s| &s.name == struct_name)
+                            {
+                                all_structs
+                                    .entry(struct_name.clone())
+                                    .or_insert_with(|| decl.clone());
+                                dep_modules.insert(mod_name.clone());
+                            }
+                        }
+                        for mod_name in &dep_modules {
+                            if let Some(prog) = all_stdlib_progs.get(mod_name) {
+                                let (dep_funcs, _) = process_stdlib_functions(prog.funcs.clone());
+                                for func in &dep_funcs {
+                                    if func.is_extern && !all_funcs.contains_key(&func.name) {
+                                        all_funcs.insert(func.name.clone(), func.clone());
+                                    }
+                                }
+                                for decl in &prog.impls {
+                                    all_impls.push(decl.clone());
+                                }
+                            }
+                        }
+                    } else {
+                        // Single function import
+                        let found = module_funcs.iter().find(|f| f.name == *target_name);
+                        match found {
+                            Some(func) => {
+                                let new_name = if prefix.is_empty() {
+                                    target_name.clone()
+                                } else {
+                                    format!("{}{}", prefix, target_name)
+                                };
+                                let mut new_func = func.clone();
+                                new_func.name = new_name.clone();
+                                new_func.is_pub = use_decl.is_pub;
+                                all_funcs.insert(new_name, new_func);
+                                
+                                let qualified_name = format!("{}::{}", module_name, target_name);
+                                all_funcs.entry(qualified_name).or_insert(func.clone());
+                                
+                                for other in &module_funcs {
+                                    if other.name != *target_name
+                                        && other.is_extern
+                                        && !all_funcs.contains_key(&other.name)
+                                    {
+                                        all_funcs.insert(other.name.clone(), other.clone());
+                                    }
+                                }
+                            }
+                            None => {
+                                eprintln!(
+                                    "error: '{}' not found in std::{}{}",
+                                    target_name,
+                                    module_name,
+                                    if target_name.chars().next().unwrap_or(' ').is_uppercase() {
+                                        format!(
+                                            " (struct '{}' has impl methods, try 'use std::{}::{}{}')",
+                                            target_name,
+                                            module_name,
+                                            target_name,
+                                            " or 'use std::{}' for all items",
+                                        )
+                                    } else {
+                                        String::new()
+                                    }
+                                );
+                                process::exit(1);
+                            }
                         }
                     }
                 }
+                progress = true;
+            } else {
+                // Local import!
+                let source_name_segs = if path[0] == "crate" {
+                    path[1..].to_vec()
+                } else if !use_decl.module_path.is_empty() {
+                    let mut segs = use_decl.module_path.clone();
+                    segs.extend(path.clone());
+                    segs
+                } else {
+                    path.clone()
+                };
+                let source_name = source_name_segs.join("::");
+
+                let last_seg = path.last().unwrap();
+                let imported_name = if !use_decl.module_path.is_empty() {
+                    format!("{}::{}", use_decl.module_path.join("::"), last_seg)
+                } else {
+                    last_seg.clone()
+                };
+
+                let has_overloads = all_overloads.contains_key(&source_name);
+                let has_funcs = all_funcs.contains_key(&source_name) || all_funcs.keys().any(|k| k.starts_with(&format!("{}$", source_name)));
+                let has_structs = all_structs.contains_key(&source_name);
+                let has_enums = all_enums.contains_key(&source_name);
+                let has_traits = all_traits.contains_key(&source_name);
+                let has_aliases = all_aliases.contains_key(&source_name);
+
+                let prefix_match = format!("{}::", source_name);
+                let is_namespace = all_funcs.keys().any(|k| k.starts_with(&prefix_match))
+                    || all_structs.keys().any(|k| k.starts_with(&prefix_match))
+                    || all_enums.keys().any(|k| k.starts_with(&prefix_match))
+                    || all_traits.keys().any(|k| k.starts_with(&prefix_match))
+                    || all_aliases.keys().any(|k| k.starts_with(&prefix_match));
+
+                let mut found_any = false;
+
+                // 1. Copy functions
+                if has_overloads || has_funcs {
+                    found_any = true;
+                    if let Some(overloads_list) = all_overloads.get(&source_name).cloned() {
+                        let new_list: Vec<(String, Vec<Type>)> = overloads_list
+                            .iter()
+                            .map(|(mangled, params)| {
+                                let suffix = mangled.split('$').last().unwrap();
+                                let new_mangled = format!("{}${}", imported_name, suffix);
+                                (new_mangled, params.clone())
+                            })
+                            .collect();
+                        all_overloads.insert(imported_name.clone(), new_list);
+
+                        for (mangled, _) in &overloads_list {
+                            if let Some(func) = all_funcs.get(mangled).cloned() {
+                                let suffix = mangled.split('$').last().unwrap();
+                                let new_mangled = format!("{}${}", imported_name, suffix);
+                                let mut new_func = func;
+                                new_func.name = new_mangled.clone();
+                                new_func.is_pub = use_decl.is_pub;
+                                all_funcs.insert(new_mangled, new_func);
+                            }
+                        }
+                    } else if let Some(func) = all_funcs.get(&source_name).cloned() {
+                        let mut new_func = func;
+                        new_func.name = imported_name.clone();
+                        new_func.is_pub = use_decl.is_pub;
+                        all_funcs.insert(imported_name.clone(), new_func);
+                    }
+                }
+
+                // 2. Copy structs
+                if has_structs {
+                    found_any = true;
+                    if let Some(decl) = all_structs.get(&source_name).cloned() {
+                        let mut new_decl = decl;
+                        new_decl.name = imported_name.clone();
+                        new_decl.is_pub = use_decl.is_pub;
+                        all_structs.insert(imported_name.clone(), new_decl);
+                    }
+                }
+
+                // 3. Copy enums
+                if has_enums {
+                    found_any = true;
+                    if let Some(decl) = all_enums.get(&source_name).cloned() {
+                        let mut new_decl = decl;
+                        new_decl.name = imported_name.clone();
+                        new_decl.is_pub = use_decl.is_pub;
+                        all_enums.insert(imported_name.clone(), new_decl);
+                    }
+                }
+
+                // 4. Copy traits
+                if has_traits {
+                    found_any = true;
+                    if let Some(decl) = all_traits.get(&source_name).cloned() {
+                        let mut new_decl = decl;
+                        new_decl.name = imported_name.clone();
+                        new_decl.is_pub = use_decl.is_pub;
+                        all_traits.insert(imported_name.clone(), new_decl);
+                    }
+                }
+
+                // 5. Copy type aliases
+                if has_aliases {
+                    found_any = true;
+                    if let Some(decl) = all_aliases.get(&source_name).cloned() {
+                        let mut new_decl = decl;
+                        new_decl.name = imported_name.clone();
+                        new_decl.is_pub = use_decl.is_pub;
+                        all_aliases.insert(imported_name.clone(), new_decl);
+                    }
+                }
+
+                // 6. Copy namespace/module children
+                if is_namespace {
+                    found_any = true;
+
+                    // Functions
+                    let matching_funcs: Vec<(String, Function)> = all_funcs
+                        .iter()
+                        .filter(|(k, _)| k.starts_with(&prefix_match))
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                    for (k, func) in matching_funcs {
+                        let relative = k.strip_prefix(&prefix_match).unwrap();
+                        let new_name = format!("{}::{}", imported_name, relative);
+                        let mut new_func = func;
+                        new_func.name = new_name.clone();
+                        new_func.is_pub = use_decl.is_pub;
+                        all_funcs.insert(new_name, new_func);
+                    }
+
+                    // Overloads
+                    let matching_overloads: Vec<(String, Vec<(String, Vec<Type>)>)> = all_overloads
+                        .iter()
+                        .filter(|(k, _)| k.starts_with(&prefix_match))
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                    for (k, overloads_list) in matching_overloads {
+                        let relative = k.strip_prefix(&prefix_match).unwrap();
+                        let new_name = format!("{}::{}", imported_name, relative);
+                        let new_list: Vec<(String, Vec<Type>)> = overloads_list
+                            .iter()
+                            .map(|(mangled, params)| {
+                                let rel_mangled = mangled.strip_prefix(&prefix_match).unwrap();
+                                let new_mangled = format!("{}::{}", imported_name, rel_mangled);
+                                (new_mangled, params.clone())
+                            })
+                            .collect();
+                        all_overloads.insert(new_name, new_list);
+                    }
+
+                    // Structs
+                    let matching_structs: Vec<(String, StructDecl)> = all_structs
+                        .iter()
+                        .filter(|(k, _)| k.starts_with(&prefix_match))
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                    for (k, decl) in matching_structs {
+                        let relative = k.strip_prefix(&prefix_match).unwrap();
+                        let new_name = format!("{}::{}", imported_name, relative);
+                        let mut new_decl = decl;
+                        new_decl.name = new_name.clone();
+                        new_decl.is_pub = use_decl.is_pub;
+                        all_structs.insert(new_name, new_decl);
+                    }
+
+                    // Enums
+                    let matching_enums: Vec<(String, EnumDecl)> = all_enums
+                        .iter()
+                        .filter(|(k, _)| k.starts_with(&prefix_match))
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                    for (k, decl) in matching_enums {
+                        let relative = k.strip_prefix(&prefix_match).unwrap();
+                        let new_name = format!("{}::{}", imported_name, relative);
+                        let mut new_decl = decl;
+                        new_decl.name = new_name.clone();
+                        new_decl.is_pub = use_decl.is_pub;
+                        all_enums.insert(new_name, new_decl);
+                    }
+
+                    // Traits
+                    let matching_traits: Vec<(String, TraitDecl)> = all_traits
+                        .iter()
+                        .filter(|(k, _)| k.starts_with(&prefix_match))
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                    for (k, decl) in matching_traits {
+                        let relative = k.strip_prefix(&prefix_match).unwrap();
+                        let new_name = format!("{}::{}", imported_name, relative);
+                        let mut new_decl = decl;
+                        new_decl.name = new_name.clone();
+                        new_decl.is_pub = use_decl.is_pub;
+                        all_traits.insert(new_name, new_decl);
+                    }
+
+                    // Aliases
+                    let matching_aliases: Vec<(String, TypeAliasDecl)> = all_aliases
+                        .iter()
+                        .filter(|(k, _)| k.starts_with(&prefix_match))
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                    for (k, decl) in matching_aliases {
+                        let relative = k.strip_prefix(&prefix_match).unwrap();
+                        let new_name = format!("{}::{}", imported_name, relative);
+                        let mut new_decl = decl;
+                        new_decl.name = new_name.clone();
+                        new_decl.is_pub = use_decl.is_pub;
+                        all_aliases.insert(new_name, new_decl);
+                    }
+                }
+
+                if found_any {
+                    progress = true;
+                } else {
+                    unresolved.push(use_decl);
+                }
             }
         }
+        pending = unresolved;
     }
 
     (
@@ -1079,7 +1408,7 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
             enums: all_enums.into_values().collect(),
             traits: all_traits.into_values().collect(),
             impls: all_impls,
-            type_aliases: Vec::new(),
+            type_aliases: all_aliases.into_values().collect(),
         },
         all_overloads,
     )
@@ -1373,14 +1702,23 @@ fn resolve_modules(program: &mut Program, source_path: &str) {
     for m in &mut program.modules {
         if m.body.is_none() {
             let parent_dir = Path::new(source_path).parent().unwrap_or(Path::new("."));
-            let mod_path = parent_dir.join(format!("{}.u", m.name));
-            let mod_src = match fs::read_to_string(&mod_path) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("error reading module file '{}': {}", mod_path.display(), e);
-                    process::exit(1);
-                }
+            let mod_path_file = parent_dir.join(format!("{}.u", m.name));
+            let mod_path_dir = parent_dir.join(&m.name).join("mod.u");
+
+            let (mod_path, mod_src) = if let Ok(s) = fs::read_to_string(&mod_path_file) {
+                (mod_path_file, s)
+            } else if let Ok(s) = fs::read_to_string(&mod_path_dir) {
+                (mod_path_dir, s)
+            } else {
+                eprintln!(
+                    "error: cannot find module file for '{}' under '{}' or '{}'",
+                    m.name,
+                    mod_path_file.display(),
+                    mod_path_dir.display()
+                );
+                process::exit(1);
             };
+
             let mut mod_prog = lex_and_parse(&mod_src, &mod_path.to_string_lossy());
             resolve_modules(&mut mod_prog, &mod_path.to_string_lossy());
             m.body = Some(mod_prog);
@@ -2052,7 +2390,23 @@ fn flatten_module(
     root_program: &mut Program,
     top_level_modules: &HashSet<String>,
 ) {
-    let submodules: HashSet<String> = program.modules.iter().map(|m| m.name.clone()).collect();
+    let mut submodules: HashSet<String> = program.modules.iter().map(|m| m.name.clone()).collect();
+
+    let mut imported_funcs = HashSet::new();
+    let mut imported_types = HashSet::new();
+    for use_decl in &program.uses {
+        if use_decl.path.len() >= 2 {
+            let last = use_decl.path.last().unwrap();
+            if last.chars().next().unwrap().is_uppercase() {
+                imported_types.insert(last.clone());
+            } else {
+                imported_funcs.insert(last.clone());
+            }
+        }
+    }
+
+    submodules.extend(imported_funcs.clone());
+    submodules.extend(imported_types.clone());
 
     // 1. Recursively flatten all nested sub-modules first
     for m in program.modules {
@@ -2064,15 +2418,17 @@ fn flatten_module(
     }
 
     // 2. Gather local types, functions, and submodules
-    let local_types: HashSet<String> = program
+    let mut local_types: HashSet<String> = program
         .structs
         .iter()
         .map(|s| s.name.clone())
         .chain(program.enums.iter().map(|e| e.name.clone()))
         .chain(program.traits.iter().map(|t| t.name.clone()))
         .collect();
+    local_types.extend(imported_types);
 
-    let local_funcs: HashSet<String> = program.funcs.iter().map(|f| f.name.clone()).collect();
+    let mut local_funcs: HashSet<String> = program.funcs.iter().map(|f| f.name.clone()).collect();
+    local_funcs.extend(imported_funcs);
 
     let prefix = current_path.join("::");
 
@@ -2175,8 +2531,9 @@ fn flatten_module(
     root_program.impls.extend(impls);
     root_program.type_aliases.extend(type_aliases);
 
-    if current_path.is_empty() {
-        root_program.uses = program.uses;
+    for mut use_decl in program.uses {
+        use_decl.module_path = current_path.clone();
+        root_program.uses.push(use_decl);
     }
 }
 

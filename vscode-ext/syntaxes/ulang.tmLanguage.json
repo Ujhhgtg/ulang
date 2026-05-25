@@ -1,0 +1,83 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "ulang",
+  "patterns": [
+    {
+      "include": "#comments"
+    },
+    {
+      "include": "#keywords"
+    },
+    {
+      "include": "#strings"
+    },
+    {
+      "include": "#numbers"
+    },
+    {
+      "include": "#types"
+    }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.double-slash.u",
+          "match": "//.*$"
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.u",
+          "match": "\\b(if|else|while|loop|return|match|use|mod|extern|pub|const|as|crate)\\b"
+        },
+        {
+          "name": "keyword.other.u",
+          "match": "\\b(let|mut|fn|struct|enum|impl|trait|type|self)\\b"
+        },
+        {
+          "name": "constant.language.boolean.u",
+          "match": "\\b(true|false)\\b"
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.u",
+          "begin": "\"",
+          "end": "\"",
+          "patterns": [
+            {
+              "name": "constant.character.escape.u",
+              "match": "\\\\."
+            }
+          ]
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.integer.u",
+          "match": "\\b[0-9]+(i32|i64|u8|u32|u64|usize)?\\b"
+        },
+        {
+          "name": "constant.numeric.float.u",
+          "match": "\\b[0-9]+\\.[0-9]+(f32|f64)?\\b"
+        }
+      ]
+    },
+    "types": {
+      "patterns": [
+        {
+          "name": "entity.name.type.u",
+          "match": "\\b(i8|i16|i32|i64|u8|u16|u32|u64|usize|isize|f32|f64|bool|str)\\b"
+        }
+      ]
+    }
+  },
+  "scopeName": "source.u"
+}

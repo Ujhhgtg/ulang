@@ -286,6 +286,7 @@ pub struct ImplDecl {
 }
 
 /// A pattern for destructuring in `if let` and `match`.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum Pattern {
     /// `_` — matches anything, binds nothing

@@ -148,6 +148,44 @@ impl<'ctx> CodeGen<'ctx> {
         }
     }
 
+    fn resolve_mangled_name(&self, base_name: &str) -> String {
+        if let Some((ref base, ref mangled)) = self.current_monomorphization
+            && base == base_name
+        {
+            mangled.clone()
+        } else {
+            self.monomorphized_names
+                .get(base_name)
+                .cloned()
+                .unwrap_or_else(|| base_name.to_string())
+        }
+    }
+
+    fn with_expected_type<F, R>(&mut self, ty: &Type, f: F) -> Result<R, String>
+    where
+        F: FnOnce(&mut Self) -> Result<R, String>,
+    {
+        let mut saved = None;
+        let mut current_ty = ty;
+        while let Type::Ref { inner, .. } = current_ty {
+            current_ty = inner;
+        }
+        if let Type::GenericInstance(name, args) = current_ty {
+            let mangled = Self::mangle_generic_instance(name, args);
+            let prev = self.monomorphized_names.insert(name.clone(), mangled);
+            saved = Some((name.clone(), prev));
+        }
+        let res = f(self);
+        if let Some((name, prev)) = saved {
+            if let Some(p) = prev {
+                self.monomorphized_names.insert(name, p);
+            } else {
+                self.monomorphized_names.remove(&name);
+            }
+        }
+        res
+    }
+
     /// Resolve
     fn resolve_self_type(func: &mut Function, actual_type: &Type) {
         for param in &mut func.params {
@@ -2865,7 +2903,11 @@ impl<'ctx> CodeGen<'ctx> {
                     .builder
                     .build_alloca(llvm_ty, name)
                     .map_err(|e| format!("failed to build alloca: {}", e))?;
-                let mut value = self.compile_expr(init)?;
+                let mut value = if let Some(ann_ty) = type_ann {
+                    self.with_expected_type(ann_ty, |this| this.compile_expr(init))?
+                } else {
+                    self.compile_expr(init)?
+                };
                 // Only attempt type coercion when the LLVM types differ,
                 // to handle cases like StructLit vs GenericInstance types
                 if value.get_type() != llvm_ty
@@ -3468,7 +3510,20 @@ impl<'ctx> CodeGen<'ctx> {
                     field,
                 } => {
                     let parent_ptr_val = self.compile_expr(member_expr)?;
-                    let parent_ptr = parent_ptr_val.into_pointer_value();
+                    let parent_ptr = match parent_ptr_val {
+                        BasicValueEnum::PointerValue(p) => p,
+                        _ => {
+                            if let Expr::Ident(name) = member_expr.as_ref() {
+                                if let Some((ptr, _, _)) = self.symbols.get(name) {
+                                    *ptr
+                                } else {
+                                    return Err(format!("undefined variable '{}'", name));
+                                }
+                            } else {
+                                return Err("expected pointer for member assignment".to_string());
+                            }
+                        }
+                    };
                     let parent_type = self.expr_type(member_expr);
 
                     let (struct_ty, struct_name) = match &parent_type {
@@ -3506,6 +3561,15 @@ impl<'ctx> CodeGen<'ctx> {
                                 .copied()
                                 .ok_or_else(|| format!("unknown struct type '{}'", name))?;
                             (st, name.clone())
+                        }
+                        Type::GenericInstance(name, args) => {
+                            let mangled = Self::mangle_generic_instance(name, args);
+                            let st = self
+                                .struct_types
+                                .get(&mangled)
+                                .copied()
+                                .ok_or_else(|| format!("unknown struct type '{}'", mangled))?;
+                            (st, mangled)
                         }
                         _ => return Err("cannot assign to field on non-struct type".to_string()),
                     };
@@ -3749,9 +3813,7 @@ impl<'ctx> CodeGen<'ctx> {
                 let mangled_name = format!("{}::{}/{}", module, callee, args.len());
                 let arg_types: Vec<Type> = args.iter().map(|a| self.expr_type(a)).collect();
                 // For generic structs, also try the monomorphized name
-                let monomorphized_name = self
-                    .monomorphized_names
-                    .get(module.as_str())
+                let monomorphized_name = Some(self.resolve_mangled_name(module))
                     .map(|mangled| format!("{}::{}/{}", mangled, callee, args.len()));
                 // Try direct lookup first, then mangled name (for impl methods), then overload map
                 let mut resolved_fn_val = self
@@ -4377,11 +4439,7 @@ impl<'ctx> CodeGen<'ctx> {
                 fields,
                 ..
             } => {
-                let actual_name = self
-                    .monomorphized_names
-                    .get(struct_name.as_str())
-                    .cloned()
-                    .unwrap_or_else(|| struct_name.clone());
+                let actual_name = self.resolve_mangled_name(struct_name);
                 let struct_type = self
                     .struct_types
                     .get(&actual_name)
@@ -4397,7 +4455,11 @@ impl<'ctx> CodeGen<'ctx> {
                     .map(|f| f.iter().map(|fd| fd.ty.clone()).collect())
                     .unwrap_or_default();
                 for (i, (field_name, field_expr)) in fields.iter().enumerate() {
-                    let mut field_val = self.compile_expr(field_expr)?;
+                    let mut field_val = if let Some(field_ty) = struct_def_fields.get(i) {
+                        self.with_expected_type(field_ty, |this| this.compile_expr(field_expr))?
+                    } else {
+                        self.compile_expr(field_expr)?
+                    };
                     // Coerce field value to the declared field type
                     if let Some(field_ty) = struct_def_fields.get(i) {
                         let field_llvm_ty = self.type_to_llvm(field_ty);

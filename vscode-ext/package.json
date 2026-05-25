@@ -1,0 +1,53 @@
+{
+    "name": "ulang",
+    "displayName": "ulang Language Support",
+    "description": "Rich language support for the ulang programming language.",
+    "version": "0.1.0",
+    "publisher": "Ujhhgtg",
+    "engines": {
+        "vscode": "^1.75.0"
+    },
+    "categories": [
+        "Programming Languages"
+    ],
+    "activationEvents": [],
+    "main": "./out/extension.js",
+    "contributes": {
+        "languages": [
+            {
+                "id": "ulang",
+                "aliases": [
+                    "Ulang",
+                    "ulang"
+                ],
+                "extensions": [
+                    ".u"
+                ],
+                "configuration": "./language-configuration.json"
+            }
+        ],
+        "configuration": {
+            "title": "Ulang",
+            "properties": {
+                "ulang.executablePath": {
+                    "type": "string",
+                    "default": "ulang",
+                    "description": "Path to the ulang compiler binary. Can be a command on PATH (like 'ulang') or a relative/absolute path (like './target/debug/ulang')."
+                }
+            }
+        }
+    },
+    "scripts": {
+        "vscode:prepublish": "npm run compile",
+        "compile": "tsc -p ./",
+        "watch": "tsc -watch -p ./"
+    },
+    "dependencies": {
+        "vscode-languageclient": "^8.1.0"
+    },
+    "devDependencies": {
+        "@types/node": "^18.0.0",
+        "@types/vscode": "^1.75.0",
+        "typescript": "^5.0.0"
+    }
+}

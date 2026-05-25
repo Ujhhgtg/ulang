@@ -1,3 +1,5 @@
+use std::vec::Vec;
+
 extern "C" {
     fn malloc(size: usize) -> *mut u8;
     fn realloc(ptr: *mut u8, new_size: usize) -> *mut u8;
@@ -6,58 +8,68 @@ extern "C" {
 }
 
 struct String {
-    ptr: *mut u8,
-    len: usize,
-    cap: usize,
+    vec: Vec<u8>,
 }
 
 impl String {
     fn new() -> String {
-        String { ptr: 0 as *mut u8, len: 0, cap: 0 }
+        String { vec: Vec::new() }
     }
 
     fn with_capacity(cap: usize) -> String {
-        let ptr = if cap == 0 { 0 as *mut u8 } else { malloc(cap) };
-        String { ptr: ptr, len: 0, cap: cap }
+        String { vec: Vec::with_capacity(cap) }
     }
 
-    fn len(&self) -> usize { self.len }
+    fn len(&self) -> usize {
+        let v = self.vec;
+        v.len()
+    }
 
-    fn capacity(&self) -> usize { self.cap }
+    fn capacity(&self) -> usize {
+        let v = self.vec;
+        v.capacity()
+    }
     
-    fn is_empty(&self) -> bool { self.len == 0 }
+    fn is_empty(&self) -> bool {
+        let v = self.vec;
+        v.is_empty()
+    }
 
     fn clear(&mut self) {
-        self.len = 0;
+        let mut v = self.vec;
+        v.clear();
+        self.vec = v;
     }
 
     fn push_str(&mut self, s: &str) {
-        let new_len = self.len + s.1;
-        if new_len > self.cap {
-            let mut new_cap = if self.cap == 0 { 1 } else { self.cap * 2 };
+        let mut v = self.vec;
+        let new_len = v.len + s.1;
+        if new_len > v.cap {
+            let mut new_cap = if v.cap == 0 { 1 } else { v.cap * 2 };
             if new_len > new_cap {
                 new_cap = new_len;
             };
-            let new_ptr = if self.cap == 0 {
+            let new_ptr = if v.cap == 0 {
                 malloc(new_cap)
             } else {
-                realloc(self.ptr, new_cap)
+                realloc(v.ptr, new_cap)
             };
-            self.ptr = new_ptr;
-            self.cap = new_cap;
+            v.ptr = new_ptr;
+            v.cap = new_cap;
         };
-        memcpy((self.ptr as usize + self.len) as *mut u8, s.0, s.1);
-        self.len = new_len;
+        memcpy((v.ptr as usize + v.len) as *mut u8, s.0, s.1);
+        v.len = new_len;
+        self.vec = v;
     }
 
-    fn as_ptr(&self) -> *const u8 { self.ptr }
+    fn as_ptr(&self) -> *const u8 {
+        let v = self.vec;
+        v.as_ptr()
+    }
 
     fn drop(&mut self) {
-        if self.cap > 0 {
-            free(self.ptr);
-            self.ptr = 0 as *mut u8;
-            self.len = 0;
-            self.cap = 0;
-        };
+        let mut v = self.vec;
+        v.drop();
+        self.vec = v;
     }
 }

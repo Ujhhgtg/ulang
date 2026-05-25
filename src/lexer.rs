@@ -184,6 +184,7 @@ impl<'a> Lexer<'a> {
                 match ident.as_str() {
                     "fn" => Token::Fn,
                     "let" => Token::Let,
+                    "mod" => Token::Mod,
                     "mut" => Token::Mut,
                     "const" => Token::Const,
                     "use" => Token::Use,
@@ -430,12 +431,13 @@ mod tests {
 
     #[test]
     fn test_keywords() {
-        let tokens = lex_all("fn let mut const");
+        let tokens = lex_all("fn let mut const mod");
         assert_eq!(tokens[0].0, Token::Fn);
         assert_eq!(tokens[1].0, Token::Let);
         assert_eq!(tokens[2].0, Token::Mut);
         assert_eq!(tokens[3].0, Token::Const);
-        assert!(matches!(tokens[4].0, Token::Eof));
+        assert_eq!(tokens[4].0, Token::Mod);
+        assert!(matches!(tokens[5].0, Token::Eof));
     }
 
     #[test]

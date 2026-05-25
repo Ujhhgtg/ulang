@@ -225,7 +225,10 @@ fn test_if_expression() {
 
 #[test]
 fn test_if_else_expression() {
-    assert!(run_test("if_else", "fn main() { if false { } else { }; }\n"));
+    assert!(run_test(
+        "if_else",
+        "fn main() { if false { } else { }; }\n"
+    ));
 }
 
 #[test]
@@ -690,5 +693,46 @@ fn test_nested_shadowing() {
     assert!(run_test(
         "nested_shadow",
         "fn main() -> i32 { let x = 1; if true { let x = 2; if true { let x = 3; }; x }; 1 }\n"
+    ));
+}
+
+#[test]
+fn test_inline_modules() {
+    assert!(run_test(
+        "inline_mod",
+        r#"
+        mod logging {
+            fn get_val() -> i32 { 42 }
+        }
+        fn main() -> i32 {
+            if logging::get_val() == 42 {
+                if crate::logging::get_val() == 42 {
+                    return 0;
+                }
+            };
+            return 1;
+        }
+        "#
+    ));
+}
+
+#[test]
+fn test_file_modules() {
+    // Write the helper file directly in the temporary directory
+    let dir = test_dir("file_mod");
+    let mod_path = dir.join("helper.u");
+    std::fs::write(&mod_path, "fn get_val() -> i32 { 100 }\n").expect("write helper");
+
+    assert!(run_test(
+        "file_mod",
+        r#"
+        mod helper;
+        fn main() -> i32 {
+            if helper::get_val() == 100 {
+                return 0;
+            };
+            return 1;
+        }
+        "#
     ));
 }

@@ -19,7 +19,7 @@ type OverloadMap = HashMap<String, Vec<(String, Vec<Type>)>>;
 use crate::token::{Span, Token};
 use inkwell::targets::TargetTriple;
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum OptLevel {
     None,
     #[default]
@@ -62,7 +62,7 @@ impl From<OptLevel> for inkwell::OptimizationLevel {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Cc {
     #[default]
     Gcc,
@@ -97,6 +97,229 @@ impl std::fmt::Display for Cc {
     }
 }
 
+use serde::Deserialize;
+
+#[derive(Debug, Deserialize)]
+struct UlangToml {
+    package: PackageConfig,
+    #[serde(default)]
+    build: BuildConfig,
+    #[serde(default)]
+    profile: ProfileConfig,
+}
+
+#[derive(Debug, Deserialize)]
+struct PackageConfig {
+    name: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct BuildConfig {
+    #[serde(default, deserialize_with = "deserialize_cc_opt")]
+    cc: Option<Cc>,
+}
+
+fn deserialize_cc_opt<'de, D>(deserializer: D) -> Result<Option<Cc>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct CcOptVisitor;
+    impl<'de> serde::de::Visitor<'de> for CcOptVisitor {
+        type Value = Option<Cc>;
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a string representation of Cc or null")
+        }
+        fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            parse_cc(v).map(Some).map_err(serde::de::Error::custom)
+        }
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+        fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            deserializer.deserialize_str(self)
+        }
+    }
+    deserializer.deserialize_option(CcOptVisitor)
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ProfileConfig {
+    #[serde(default)]
+    dev: ProfileDevConfig,
+    #[serde(default)]
+    release: ProfileReleaseConfig,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProfileDevConfig {
+    #[serde(default = "default_dev_opt", deserialize_with = "deserialize_toml_opt")]
+    opt_level: OptLevel,
+}
+
+impl Default for ProfileDevConfig {
+    fn default() -> Self {
+        Self {
+            opt_level: OptLevel::None,
+        }
+    }
+}
+
+fn default_dev_opt() -> OptLevel {
+    OptLevel::None
+}
+
+#[derive(Debug, Deserialize)]
+struct ProfileReleaseConfig {
+    #[serde(
+        default = "default_release_opt",
+        deserialize_with = "deserialize_toml_opt"
+    )]
+    opt_level: OptLevel,
+}
+
+impl Default for ProfileReleaseConfig {
+    fn default() -> Self {
+        Self {
+            opt_level: OptLevel::Aggressive,
+        }
+    }
+}
+
+fn default_release_opt() -> OptLevel {
+    OptLevel::Aggressive
+}
+
+fn deserialize_toml_opt<'de, D>(deserializer: D) -> Result<OptLevel, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct OptVisitor;
+    impl<'de> serde::de::Visitor<'de> for OptVisitor {
+        type Value = OptLevel;
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("an integer (0-3) or string representing OptLevel")
+        }
+        fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            match v {
+                0 => Ok(OptLevel::None),
+                1 => Ok(OptLevel::Less),
+                2 => Ok(OptLevel::Default),
+                3 => Ok(OptLevel::Aggressive),
+                _ => Err(serde::de::Error::custom(format!(
+                    "invalid opt-level: {v}. Use 0, 1, 2, or 3"
+                ))),
+            }
+        }
+        fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            self.visit_i64(v as i64)
+        }
+        fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            parse_opt_level(v).map_err(serde::de::Error::custom)
+        }
+    }
+    deserializer.deserialize_any(OptVisitor)
+}
+
+fn find_project_root() -> Option<std::path::PathBuf> {
+    let mut dir = std::env::current_dir().ok()?;
+    loop {
+        let toml_path = dir.join("ulang.toml");
+        if toml_path.is_file() {
+            return Some(dir);
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+    None
+}
+
+fn find_stdlib_dir() -> std::path::PathBuf {
+    if let Ok(val) = std::env::var("ULANG_STDLIB") {
+        return std::path::PathBuf::from(val);
+    }
+    if let Ok(mut dir) = std::env::current_dir() {
+        loop {
+            let candidate = dir.join("stdlib");
+            if candidate.is_dir() {
+                return candidate;
+            }
+            if !dir.pop() {
+                break;
+            }
+        }
+    }
+    std::path::PathBuf::from("stdlib")
+}
+
+fn do_new_project(name: &str) {
+    let project_dir = Path::new(name);
+    if project_dir.exists() {
+        eprintln!("error: directory '{}' already exists", name);
+        process::exit(1);
+    }
+
+    if let Err(e) = fs::create_dir_all(project_dir.join("src")) {
+        eprintln!("error: failed to create project directory structure: {}", e);
+        process::exit(1);
+    }
+
+    let toml_content = format!(
+        r#"[package]
+name = "{}"
+
+[profile.dev]
+opt-level = "0"
+
+[profile.release]
+opt-level = "3"
+
+[build]
+cc = "gcc"
+"#,
+        name
+    );
+
+    let toml_path = project_dir.join("ulang.toml");
+    if let Err(e) = fs::write(&toml_path, toml_content) {
+        eprintln!("error: failed to write '{}': {}", toml_path.display(), e);
+        process::exit(1);
+    }
+
+    let main_content = r#"use std::io::println;
+
+fn main() {
+    println("Hello, World!");
+}
+"#;
+
+    let main_path = project_dir.join("src/main.u");
+    if let Err(e) = fs::write(&main_path, main_content) {
+        eprintln!("error: failed to write '{}': {}", main_path.display(), e);
+        process::exit(1);
+    }
+
+    println!("Created binary project '{}'", name);
+}
+
 #[derive(Parser)]
 #[command(name = "ulang", version, about = "A tiny compiled language",
     styles = Styles::styled()
@@ -116,31 +339,46 @@ struct Cli {
 enum Command {
     /// Compile and run the source file via JIT
     Run {
-        /// Path to .u source file
-        file: String,
+        /// Path to .u source file (optional in project mode)
+        file: Option<String>,
         /// Optimization level (0|none, 1|less, 2|default, 3|aggressive)
-        #[arg(short = 'o', long = "opt", default_value_t = OptLevel::Default, value_parser = parse_opt_level)]
-        opt: OptLevel,
+        #[arg(short = 'o', long = "opt", value_parser = parse_opt_level)]
+        opt: Option<OptLevel>,
+        /// C compiler to use for linking (in project mode)
+        #[arg(long = "cc", value_parser = parse_cc)]
+        cc: Option<Cc>,
+        /// Run as a single file script, even if inside a project
+        #[arg(long = "script")]
+        script: bool,
+        /// Build and run in release mode
+        #[arg(long = "release")]
+        release: bool,
     },
     /// Compile to a native executable
     Build {
-        /// Path to .u source file
-        file: String,
-        /// Output executable path [default: a.out]
+        /// Path to .u source file (optional in project mode)
+        file: Option<String>,
+        /// Output executable path [default: project name or a.out]
         #[arg(long = "output")]
         output: Option<String>,
         /// Optimization level (0|none, 1|less, 2|default, 3|aggressive)
-        #[arg(short = 'o', long = "opt", default_value_t = OptLevel::Default, value_parser = parse_opt_level)]
-        opt: OptLevel,
+        #[arg(short = 'o', long = "opt", value_parser = parse_opt_level)]
+        opt: Option<OptLevel>,
         /// C compiler to use for linking (gcc, clang, cosmocc, zig, tcc)
-        #[arg(long = "cc", default_value_t = Cc::Gcc, value_parser = parse_cc)]
-        cc: Cc,
+        #[arg(long = "cc", value_parser = parse_cc)]
+        cc: Option<Cc>,
+        /// Run as a single file script, even if inside a project
+        #[arg(long = "script")]
+        script: bool,
+        /// Build in release mode
+        #[arg(long = "release")]
+        release: bool,
     },
     /// Compile to a native executable and run it
     #[command(name = "build-run")]
     BuildRun {
-        /// Path to .u source file
-        file: String,
+        /// Path to .u source file (optional in project mode)
+        file: Option<String>,
         /// Output executable path [default: a.out]
         #[arg(long = "output")]
         output: Option<String>,
@@ -150,6 +388,14 @@ enum Command {
         /// C compiler to use for linking (gcc, clang, cosmocc, zig, tcc)
         #[arg(long = "cc", default_value_t = Cc::Gcc, value_parser = parse_cc)]
         cc: Cc,
+        /// Run as a single file script, even if inside a project
+        #[arg(long = "script")]
+        script: bool,
+    },
+    /// Create a new project
+    New {
+        /// Name of the project
+        name: String,
     },
     /// Start the language server (LSP)
     Lsp,
@@ -450,7 +696,8 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
     let mut all_stdlib_progs: HashMap<String, Program> = HashMap::new();
     // Map from struct name to canonical source module (e.g., "String" → "string")
     let mut canonical_struct_sources: HashMap<String, String> = HashMap::new();
-    if let Ok(entries) = std::fs::read_dir("stdlib") {
+    let stdlib_dir = find_stdlib_dir();
+    if let Ok(entries) = std::fs::read_dir(&stdlib_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().is_some_and(|e| e == "u")
@@ -483,7 +730,7 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
 
             // Resolve stdlib/module_name.u
             let module_name = &path[1];
-            let stdlib_path = Path::new("stdlib").join(format!("{}.u", module_name));
+            let stdlib_path = stdlib_dir.join(format!("{}.u", module_name));
 
             let stdlib_src = match fs::read_to_string(&stdlib_path) {
                 Ok(s) => s,
@@ -826,6 +1073,7 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
     (
         Program {
             uses: Vec::new(), // cleared after resolution
+            modules: Vec::new(),
             funcs: all_funcs.into_values().collect(),
             structs: all_structs.into_values().collect(),
             enums: all_enums.into_values().collect(),
@@ -840,6 +1088,11 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
 fn main() {
     let cli = Cli::parse();
 
+    if let Command::New { name } = &cli.command {
+        do_new_project(name);
+        return;
+    }
+
     if let Command::Lsp = cli.command {
         if let Err(e) = lsp::run_server() {
             eprintln!("LSP server error: {}", e);
@@ -848,21 +1101,194 @@ fn main() {
         return;
     }
 
-    let (mode, path) = match cli.command {
-        Command::Run { file, opt } => (Mode::Run { opt }, file),
-        Command::Build {
-            file,
-            output,
-            opt,
-            cc,
-        } => (Mode::Build { output, opt, cc }, file),
-        Command::BuildRun {
-            file,
-            output,
-            opt,
-            cc,
-        } => (Mode::BuildRun { output, opt, cc }, file),
-        Command::Lsp => unreachable!(),
+    let project_root = find_project_root();
+    let is_script_mode = match &cli.command {
+        Command::Run { script, .. } => *script,
+        Command::Build { script, .. } => *script,
+        Command::BuildRun { script, .. } => *script,
+        _ => false,
+    };
+
+    let (mode, path) = if let Some(root_path) = project_root {
+        if is_script_mode {
+            // Script / Single-file Mode inside a project folder
+            let file_opt = match &cli.command {
+                Command::Run { file, .. } => file.clone(),
+                Command::Build { file, .. } => file.clone(),
+                Command::BuildRun { file, .. } => file.clone(),
+                _ => None,
+            };
+            let path = match file_opt {
+                Some(f) => f,
+                None => {
+                    eprintln!("error: script mode requires a source file path");
+                    process::exit(1);
+                }
+            };
+
+            let mode = match &cli.command {
+                Command::Run { opt, .. } => Mode::Run {
+                    opt: opt.unwrap_or(OptLevel::Default),
+                },
+                Command::Build {
+                    output, opt, cc, ..
+                } => Mode::Build {
+                    output: output.clone(),
+                    opt: opt.unwrap_or(OptLevel::Default),
+                    cc: cc.unwrap_or(Cc::Gcc),
+                },
+                Command::BuildRun {
+                    output, opt, cc, ..
+                } => Mode::BuildRun {
+                    output: output.clone(),
+                    opt: *opt,
+                    cc: *cc,
+                },
+                _ => unreachable!(),
+            };
+
+            (mode, path)
+        } else {
+            // Project Mode
+            let toml_path = root_path.join("ulang.toml");
+            let toml_str = fs::read_to_string(&toml_path).unwrap_or_else(|e| {
+                eprintln!("error: failed to read ulang.toml: {}", e);
+                process::exit(1);
+            });
+            let config: UlangToml = toml::from_str(&toml_str).unwrap_or_else(|e| {
+                eprintln!("error: failed to parse '{}': {}", toml_path.display(), e);
+                process::exit(1);
+            });
+
+            if let Command::BuildRun { .. } = &cli.command {
+                eprintln!("error: `build-run` is disabled in projects, use `run` instead");
+                process::exit(1);
+            }
+
+            let file_opt = match &cli.command {
+                Command::Run { file, .. } => file.clone(),
+                Command::Build { file, .. } => file.clone(),
+                _ => None,
+            };
+            if file_opt.is_some() {
+                eprintln!(
+                    "error: found a project but a source file was specified. Use '--script' to run in script mode, or run without a file argument for project mode."
+                );
+                process::exit(1);
+            }
+
+            let release = match &cli.command {
+                Command::Run { release, .. } => *release,
+                Command::Build { release, .. } => *release,
+                _ => false,
+            };
+
+            let opt = match &cli.command {
+                Command::Run { opt: Some(o), .. } | Command::Build { opt: Some(o), .. } => *o,
+                _ => {
+                    if release {
+                        config.profile.release.opt_level
+                    } else {
+                        config.profile.dev.opt_level
+                    }
+                }
+            };
+
+            let cc = match &cli.command {
+                Command::Run { cc: Some(c), .. } | Command::Build { cc: Some(c), .. } => *c,
+                _ => config.build.cc.unwrap_or(Cc::Gcc),
+            };
+
+            let exe_name = match &cli.command {
+                Command::Build {
+                    output: Some(o), ..
+                } => o.clone(),
+                _ => config.package.name.clone(),
+            };
+
+            let source_path_raw = root_path.join("src/main.u");
+            let source_path = fs::canonicalize(&source_path_raw).unwrap_or_else(|e| {
+                eprintln!("error: cannot find root module 'src/main.u': {}", e);
+                process::exit(1);
+            });
+
+            let target_dir = if release {
+                root_path.join("target/release")
+            } else {
+                root_path.join("target/debug")
+            };
+            fs::create_dir_all(&target_dir).unwrap_or_else(|e| {
+                eprintln!("error: failed to create target directory: {}", e);
+                process::exit(1);
+            });
+            let canonical_target_dir = fs::canonicalize(&target_dir).unwrap_or_else(|e| {
+                eprintln!("error: failed to canonicalize target directory: {}", e);
+                process::exit(1);
+            });
+            std::env::set_current_dir(&canonical_target_dir).unwrap_or_else(|e| {
+                eprintln!(
+                    "error: failed to set target directory as working dir: {}",
+                    e
+                );
+                process::exit(1);
+            });
+
+            let mode = match &cli.command {
+                Command::Build { .. } => Mode::Build {
+                    output: Some(exe_name),
+                    opt,
+                    cc,
+                },
+                Command::Run { .. } => Mode::BuildRun {
+                    output: Some(exe_name),
+                    opt,
+                    cc,
+                },
+                _ => unreachable!(),
+            };
+
+            (mode, source_path.to_string_lossy().into_owned())
+        }
+    } else {
+        // Script / Single-file Mode
+        let file_opt = match &cli.command {
+            Command::Run { file, .. } => file.clone(),
+            Command::Build { file, .. } => file.clone(),
+            Command::BuildRun { file, .. } => file.clone(),
+            _ => None,
+        };
+        let path = match file_opt {
+            Some(f) => f,
+            None => {
+                eprintln!(
+                    "error: no ulang.toml found and no source file specified. Use 'ulang new <name>' to create a project or specify a file to compile."
+                );
+                process::exit(1);
+            }
+        };
+
+        let mode = match &cli.command {
+            Command::Run { opt, .. } => Mode::Run {
+                opt: opt.unwrap_or(OptLevel::Default),
+            },
+            Command::Build {
+                output, opt, cc, ..
+            } => Mode::Build {
+                output: output.clone(),
+                opt: opt.unwrap_or(OptLevel::Default),
+                cc: cc.unwrap_or(Cc::Gcc),
+            },
+            Command::BuildRun {
+                output, opt, cc, ..
+            } => Mode::BuildRun {
+                output: output.clone(),
+                opt: *opt,
+                cc: *cc,
+            },
+            _ => unreachable!(),
+        };
+
+        (mode, path)
     };
 
     let source = fs::read_to_string(&path).unwrap_or_else(|e| {
@@ -872,6 +1298,9 @@ fn main() {
 
     // --- Lex & Parse ---
     let program = lex_and_parse(&source, &path);
+
+    // --- Resolve Modules & Flatten ---
+    let program = resolve_and_flatten_modules(program, &path);
 
     // --- Resolve uses (stdlib) ---
     let (program, overloads) = resolve_uses(program, cli.no_std, &path);
@@ -937,5 +1366,887 @@ fn main() {
                 process::exit(status.code().unwrap_or(1));
             }
         }
+    }
+}
+
+fn resolve_modules(program: &mut Program, source_path: &str) {
+    for m in &mut program.modules {
+        if m.body.is_none() {
+            let parent_dir = Path::new(source_path).parent().unwrap_or(Path::new("."));
+            let mod_path = parent_dir.join(format!("{}.u", m.name));
+            let mod_src = match fs::read_to_string(&mod_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("error reading module file '{}': {}", mod_path.display(), e);
+                    process::exit(1);
+                }
+            };
+            let mut mod_prog = lex_and_parse(&mod_src, &mod_path.to_string_lossy());
+            resolve_modules(&mut mod_prog, &mod_path.to_string_lossy());
+            m.body = Some(mod_prog);
+        } else if let Some(ref mut body) = m.body {
+            resolve_modules(body, source_path);
+        }
+    }
+}
+
+fn qualify_type(ty: &mut Type, local_types: &HashSet<String>, prefix: &str) {
+    if prefix.is_empty() {
+        return;
+    }
+    match ty {
+        Type::Tuple(elems) => {
+            for elem in elems {
+                qualify_type(elem, local_types, prefix);
+            }
+        }
+        Type::Ptr { inner, .. } => {
+            qualify_type(inner, local_types, prefix);
+        }
+        Type::Ref { inner, .. } => {
+            qualify_type(inner, local_types, prefix);
+        }
+        Type::Array { inner, .. } => {
+            qualify_type(inner, local_types, prefix);
+        }
+        Type::Struct(name) => {
+            if local_types.contains(name) {
+                *name = format!("{}::{}", prefix, name);
+            }
+        }
+        Type::GenericInstance(name, args) => {
+            if local_types.contains(name) {
+                *name = format!("{}::{}", prefix, name);
+            }
+            for arg in args {
+                qualify_type(arg, local_types, prefix);
+            }
+        }
+        Type::Alias(name, args) => {
+            if local_types.contains(name) {
+                *name = format!("{}::{}", prefix, name);
+            }
+            for arg in args {
+                qualify_type(arg, local_types, prefix);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn qualify_pattern(
+    pattern: &mut crate::ast::Pattern,
+    local_types: &HashSet<String>,
+    prefix: &str,
+    current_path: &[String],
+    submodules: &HashSet<String>,
+    top_level_modules: &HashSet<String>,
+) {
+    if let crate::ast::Pattern::EnumVariant {
+        enum_name, payload, ..
+    } = pattern
+    {
+        if let Some(name) = enum_name {
+            if !prefix.is_empty() && local_types.contains(name) {
+                *name = format!("{}::{}", prefix, name);
+            }
+            let segments: Vec<String> = name.split("::").map(|s| s.to_string()).collect();
+            if segments.len() > 1 {
+                let resolved_path = if segments[0] == "crate" {
+                    segments[1..].to_vec()
+                } else if submodules.contains(&segments[0]) {
+                    let mut path = current_path.to_vec();
+                    path.extend(segments);
+                    path
+                } else if top_level_modules.contains(&segments[0]) {
+                    segments
+                } else {
+                    segments
+                };
+                *name = resolved_path.join("::");
+            }
+        }
+        if let Some(p) = payload {
+            qualify_pattern(
+                p,
+                local_types,
+                prefix,
+                current_path,
+                submodules,
+                top_level_modules,
+            );
+        }
+    }
+}
+
+fn qualify_expr(
+    expr: &mut crate::ast::Expr,
+    local_funcs: &HashSet<String>,
+    local_types: &HashSet<String>,
+    prefix: &str,
+    current_path: &[String],
+    submodules: &HashSet<String>,
+    top_level_modules: &HashSet<String>,
+) {
+    match expr {
+        crate::ast::Expr::Call { callee, args } => {
+            if !prefix.is_empty() && local_funcs.contains(callee) {
+                *callee = format!("{}::{}", prefix, callee);
+            }
+            for arg in args {
+                qualify_expr(
+                    arg,
+                    local_funcs,
+                    local_types,
+                    prefix,
+                    current_path,
+                    submodules,
+                    top_level_modules,
+                );
+            }
+        }
+        crate::ast::Expr::QualifiedCall {
+            module,
+            callee: _,
+            args,
+        } => {
+            let segments: Vec<String> = module.split("::").map(|s| s.to_string()).collect();
+            if !segments.is_empty() {
+                let resolved_path = if segments[0] == "crate" {
+                    segments[1..].to_vec()
+                } else if submodules.contains(&segments[0]) {
+                    let mut path = current_path.to_vec();
+                    path.extend(segments);
+                    path
+                } else if top_level_modules.contains(&segments[0]) {
+                    segments
+                } else {
+                    segments
+                };
+                if !resolved_path.is_empty() {
+                    *module = resolved_path.join("::");
+                }
+            }
+            for arg in args {
+                qualify_expr(
+                    arg,
+                    local_funcs,
+                    local_types,
+                    prefix,
+                    current_path,
+                    submodules,
+                    top_level_modules,
+                );
+            }
+        }
+        crate::ast::Expr::StructLit {
+            struct_name,
+            fields,
+        } => {
+            if !prefix.is_empty() && local_types.contains(struct_name) {
+                *struct_name = format!("{}::{}", prefix, struct_name);
+            }
+            let segments: Vec<String> = struct_name.split("::").map(|s| s.to_string()).collect();
+            if segments.len() > 1 {
+                let resolved_path = if segments[0] == "crate" {
+                    segments[1..].to_vec()
+                } else if submodules.contains(&segments[0]) {
+                    let mut path = current_path.to_vec();
+                    path.extend(segments);
+                    path
+                } else if top_level_modules.contains(&segments[0]) {
+                    segments
+                } else {
+                    segments
+                };
+                *struct_name = resolved_path.join("::");
+            }
+            for (_, val) in fields {
+                qualify_expr(
+                    val,
+                    local_funcs,
+                    local_types,
+                    prefix,
+                    current_path,
+                    submodules,
+                    top_level_modules,
+                );
+            }
+        }
+        crate::ast::Expr::EnumLit {
+            enum_name, payload, ..
+        } => {
+            if !prefix.is_empty() && local_types.contains(enum_name) {
+                *enum_name = format!("{}::{}", prefix, enum_name);
+            }
+            let segments: Vec<String> = enum_name.split("::").map(|s| s.to_string()).collect();
+            if segments.len() > 1 {
+                let resolved_path = if segments[0] == "crate" {
+                    segments[1..].to_vec()
+                } else if submodules.contains(&segments[0]) {
+                    let mut path = current_path.to_vec();
+                    path.extend(segments);
+                    path
+                } else if top_level_modules.contains(&segments[0]) {
+                    segments
+                } else {
+                    segments
+                };
+                *enum_name = resolved_path.join("::");
+            }
+            if let Some(payload_expr) = payload {
+                qualify_expr(
+                    payload_expr,
+                    local_funcs,
+                    local_types,
+                    prefix,
+                    current_path,
+                    submodules,
+                    top_level_modules,
+                );
+            }
+        }
+        crate::ast::Expr::Binary { lhs, rhs, .. } => {
+            qualify_expr(
+                lhs,
+                local_funcs,
+                local_types,
+                prefix,
+                current_path,
+                submodules,
+                top_level_modules,
+            );
+            qualify_expr(
+                rhs,
+                local_funcs,
+                local_types,
+                prefix,
+                current_path,
+                submodules,
+                top_level_modules,
+            );
+        }
+        crate::ast::Expr::Assign { target, value } => {
+            qualify_expr(
+                target,
+                local_funcs,
+                local_types,
+                prefix,
+                current_path,
+                submodules,
+                top_level_modules,
+            );
+            qualify_expr(
+                value,
+                local_funcs,
+                local_types,
+                prefix,
+                current_path,
+                submodules,
+                top_level_modules,
+            );
+        }
+        crate::ast::Expr::Ref { expr, .. } => {
+            qualify_expr(
+                expr,
+                local_funcs,
+                local_types,
+                prefix,
+                current_path,
+                submodules,
+                top_level_modules,
+            );
+        }
+        crate::ast::Expr::UnaryNot(expr) => {
+            qualify_expr(
+                expr,
+                local_funcs,
+                local_types,
+                prefix,
+                current_path,
+                submodules,
+                top_level_modules,
+            );
+        }
+        crate::ast::Expr::UnaryMinus(expr) => {
+            qualify_expr(
+                expr,
+                local_funcs,
+                local_types,
+                prefix,
+                current_path,
+                submodules,
+                top_level_modules,
+            );
+        }
+        crate::ast::Expr::Deref(expr) => {
+            qualify_expr(
+                expr,
+                local_funcs,
+                local_types,
+                prefix,
+                current_path,
+                submodules,
+                top_level_modules,
+            );
+        }
+        crate::ast::Expr::Cast { expr, to_type } => {
+            qualify_expr(
+                expr,
+                local_funcs,
+                local_types,
+                prefix,
+                current_path,
+                submodules,
+                top_level_modules,
+            );
+            qualify_type(to_type, local_types, prefix);
+        }
+        crate::ast::Expr::Tuple(elems) => {
+            for elem in elems {
+                qualify_expr(
+                    elem,
+                    local_funcs,
+                    local_types,
+                    prefix,
+                    current_path,
+                    submodules,
+                    top_level_modules,
+                );
+            }
+        }
+        crate::ast::Expr::Member { expr, .. } => {
+            qualify_expr(
+                expr,
+                local_funcs,
+                local_types,
+                prefix,
+                current_path,
+                submodules,
+                top_level_modules,
+            );
+        }
+        crate::ast::Expr::MethodCall { expr, args, .. } => {
+            qualify_expr(
+                expr,
+                local_funcs,
+                local_types,
+                prefix,
+                current_path,
+                submodules,
+                top_level_modules,
+            );
+            for arg in args {
+                qualify_expr(
+                    arg,
+                    local_funcs,
+                    local_types,
+                    prefix,
+                    current_path,
+                    submodules,
+                    top_level_modules,
+                );
+            }
+        }
+        crate::ast::Expr::If {
+            cond,
+            then_block,
+            else_ifs,
+            else_block,
+        } => {
+            qualify_expr(
+                cond,
+                local_funcs,
+                local_types,
+                prefix,
+                current_path,
+                submodules,
+                top_level_modules,
+            );
+            qualify_block(
+                then_block,
+                local_funcs,
+                local_types,
+                prefix,
+                current_path,
+                submodules,
+                top_level_modules,
+            );
+            for (elif_cond, elif_block) in else_ifs {
+                qualify_expr(
+                    elif_cond,
+                    local_funcs,
+                    local_types,
+                    prefix,
+                    current_path,
+                    submodules,
+                    top_level_modules,
+                );
+                qualify_block(
+                    elif_block,
+                    local_funcs,
+                    local_types,
+                    prefix,
+                    current_path,
+                    submodules,
+                    top_level_modules,
+                );
+            }
+            if let Some(block) = else_block {
+                qualify_block(
+                    block,
+                    local_funcs,
+                    local_types,
+                    prefix,
+                    current_path,
+                    submodules,
+                    top_level_modules,
+                );
+            }
+        }
+        crate::ast::Expr::Loop { body } => {
+            qualify_block(
+                body,
+                local_funcs,
+                local_types,
+                prefix,
+                current_path,
+                submodules,
+                top_level_modules,
+            );
+        }
+        crate::ast::Expr::While { cond, body } => {
+            qualify_expr(
+                cond,
+                local_funcs,
+                local_types,
+                prefix,
+                current_path,
+                submodules,
+                top_level_modules,
+            );
+            qualify_block(
+                body,
+                local_funcs,
+                local_types,
+                prefix,
+                current_path,
+                submodules,
+                top_level_modules,
+            );
+        }
+        crate::ast::Expr::Array(elems) => {
+            for elem in elems {
+                qualify_expr(
+                    elem,
+                    local_funcs,
+                    local_types,
+                    prefix,
+                    current_path,
+                    submodules,
+                    top_level_modules,
+                );
+            }
+        }
+        crate::ast::Expr::Repeat(expr, _) => {
+            qualify_expr(
+                expr,
+                local_funcs,
+                local_types,
+                prefix,
+                current_path,
+                submodules,
+                top_level_modules,
+            );
+        }
+        crate::ast::Expr::Index { array, index } => {
+            qualify_expr(
+                array,
+                local_funcs,
+                local_types,
+                prefix,
+                current_path,
+                submodules,
+                top_level_modules,
+            );
+            qualify_expr(
+                index,
+                local_funcs,
+                local_types,
+                prefix,
+                current_path,
+                submodules,
+                top_level_modules,
+            );
+        }
+        crate::ast::Expr::IfLet {
+            pattern,
+            scrutinee,
+            then_block,
+            else_block,
+        } => {
+            qualify_pattern(
+                pattern,
+                local_types,
+                prefix,
+                current_path,
+                submodules,
+                top_level_modules,
+            );
+            qualify_expr(
+                scrutinee,
+                local_funcs,
+                local_types,
+                prefix,
+                current_path,
+                submodules,
+                top_level_modules,
+            );
+            qualify_block(
+                then_block,
+                local_funcs,
+                local_types,
+                prefix,
+                current_path,
+                submodules,
+                top_level_modules,
+            );
+            if let Some(block) = else_block {
+                qualify_block(
+                    block,
+                    local_funcs,
+                    local_types,
+                    prefix,
+                    current_path,
+                    submodules,
+                    top_level_modules,
+                );
+            }
+        }
+        crate::ast::Expr::Match { scrutinee, arms } => {
+            qualify_expr(
+                scrutinee,
+                local_funcs,
+                local_types,
+                prefix,
+                current_path,
+                submodules,
+                top_level_modules,
+            );
+            for arm in arms {
+                qualify_pattern(
+                    &mut arm.pattern,
+                    local_types,
+                    prefix,
+                    current_path,
+                    submodules,
+                    top_level_modules,
+                );
+                if let Some(guard_expr) = &mut arm.guard {
+                    qualify_expr(
+                        guard_expr,
+                        local_funcs,
+                        local_types,
+                        prefix,
+                        current_path,
+                        submodules,
+                        top_level_modules,
+                    );
+                }
+                qualify_block(
+                    &mut arm.body,
+                    local_funcs,
+                    local_types,
+                    prefix,
+                    current_path,
+                    submodules,
+                    top_level_modules,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+fn qualify_block(
+    block: &mut crate::ast::Block,
+    local_funcs: &HashSet<String>,
+    local_types: &HashSet<String>,
+    prefix: &str,
+    current_path: &[String],
+    submodules: &HashSet<String>,
+    top_level_modules: &HashSet<String>,
+) {
+    for stmt in &mut block.stmts {
+        match stmt {
+            crate::ast::Stmt::Let { type_ann, init, .. } => {
+                if let Some(ty) = type_ann {
+                    qualify_type(ty, local_types, prefix);
+                }
+                qualify_expr(
+                    init,
+                    local_funcs,
+                    local_types,
+                    prefix,
+                    current_path,
+                    submodules,
+                    top_level_modules,
+                );
+            }
+            crate::ast::Stmt::Const { type_ann, init, .. } => {
+                if let Some(ty) = type_ann {
+                    qualify_type(ty, local_types, prefix);
+                }
+                qualify_expr(
+                    init,
+                    local_funcs,
+                    local_types,
+                    prefix,
+                    current_path,
+                    submodules,
+                    top_level_modules,
+                );
+            }
+            crate::ast::Stmt::Expr(expr) => {
+                qualify_expr(
+                    expr,
+                    local_funcs,
+                    local_types,
+                    prefix,
+                    current_path,
+                    submodules,
+                    top_level_modules,
+                );
+            }
+            crate::ast::Stmt::Return { value, .. } => {
+                if let Some(expr) = value {
+                    qualify_expr(
+                        expr,
+                        local_funcs,
+                        local_types,
+                        prefix,
+                        current_path,
+                        submodules,
+                        top_level_modules,
+                    );
+                }
+            }
+        }
+    }
+    if let Some(tail) = &mut block.tail_expr {
+        qualify_expr(
+            tail,
+            local_funcs,
+            local_types,
+            prefix,
+            current_path,
+            submodules,
+            top_level_modules,
+        );
+    }
+}
+
+fn flatten_module(
+    program: Program,
+    current_path: Vec<String>,
+    root_program: &mut Program,
+    top_level_modules: &HashSet<String>,
+) {
+    let submodules: HashSet<String> = program.modules.iter().map(|m| m.name.clone()).collect();
+
+    // 1. Recursively flatten all nested sub-modules first
+    for m in program.modules {
+        if let Some(body) = m.body {
+            let mut path = current_path.clone();
+            path.push(m.name.clone());
+            flatten_module(body, path, root_program, top_level_modules);
+        }
+    }
+
+    // 2. Gather local types, functions, and submodules
+    let local_types: HashSet<String> = program
+        .structs
+        .iter()
+        .map(|s| s.name.clone())
+        .chain(program.enums.iter().map(|e| e.name.clone()))
+        .chain(program.traits.iter().map(|t| t.name.clone()))
+        .collect();
+
+    let local_funcs: HashSet<String> = program.funcs.iter().map(|f| f.name.clone()).collect();
+
+    let prefix = current_path.join("::");
+
+    // Qualify local items if not at the root level
+    let mut funcs = program.funcs;
+    let mut structs = program.structs;
+    let mut enums = program.enums;
+    let mut traits = program.traits;
+    let mut impls = program.impls;
+    let mut type_aliases = program.type_aliases;
+
+    for func in &mut funcs {
+        for param in &mut func.params {
+            qualify_type(&mut param.ty, &local_types, &prefix);
+        }
+        if let Some(ref mut ret) = func.return_type {
+            qualify_type(ret, &local_types, &prefix);
+        }
+        qualify_block(
+            &mut func.body,
+            &local_funcs,
+            &local_types,
+            &prefix,
+            &current_path,
+            &submodules,
+            top_level_modules,
+        );
+        if !prefix.is_empty() && func.name != "main" {
+            func.name = format!("{}::{}", prefix, func.name);
+        }
+    }
+
+    for s in &mut structs {
+        for field in &mut s.fields {
+            qualify_type(&mut field.ty, &local_types, &prefix);
+        }
+        if !prefix.is_empty() {
+            s.name = format!("{}::{}", prefix, s.name);
+        }
+    }
+
+    for e in &mut enums {
+        for variant in &mut e.variants {
+            if let Some(ref mut ty) = variant.ty {
+                qualify_type(ty, &local_types, &prefix);
+            }
+        }
+        if !prefix.is_empty() {
+            e.name = format!("{}::{}", prefix, e.name);
+        }
+    }
+
+    for t in &mut traits {
+        for method in &mut t.methods {
+            for param in &mut method.params {
+                qualify_type(&mut param.ty, &local_types, &prefix);
+            }
+            if let Some(ref mut ret) = method.return_type {
+                qualify_type(ret, &local_types, &prefix);
+            }
+        }
+        if !prefix.is_empty() {
+            t.name = format!("{}::{}", prefix, t.name);
+        }
+    }
+
+    for i in &mut impls {
+        qualify_type(&mut i.impl_type, &local_types, &prefix);
+        for method in &mut i.methods {
+            for param in &mut method.params {
+                qualify_type(&mut param.ty, &local_types, &prefix);
+            }
+            if let Some(ref mut ret) = method.return_type {
+                qualify_type(ret, &local_types, &prefix);
+            }
+            qualify_block(
+                &mut method.body,
+                &local_funcs,
+                &local_types,
+                &prefix,
+                &current_path,
+                &submodules,
+                top_level_modules,
+            );
+        }
+    }
+
+    for alias in &mut type_aliases {
+        qualify_type(&mut alias.aliased_type, &local_types, &prefix);
+        if !prefix.is_empty() {
+            alias.name = format!("{}::{}", prefix, alias.name);
+        }
+    }
+
+    // Merge into the root program
+    root_program.funcs.extend(funcs);
+    root_program.structs.extend(structs);
+    root_program.enums.extend(enums);
+    root_program.traits.extend(traits);
+    root_program.impls.extend(impls);
+    root_program.type_aliases.extend(type_aliases);
+
+    if current_path.is_empty() {
+        root_program.uses = program.uses;
+    }
+}
+
+fn resolve_and_flatten_modules(mut program: Program, source_path: &str) -> Program {
+    // 1. Recursive load all mod files
+    resolve_modules(&mut program, source_path);
+
+    // 2. Build top-level module names set
+    let top_level_modules: HashSet<String> =
+        program.modules.iter().map(|m| m.name.clone()).collect();
+
+    // 3. Flatten recursively
+    let mut root_program = Program {
+        uses: Vec::new(),
+        modules: Vec::new(), // modules are flattened
+        funcs: Vec::new(),
+        structs: Vec::new(),
+        enums: Vec::new(),
+        traits: Vec::new(),
+        impls: Vec::new(),
+        type_aliases: Vec::new(),
+    };
+
+    flatten_module(program, vec![], &mut root_program, &top_level_modules);
+
+    root_program
+}
+
+#[cfg(test)]
+mod project_tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_ulang_toml() {
+        let toml_content = r#"
+            [package]
+            name = "my_project"
+
+            [profile.dev]
+            opt-level = "none"
+
+            [profile.release]
+            opt-level = 3
+
+            [build]
+            cc = "clang"
+        "#;
+        let config: UlangToml = toml::from_str(toml_content).unwrap();
+        assert_eq!(config.package.name, "my_project");
+        assert!(matches!(config.profile.dev.opt_level, OptLevel::None));
+        assert!(matches!(
+            config.profile.release.opt_level,
+            OptLevel::Aggressive
+        ));
+        assert_eq!(config.build.cc, Some(Cc::Clang));
+    }
+
+    #[test]
+    fn test_parse_ulang_toml_defaults() {
+        let toml_content = r#"
+            [package]
+            name = "test_defaults"
+        "#;
+        let config: UlangToml = toml::from_str(toml_content).unwrap();
+        assert_eq!(config.package.name, "test_defaults");
+        assert_eq!(config.build.cc, None);
+        assert!(matches!(config.profile.dev.opt_level, OptLevel::None));
+        assert!(matches!(
+            config.profile.release.opt_level,
+            OptLevel::Aggressive
+        ));
     }
 }

@@ -4655,10 +4655,7 @@ impl<'ctx> CodeGen<'ctx> {
 
                 let cond_type = self.expr_type(cond);
                 if cond_type != Type::Bool {
-                    return Err(format!(
-                        "if condition must be bool, found {:?}",
-                        cond_type
-                    ));
+                    return Err(format!("if condition must be bool, found {:?}", cond_type));
                 }
                 let cond_val = self.compile_expr(cond)?;
                 let cond_i1 = match cond_val {
@@ -6902,7 +6899,8 @@ mod tests {
     fn test_jit_else_if_block_shadowing_restores_outer() {
         // Shadowing in else-if block
         assert_eq!(
-            jit("fn main() -> i32 { let x = 1; if false { } else if true { let x = 4; }; x }").unwrap(),
+            jit("fn main() -> i32 { let x = 1; if false { } else if true { let x = 4; }; x }")
+                .unwrap(),
             1
         );
     }

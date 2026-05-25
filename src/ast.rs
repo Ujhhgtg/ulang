@@ -10,8 +10,17 @@ pub struct Attribute {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
+pub struct ModuleDecl {
+    pub name: String,
+    pub body: Option<Program>,
+    pub span: Span,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
 pub struct Program {
     pub uses: Vec<Use>,
+    pub modules: Vec<ModuleDecl>,
     pub funcs: Vec<Function>,
     pub structs: Vec<StructDecl>,
     pub enums: Vec<EnumDecl>,

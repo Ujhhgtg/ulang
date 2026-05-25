@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::{
-    Attribute, BinOp, Block, EnumDecl, EnumVariant, Expr, Function, ImplDecl, MatchArm, Param,
-    Pattern, Program, Stmt, StructDecl, StructField, TraitDecl, TraitMethodDef, Type,
+    Attribute, BinOp, Block, EnumDecl, EnumVariant, Expr, Function, ImplDecl, MatchArm, ModuleDecl,
+    Param, Pattern, Program, Stmt, StructDecl, StructField, TraitDecl, TraitMethodDef, Type,
     TypeAliasDecl, Use,
 };
 use crate::token::{Span, Token};
@@ -39,6 +39,7 @@ impl<'a> Parser<'a> {
 
     pub fn parse_program(&mut self) -> Result<Program, ParseError> {
         let mut uses = Vec::new();
+        let mut modules = Vec::new();
         let mut funcs = Vec::new();
         let mut structs = Vec::new();
         let mut enums = Vec::new();
@@ -53,6 +54,9 @@ impl<'a> Parser<'a> {
                 Token::Eof => break,
                 Token::Use => {
                     uses.push(self.parse_use_decl()?);
+                }
+                Token::Mod => {
+                    modules.push(self.parse_mod_decl()?);
                 }
                 Token::Extern => {
                     self.parse_extern_block(&mut funcs)?;
@@ -126,6 +130,7 @@ impl<'a> Parser<'a> {
 
         let mut program = Program {
             uses,
+            modules,
             funcs,
             structs,
             enums,
@@ -137,6 +142,113 @@ impl<'a> Parser<'a> {
         self.resolve_type_aliases(&mut program)?;
 
         Ok(program)
+    }
+
+    fn parse_mod_decl(&mut self) -> Result<ModuleDecl, ParseError> {
+        let lo = self.current_span_lo();
+        self.expect(&Token::Mod)?;
+        let name = match self.peek_token() {
+            Token::Ident(s) => {
+                let s = s.clone();
+                self.advance();
+                s
+            }
+            _ => {
+                let default = (Token::Eof, Span::empty(0));
+                let (_, span) = self.current().unwrap_or(&default);
+                return Err(ParseError {
+                    span: *span,
+                    msg: "expected module name".to_string(),
+                });
+            }
+        };
+
+        if *self.peek_token() == Token::Semicolon {
+            self.advance(); // consume ';'
+            let hi = self.last_span_end();
+            return Ok(ModuleDecl {
+                name,
+                body: None,
+                span: Span::new(lo, hi),
+            });
+        }
+
+        self.expect(&Token::LBrace)?;
+        // Parse the body as a separate sub-program
+        let mut uses = Vec::new();
+        let mut modules = Vec::new();
+        let mut funcs = Vec::new();
+        let mut structs = Vec::new();
+        let mut enums = Vec::new();
+        let mut traits = Vec::new();
+        let mut impls = Vec::new();
+        let mut type_aliases = Vec::new();
+
+        while *self.peek_token() != Token::RBrace && *self.peek_token() != Token::Eof {
+            let attribs = self.parse_attrs()?;
+            match self.peek_token() {
+                Token::Use => {
+                    uses.push(self.parse_use_decl()?);
+                }
+                Token::Mod => {
+                    modules.push(self.parse_mod_decl()?);
+                }
+                Token::Extern => {
+                    self.parse_extern_block(&mut funcs)?;
+                }
+                Token::Enum => {
+                    let decl = self.parse_enum_decl(attribs)?;
+                    self.enum_names.insert(decl.name.clone());
+                    enums.push(decl);
+                }
+                Token::Struct => {
+                    let decl = self.parse_struct_decl(attribs)?;
+                    self.struct_defs
+                        .insert(decl.name.clone(), decl.fields.clone());
+                    self.struct_names.insert(decl.name.clone());
+                    structs.push(decl);
+                }
+                Token::Impl => {
+                    impls.push(self.parse_impl_decl()?);
+                }
+                Token::Trait => {
+                    traits.push(self.parse_trait_decl()?);
+                }
+                Token::Type => {
+                    let decl = self.parse_type_alias()?;
+                    let params = decl.type_params.clone();
+                    let aliased = decl.aliased_type.clone();
+                    self.type_aliases
+                        .insert(decl.name.clone(), (params, aliased));
+                    type_aliases.push(decl);
+                }
+                _ => {
+                    funcs.push(self.parse_function(attribs)?);
+                }
+            }
+        }
+
+        self.expect(&Token::RBrace)?;
+        let hi = self.last_span_end();
+
+        let mut program = Program {
+            uses,
+            modules,
+            funcs,
+            structs,
+            enums,
+            traits,
+            impls,
+            type_aliases,
+        };
+
+        self.resolve_type_aliases(&mut program)?;
+
+        Ok(ModuleDecl {
+            name,
+            body: Some(program),
+            span: Span::new(lo, hi),
+        })
     }
 
     fn parse_attrs(&mut self) -> Result<Vec<Attribute>, ParseError> {
@@ -1364,9 +1476,29 @@ impl<'a> Parser<'a> {
             Token::Str => Ok(Type::Str),
             Token::SelfType => Ok(Type::SelfType),
             Token::Ident(name) => {
+                let mut path = vec![name];
+                while *self.peek_token() == Token::DoubleColon {
+                    self.advance(); // consume ::
+                    match self.peek_token() {
+                        Token::Ident(s) => {
+                            path.push(s.clone());
+                            self.advance();
+                        }
+                        _ => {
+                            let default = (Token::Eof, Span::empty(0));
+                            let (_, span) = self.current().unwrap_or(&default);
+                            return Err(ParseError {
+                                span: *span,
+                                msg: "expected identifier after '::'".to_string(),
+                            });
+                        }
+                    }
+                }
+                let full_name = path.join("::");
+
                 // Check for generic args: name < type, type, ... >
                 if *self.peek_token() == Token::Lt {
-                    if self.type_aliases.contains_key(&name) {
+                    if self.type_aliases.contains_key(&full_name) {
                         self.advance(); // consume <
                         let mut args = Vec::new();
                         loop {
@@ -1378,7 +1510,7 @@ impl<'a> Parser<'a> {
                             }
                         }
                         self.expect(&Token::Gt)?;
-                        return Ok(Type::Alias(name, args));
+                        return Ok(Type::Alias(full_name, args));
                     } else {
                         // Assume generic struct (or will be resolved later via stdlib imports)
                         self.advance(); // consume <
@@ -1392,10 +1524,10 @@ impl<'a> Parser<'a> {
                             }
                         }
                         self.expect(&Token::Gt)?;
-                        return Ok(Type::GenericInstance(name, args));
+                        return Ok(Type::GenericInstance(full_name, args));
                     }
                 }
-                Ok(Type::Struct(name))
+                Ok(Type::Struct(full_name))
             }
             Token::Bang => Ok(Type::Never),
             _ => {
@@ -1647,91 +1779,110 @@ impl<'a> Parser<'a> {
             Token::Ident(name) => {
                 let name = name.clone();
                 self.advance();
-                // Check for struct literal: Name { field: expr, ... }
-                if *self.peek_token() == Token::LBrace && !self.suppress_struct_lit {
-                    return self.parse_struct_lit(&name);
-                }
-                // Check for qualified path: ident :: ident
-                if *self.peek_token() == Token::DoubleColon {
+                let mut path = vec![name];
+                while *self.peek_token() == Token::DoubleColon {
                     self.advance(); // consume ::
-                    let variant_or_fn = match self.peek_token() {
+                    match self.peek_token() {
                         Token::Ident(s) => {
-                            let s = s.clone();
+                            path.push(s.clone());
                             self.advance();
-                            s
                         }
                         _ => {
-                            let (_, span) = self.current().unwrap();
+                            let default = (Token::Eof, Span::empty(0));
+                            let (_, span) = self.current().unwrap_or(&default);
                             return Err(ParseError {
                                 span: *span,
                                 msg: "expected identifier after '::'".to_string(),
                             });
                         }
-                    };
-                    // Disambiguate enum lit vs qualified call:
-                    // Enum variants are PascalCase, functions/modules are snake_case.
-                    let is_enum_variant = variant_or_fn
+                    }
+                }
+
+                if path.len() > 1 {
+                    let last_segment = path.last().unwrap().clone();
+                    let prefix_segments = path[0..path.len() - 1].to_vec();
+                    let prefix_str = prefix_segments.join("::");
+
+                    let is_enum_variant = last_segment
                         .chars()
                         .next()
                         .map(|c| c.is_uppercase())
                         .unwrap_or(false);
-                    // If followed by `(`, check if it's an enum literal or qualified call
+
+                    // Check for qualified struct literal: prefix::Struct { ... }
+                    if *self.peek_token() == Token::LBrace && !self.suppress_struct_lit {
+                        let full_struct_name = path.join("::");
+                        return self.parse_struct_lit(&full_struct_name);
+                    }
+
                     if *self.peek_token() == Token::LParen {
                         if is_enum_variant {
                             self.advance(); // consume '('
                             if *self.peek_token() == Token::RParen {
-                                // Empty parens → unit variant with no payload
                                 self.advance(); // consume ')'
                                 return Ok(Expr::EnumLit {
-                                    enum_name: name,
-                                    variant: variant_or_fn,
+                                    enum_name: prefix_str,
+                                    variant: last_segment,
                                     payload: None,
                                 });
                             }
                             let inner = self.parse_expr()?;
                             self.expect(&Token::RParen)?;
                             return Ok(Expr::EnumLit {
-                                enum_name: name,
-                                variant: variant_or_fn,
+                                enum_name: prefix_str,
+                                variant: last_segment,
                                 payload: Some(Box::new(inner)),
                             });
                         } else {
                             let args = self.parse_call_args()?;
                             return Ok(Expr::QualifiedCall {
-                                module: name,
-                                callee: variant_or_fn,
+                                module: prefix_str,
+                                callee: last_segment,
                                 args,
                             });
                         }
                     } else {
-                        // No parens → unit enum variant (if PascalCase) or forward reference
-                        // Always treat as enum lit; codegen will error if name is not an enum.
-                        return Ok(Expr::EnumLit {
-                            enum_name: name,
-                            variant: variant_or_fn,
-                            payload: None,
+                        if is_enum_variant {
+                            return Ok(Expr::EnumLit {
+                                enum_name: prefix_str,
+                                variant: last_segment,
+                                payload: None,
+                            });
+                        } else {
+                            return Ok(Expr::QualifiedCall {
+                                module: prefix_str,
+                                callee: last_segment,
+                                args: vec![],
+                            });
+                        }
+                    }
+                } else {
+                    // path.len() == 1
+                    let single_name = path[0].clone();
+                    if *self.peek_token() == Token::LBrace && !self.suppress_struct_lit {
+                        return self.parse_struct_lit(&single_name);
+                    }
+                    if *self.peek_token() == Token::LParen {
+                        let args = self.parse_call_args()?;
+                        return Ok(Expr::Call {
+                            callee: single_name,
+                            args,
                         });
                     }
+                    if self.struct_names.contains(&single_name)
+                        && self
+                            .struct_defs
+                            .get(&single_name)
+                            .map(|f| f.is_empty())
+                            .unwrap_or(false)
+                    {
+                        return Ok(Expr::StructLit {
+                            struct_name: single_name,
+                            fields: vec![],
+                        });
+                    }
+                    return Ok(Expr::Ident(single_name));
                 }
-                // Check for function call: ident ( ... )
-                if *self.peek_token() == Token::LParen {
-                    let args = self.parse_call_args()?;
-                    return Ok(Expr::Call { callee: name, args });
-                }
-                // Check for unit struct literal: struct name used as value
-                if self.struct_names.contains(&name)
-                    && self
-                        .struct_defs
-                        .get(&name)
-                        .map(|f| f.is_empty())
-                        .unwrap_or(false)
-                {
-                    return Ok(Expr::StructLit {
-                        struct_name: name,
-                        fields: vec![],
-                    });
-                }
-                Ok(Expr::Ident(name))
             }
             Token::LBracket => {
                 self.advance(); // consume [
@@ -2016,24 +2167,31 @@ impl<'a> Parser<'a> {
 
     /// Continue parsing a pattern after seeing an identifier.
     fn parse_pattern_ident_rest(&mut self, name: String) -> Result<Pattern, ParseError> {
-        // Check for `::` — qualified enum variant: `Option::Some(x)`
+        // Check for `::` — qualified enum variant: `Option::Some(x)` or `a::b::Option::Some(x)`
         if *self.peek_token() == Token::DoubleColon {
-            self.advance();
-            let variant = match self.peek_token() {
-                Token::Ident(s) => {
-                    let s = s.clone();
-                    self.advance();
-                    s
+            let mut path = vec![name];
+            while *self.peek_token() == Token::DoubleColon {
+                self.advance();
+                match self.peek_token() {
+                    Token::Ident(s) => {
+                        path.push(s.clone());
+                        self.advance();
+                    }
+                    _ => {
+                        let default = (Token::Eof, Span::empty(0));
+                        let (_, span) = self.current().unwrap_or(&default);
+                        return Err(ParseError {
+                            span: *span,
+                            msg: "expected identifier after '::'".to_string(),
+                        });
+                    }
                 }
-                _ => {
-                    let default = (Token::Eof, Span::empty(0));
-                    let (_, span) = self.current().unwrap_or(&default);
-                    return Err(ParseError {
-                        span: *span,
-                        msg: "expected variant name after '::'".to_string(),
-                    });
-                }
-            };
+            }
+
+            let variant = path.last().unwrap().clone();
+            let prefix_segments = path[0..path.len() - 1].to_vec();
+            let prefix_str = prefix_segments.join("::");
+
             let payload = if *self.peek_token() == Token::LParen {
                 self.advance();
                 if *self.peek_token() == Token::RParen {
@@ -2048,7 +2206,7 @@ impl<'a> Parser<'a> {
                 None
             };
             return Ok(Pattern::EnumVariant {
-                enum_name: Some(name),
+                enum_name: Some(prefix_str),
                 variant,
                 payload,
             });
@@ -2174,6 +2332,13 @@ impl<'a> Parser<'a> {
                 &alias_defs,
                 &mut HashSet::new(),
             )?;
+        }
+
+        // Also resolve in nested sub-modules
+        for m in &mut program.modules {
+            if let Some(ref mut body) = m.body {
+                self.resolve_type_aliases(body)?;
+            }
         }
 
         Ok(())

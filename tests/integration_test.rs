@@ -439,6 +439,33 @@ fn test_option_stdlib() {
 }
 
 #[test]
+fn test_option_expect_some() {
+    assert!(run_test(
+        "option_expect_some",
+        r#"use std::option::Option;
+        fn main() -> i32 {
+            let opt = Option::Some(42);
+            if opt.expect("should be some") == 42 {
+                return 0;
+            };
+            return 1;
+        }"#
+    ));
+}
+
+#[test]
+fn test_option_expect_none() {
+    assert!(run_test_expect_error(
+        "option_expect_none",
+        r#"use std::option::Option;
+        fn main() {
+            let opt: Option<i32> = Option::None;
+            opt.expect("custom panic message");
+        }"#
+    ));
+}
+
+#[test]
 fn test_result_stdlib() {
     assert!(run_test(
         "result_test",

@@ -16,6 +16,57 @@ struct DocumentState {
     last_valid_program: Option<Program>,
 }
 
+struct StdlibEntry {
+    source: String,
+    program: Program,
+}
+
+struct StdlibCache {
+    entries: Vec<(Url, StdlibEntry)>,
+}
+
+fn load_stdlib_cache() -> StdlibCache {
+    let mut entries = Vec::new();
+    let stdlib_dir = find_stdlib_dir();
+    if let Ok(dir) = std::fs::read_dir(&stdlib_dir) {
+        for entry in dir.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "u")
+                && let Ok(src) = std::fs::read_to_string(&path)
+            {
+                let mut lexer = Lexer::new(&src);
+                let mut tokens = Vec::new();
+                loop {
+                    match lexer.next_token() {
+                        Ok((token, span)) => {
+                            tokens.push((token, span));
+                            if let Token::Eof = tokens.last().unwrap().0 {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                if !tokens.is_empty() && matches!(tokens.last().unwrap().0, Token::Eof) {
+                    let mut parser = Parser::new(&tokens);
+                    if let Ok(program) = parser.parse_program()
+                        && let Ok(url) = Url::from_file_path(&path)
+                    {
+                        entries.push((
+                            url,
+                            StdlibEntry {
+                                source: src,
+                                program,
+                            },
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    StdlibCache { entries }
+}
+
 fn offset_to_position(source: &str, offset: usize) -> Position {
     let mut line = 0;
     let mut col_utf16 = 0;
@@ -269,19 +320,15 @@ fn get_hover_text_recursive(program: &Program, name: &str) -> Option<String> {
     // 7. Search modules
     if let Some(m) = program.modules.iter().find(|md| md.name == name) {
         let pub_str = if m.is_pub { "pub " } else { "" };
-        return Some(format!(
-            "```rust\n{}mod {};\n```",
-            pub_str,
-            name
-        ));
+        return Some(format!("```rust\n{}mod {};\n```", pub_str, name));
     }
 
     // 8. Recursively search inside submodules
     for m in &program.modules {
-        if let Some(ref body) = m.body {
-            if let Some(res) = get_hover_text_recursive(body, name) {
-                return Some(res);
-            }
+        if let Some(ref body) = m.body
+            && let Some(res) = get_hover_text_recursive(body, name)
+        {
+            return Some(res);
         }
     }
 
@@ -298,18 +345,18 @@ fn find_definition_span(tokens: &[(Token, Span)], name: &str, hover_offset: usiz
         while i > 0 {
             i -= 1;
             if i + 1 < tokens.len() {
-                if let Token::Ident(ref id) = tokens[i].0 {
-                    if id == name {
-                        if i > 0 && (tokens[i - 1].0 == Token::Let || tokens[i - 1].0 == Token::Mut)
-                        {
-                            return Some(tokens[i].1);
-                        }
-                    }
+                if let Token::Ident(ref id) = tokens[i].0
+                    && id == name
+                    && i > 0
+                    && (tokens[i - 1].0 == Token::Let || tokens[i - 1].0 == Token::Mut)
+                {
+                    return Some(tokens[i].1);
                 }
-                if let Token::Ident(ref id) = tokens[i + 1].0 {
-                    if id == name && tokens[i].0 == Token::Let {
-                        return Some(tokens[i + 1].1);
-                    }
+                if let Token::Ident(ref id) = tokens[i + 1].0
+                    && id == name
+                    && tokens[i].0 == Token::Let
+                {
+                    return Some(tokens[i + 1].1);
                 }
             }
             if tokens[i].0 == Token::Fn {
@@ -324,12 +371,11 @@ fn find_definition_span(tokens: &[(Token, Span)], name: &str, hover_offset: usiz
                         in_params = true;
                     } else if tokens[j].0 == Token::RParen {
                         break;
-                    } else if in_params {
-                        if let Token::Ident(ref id) = tokens[j].0 {
-                            if id == name {
-                                return Some(tokens[j].1);
-                            }
-                        }
+                    } else if in_params
+                        && let Token::Ident(ref id) = tokens[j].0
+                        && id == name
+                    {
+                        return Some(tokens[j].1);
                     }
                     j += 1;
                 }
@@ -343,12 +389,11 @@ fn find_definition_span(tokens: &[(Token, Span)], name: &str, hover_offset: usiz
     while i < tokens.len() {
         match &tokens[i].0 {
             Token::Fn | Token::Struct | Token::Enum | Token::Trait | Token::Type | Token::Mod => {
-                if i + 1 < tokens.len() {
-                    if let Token::Ident(ref id) = tokens[i + 1].0 {
-                        if id == name {
-                            return Some(tokens[i + 1].1);
-                        }
-                    }
+                if i + 1 < tokens.len()
+                    && let Token::Ident(ref id) = tokens[i + 1].0
+                    && id == name
+                {
+                    return Some(tokens[i + 1].1);
                 }
             }
             _ => {}
@@ -474,7 +519,11 @@ fn publish_diagnostics(
     Ok(())
 }
 
-fn handle_hover(documents: &HashMap<Url, DocumentState>, params: HoverParams) -> Option<Hover> {
+fn handle_hover(
+    documents: &HashMap<Url, DocumentState>,
+    stdlib_cache: &StdlibCache,
+    params: HoverParams,
+) -> Option<Hover> {
     let url = params.text_document_position_params.text_document.uri;
     let doc = documents.get(&url)?;
     let position = params.text_document_position_params.position;
@@ -518,6 +567,20 @@ fn handle_hover(documents: &HashMap<Url, DocumentState>, params: HoverParams) ->
                 )),
             });
         }
+
+        // Fallback: search stdlib cache
+        if let Some(stdlib_text) = get_hover_text_from_stdlib(stdlib_cache, name) {
+            return Some(Hover {
+                contents: HoverContents::Markup(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value: stdlib_text,
+                }),
+                range: Some(Range::new(
+                    offset_to_position(&doc.source, hovered_token.1.lo),
+                    offset_to_position(&doc.source, hovered_token.1.hi),
+                )),
+            });
+        }
     }
 
     None
@@ -541,8 +604,48 @@ fn find_stdlib_dir() -> std::path::PathBuf {
     std::path::PathBuf::from("stdlib")
 }
 
+/// Search for a definition in the stdlib cache.
+fn find_stdlib_definition(cache: &StdlibCache, name: &str) -> Option<(Url, Range)> {
+    for (url, entry) in &cache.entries {
+        if get_hover_text_from_program(&entry.program, name).is_some() {
+            // Token-based search for exact span
+            let mut lexer = Lexer::new(&entry.source);
+            let mut tokens = Vec::new();
+            loop {
+                match lexer.next_token() {
+                    Ok((token, span)) => {
+                        tokens.push((token, span));
+                        if let Token::Eof = tokens.last().unwrap().0 {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            if let Some(def_span) = find_definition_span(&tokens, name, 0) {
+                let start = offset_to_position(&entry.source, def_span.lo);
+                let end = offset_to_position(&entry.source, def_span.hi);
+                let range = Range::new(start, end);
+                return Some((url.clone(), range));
+            }
+        }
+    }
+    None
+}
+
+/// Search for hover text in the stdlib cache.
+fn get_hover_text_from_stdlib(cache: &StdlibCache, name: &str) -> Option<String> {
+    for (_, entry) in &cache.entries {
+        if let Some(text) = get_hover_text_recursive(&entry.program, name) {
+            return Some(text);
+        }
+    }
+    None
+}
+
 fn handle_definition(
     documents: &HashMap<Url, DocumentState>,
+    stdlib_cache: &StdlibCache,
     params: GotoDefinitionParams,
 ) -> Option<GotoDefinitionResponse> {
     let url = params.text_document_position_params.text_document.uri;
@@ -577,37 +680,11 @@ fn handle_definition(
             return Some(GotoDefinitionResponse::Scalar(Location::new(url, range)));
         }
 
-        // Fallback: Search the standard library
-        let stdlib_dir = find_stdlib_dir();
-        if let Ok(entries) = std::fs::read_dir(&stdlib_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().is_some_and(|e| e == "u") {
-                    if let Ok(src) = std::fs::read_to_string(&path) {
-                        let mut l = Lexer::new(&src);
-                        let mut t = Vec::new();
-                        loop {
-                            match l.next_token() {
-                                Ok((tok, span)) => {
-                                    t.push((tok, span));
-                                    if let Token::Eof = t.last().unwrap().0 {
-                                        break;
-                                    }
-                                }
-                                Err(_) => break,
-                            }
-                        }
-                        if let Some(def_span) = find_definition_span(&t, name, 0) {
-                            if let Ok(file_url) = Url::from_file_path(&path) {
-                                let start = offset_to_position(&src, def_span.lo);
-                                let end = offset_to_position(&src, def_span.hi);
-                                let range = Range::new(start, end);
-                                return Some(GotoDefinitionResponse::Scalar(Location::new(file_url, range)));
-                            }
-                        }
-                    }
-                }
-            }
+        // Fallback: Search the standard library cache
+        if let Some((file_url, range)) = find_stdlib_definition(stdlib_cache, name) {
+            return Some(GotoDefinitionResponse::Scalar(Location::new(
+                file_url, range,
+            )));
         }
     }
 
@@ -636,7 +713,10 @@ where
         .map_err(|e| format!("failed to extract notification: {:?}", e).into())
 }
 
-fn main_loop(connection: Connection) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn main_loop(
+    connection: Connection,
+    stdlib_cache: StdlibCache,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut documents: HashMap<Url, DocumentState> = HashMap::new();
 
     for msg in &connection.receiver {
@@ -648,7 +728,7 @@ fn main_loop(connection: Connection) -> Result<(), Box<dyn std::error::Error + S
                 match req.method.as_str() {
                     "textDocument/hover" => {
                         let (id, params) = cast_request::<lsp_types::request::HoverRequest>(req)?;
-                        let response = handle_hover(&documents, params);
+                        let response = handle_hover(&documents, &stdlib_cache, params);
                         let result = serde_json::to_value(&response)?;
                         connection
                             .sender
@@ -656,7 +736,7 @@ fn main_loop(connection: Connection) -> Result<(), Box<dyn std::error::Error + S
                     }
                     "textDocument/definition" => {
                         let (id, params) = cast_request::<lsp_types::request::GotoDefinition>(req)?;
-                        let response = handle_definition(&documents, params);
+                        let response = handle_definition(&documents, &stdlib_cache, params);
                         let result = serde_json::to_value(&response)?;
                         connection
                             .sender
@@ -712,7 +792,13 @@ pub fn run_server() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let initialization_params = connection.initialize(server_capabilities)?;
     let _params: InitializeParams = serde_json::from_value(initialization_params)?;
 
-    main_loop(connection)?;
+    let stdlib_cache = load_stdlib_cache();
+    eprintln!(
+        "ulang lsp server loaded {} stdlib modules",
+        stdlib_cache.entries.len()
+    );
+
+    main_loop(connection, stdlib_cache)?;
     io_threads.join()?;
 
     eprintln!("ulang lsp server stopped successfully");
@@ -827,5 +913,217 @@ mod tests {
         // 2. Check definition span for single extern
         let def_span = find_definition_span(&tokens, "fork", 0);
         assert!(def_span.is_some());
+    }
+
+    #[test]
+    fn test_find_definition_span_method_in_impl() {
+        // Method definitions inside impl blocks must be discoverable
+        let src = r#"
+            struct Foo { x: i32 }
+            impl Foo {
+                pub fn bar(&self) -> i32 { self.x }
+                fn baz(&self) -> i32 { self.x }
+            }
+        "#;
+        let mut tokens = Vec::new();
+        let mut lexer = Lexer::new(src);
+        loop {
+            let (t, s) = lexer.next_token().unwrap();
+            tokens.push((t, s));
+            if tokens.last().unwrap().0 == Token::Eof {
+                break;
+            }
+        }
+
+        // Find method 'bar' inside impl block
+        let span_bar = find_definition_span(&tokens, "bar", 0);
+        assert!(
+            span_bar.is_some(),
+            "should find 'bar' method definition inside impl"
+        );
+
+        // Find method 'baz' inside impl block (no pub)
+        let span_baz = find_definition_span(&tokens, "baz", 0);
+        assert!(
+            span_baz.is_some(),
+            "should find 'baz' method definition inside impl"
+        );
+
+        // Find struct 'Foo' definition alongside impl
+        let span_foo = find_definition_span(&tokens, "Foo", 0);
+        assert!(span_foo.is_some(), "should find 'Foo' struct definition");
+    }
+
+    #[test]
+    fn test_find_definition_span_backward_search_local_var() {
+        // Local backward search for let-binding
+        let src = "fn main() { let x = 42; let y = x; }";
+        let mut tokens = Vec::new();
+        let mut lexer = Lexer::new(src);
+        loop {
+            let (t, s) = lexer.next_token().unwrap();
+            tokens.push((t, s));
+            if tokens.last().unwrap().0 == Token::Eof {
+                break;
+            }
+        }
+
+        // Hover over the second 'x' (the usage) and find its let-binding definition
+        let second_x_offset = tokens
+            .iter()
+            .rposition(|(tok, _)| matches!(tok, Token::Ident(id) if id == "x"))
+            .map(|i| tokens[i].1.lo)
+            .unwrap_or(0);
+
+        let def_span = find_definition_span(&tokens, "x", second_x_offset);
+        assert!(
+            def_span.is_some(),
+            "should find 'x' let-binding definition from usage"
+        );
+    }
+
+    #[test]
+    fn test_stdlib_cache_loads_modules() {
+        // Load stdlib cache from the actual filesystem
+        let cache = load_stdlib_cache();
+        // At minimum we should have the stdlib modules we know about
+        assert!(
+            !cache.entries.is_empty(),
+            "stdlib cache should have entries"
+        );
+
+        // Verify we get expected modules by checking hover text
+        // io.u should export `print` and `println`
+        let print_hover = get_hover_text_from_stdlib(&cache, "print");
+        assert!(print_hover.is_some(), "should find 'print' in stdlib");
+        let print_text = print_hover.unwrap();
+        assert!(
+            print_text.contains("fn print"),
+            "hover for print should be a function"
+        );
+
+        // option.u should export `Option` enum
+        let option_hover = get_hover_text_from_stdlib(&cache, "Option");
+        assert!(option_hover.is_some(), "should find 'Option' in stdlib");
+        let option_text = option_hover.unwrap();
+        assert!(
+            option_text.contains("enum Option"),
+            "hover for Option should be an enum"
+        );
+
+        // panic.u should export `panic` function
+        let panic_hover = get_hover_text_from_stdlib(&cache, "panic");
+        assert!(panic_hover.is_some(), "should find 'panic' in stdlib");
+        let panic_text = panic_hover.unwrap();
+        assert!(
+            panic_text.contains("fn panic"),
+            "hover for panic should be a function"
+        );
+
+        // alloc.u should export `malloc`, `free`, `realloc`, `memcpy`
+        let malloc_hover = get_hover_text_from_stdlib(&cache, "malloc");
+        assert!(malloc_hover.is_some(), "should find 'malloc' in stdlib");
+        assert!(malloc_hover.unwrap().contains("fn malloc"));
+
+        let free_hover = get_hover_text_from_stdlib(&cache, "free");
+        assert!(free_hover.is_some(), "should find 'free' in stdlib");
+        assert!(free_hover.unwrap().contains("fn free"));
+
+        // process.u should export `exit`, `Command`
+        let exit_hover = get_hover_text_from_stdlib(&cache, "exit");
+        assert!(exit_hover.is_some(), "should find 'exit' in stdlib");
+
+        let command_hover = get_hover_text_from_stdlib(&cache, "Command");
+        assert!(command_hover.is_some(), "should find 'Command' in stdlib");
+    }
+
+    #[test]
+    fn test_stdlib_definition_find_function() {
+        // Verify we can find a definition span in stdlib for a function
+        let cache = load_stdlib_cache();
+
+        // Try to find definition of 'print' in stdlib
+        let def = find_stdlib_definition(&cache, "print");
+        assert!(
+            def.is_some(),
+            "should find definition for 'print' in stdlib"
+        );
+
+        let (url, range) = def.unwrap();
+        // The URL should point to io.u
+        let path = url.to_file_path().unwrap();
+        assert!(
+            path.to_string_lossy().contains("io.u"),
+            "print definition should be in io.u, got {:?}",
+            path
+        );
+        // Range should be meaningful (non-zero)
+        assert!(
+            range.start.line > 0 || range.start.character > 0 || range.end.line > 0,
+            "definition range should be non-trivial"
+        );
+
+        // Find definition of 'Option' enum
+        let option_def = find_stdlib_definition(&cache, "Option");
+        assert!(
+            option_def.is_some(),
+            "should find definition for 'Option' in stdlib"
+        );
+        let (opt_url, _) = option_def.unwrap();
+        let opt_path = opt_url.to_file_path().unwrap();
+        assert!(
+            opt_path.to_string_lossy().contains("option.u"),
+            "Option definition should be in option.u, got {:?}",
+            opt_path
+        );
+
+        // Find definition of 'malloc' which is extern "C"
+        let malloc_def = find_stdlib_definition(&cache, "malloc");
+        assert!(
+            malloc_def.is_some(),
+            "should find definition for 'malloc' in stdlib"
+        );
+        let (m_url, _) = malloc_def.unwrap();
+        let m_path = m_url.to_file_path().unwrap();
+        assert!(
+            m_path.to_string_lossy().contains("alloc.u"),
+            "malloc definition should be in alloc.u, got {:?}",
+            m_path
+        );
+    }
+
+    #[test]
+    fn test_stdlib_definition_method_in_impl() {
+        // Methods inside impl blocks should be findable via stdlib search
+        let cache = load_stdlib_cache();
+
+        // Option::unwrap is defined inside impl<T> Option<T> { ... }
+        let unwrap_def = find_stdlib_definition(&cache, "unwrap");
+        assert!(
+            unwrap_def.is_some(),
+            "should find 'unwrap' method inside impl block in stdlib"
+        );
+
+        let (url, _) = unwrap_def.unwrap();
+        let path = url.to_file_path().unwrap();
+        assert!(
+            path.to_string_lossy().contains("option.u"),
+            "unwrap definition should be in option.u, got {:?}",
+            path
+        );
+
+        // Vec::push is defined inside impl<T> Vec<T> { ... }
+        let push_def = find_stdlib_definition(&cache, "push");
+        assert!(
+            push_def.is_some(),
+            "should find 'push' method inside impl block in stdlib"
+        );
+        let (push_url, _) = push_def.unwrap();
+        let push_path = push_url.to_file_path().unwrap();
+        assert!(
+            push_path.to_string_lossy().contains("vec.u"),
+            "push definition should be in vec.u, got {:?}",
+            push_path
+        );
     }
 }

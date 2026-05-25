@@ -35,4 +35,13 @@ impl<T> Option<T> {
             Option::None => default,
         }
     }
+
+    pub fn expect(&self, msg: &str) -> T {
+        match *self {
+            Option::Some(val) => val,
+            Option::None => {
+                panic(msg);
+            }
+        }
+    }
 }

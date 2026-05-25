@@ -126,6 +126,10 @@ cargo test -- jit
 cargo test --test integration_test
 ```
 
+### Clippy
+
+- When `cargo clippy` reports auto-fixable warnings, run `cargo clippy --fix --bin ulang -- -W clippy::all` to apply them immediately. Do not hand-fix clippy suggestions.
+
 ### Notes
 
 - Codegen tests require LLVM 22 (via `inkwell` JIT) and are excluded from `cargo check`.

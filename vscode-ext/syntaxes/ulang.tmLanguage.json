@@ -6,40 +6,109 @@
       "include": "#comments"
     },
     {
+      "include": "#attributes"
+    },
+    {
       "include": "#keywords"
+    },
+    {
+      "include": "#preprocessor"
     },
     {
       "include": "#strings"
     },
     {
+      "include": "#chars"
+    },
+    {
       "include": "#numbers"
     },
     {
+      "include": "#operators"
+    },
+    {
+      "include": "#punctuation"
+    },
+    {
       "include": "#types"
+    },
+    {
+      "include": "#underscore"
     }
   ],
   "repository": {
     "comments": {
       "patterns": [
         {
+          "name": "comment.line.documentation.u",
+          "match": "///.*$"
+        },
+        {
           "name": "comment.line.double-slash.u",
           "match": "//.*$"
+        }
+      ]
+    },
+    "attributes": {
+      "patterns": [
+        {
+          "name": "meta.attribute.u",
+          "begin": "#\\[",
+          "end": "\\]",
+          "patterns": [
+            {
+              "name": "keyword.control.attribute.u",
+              "match": "\\b(allow|allow_dead_code|derive|inline|no_mangle|repr|must_use)\\b"
+            },
+            {
+              "name": "string.quoted.double.u",
+              "match": "\"[^\"]*\""
+            }
+          ]
         }
       ]
     },
     "keywords": {
       "patterns": [
         {
-          "name": "keyword.control.u",
-          "match": "\\b(if|else|while|loop|return|match|use|mod|extern|pub|const|as|crate)\\b"
+          "name": "keyword.declaration.u",
+          "match": "\\b(fn|let|mut|const|static|pub|use|mod|extern|as|crate|type|struct|enum|trait|impl|self|Self)\\b"
         },
         {
-          "name": "keyword.other.u",
-          "match": "\\b(let|mut|fn|struct|enum|impl|trait|type|self)\\b"
+          "name": "keyword.control.u",
+          "match": "\\b(if|else|while|loop|for|in|return|match|break|continue)\\b"
+        },
+        {
+          "name": "keyword.operator.u",
+          "match": "\\b(as)\\b"
         },
         {
           "name": "constant.language.boolean.u",
           "match": "\\b(true|false)\\b"
+        }
+      ]
+    },
+    "preprocessor": {
+      "patterns": [
+        {
+          "name": "keyword.control.import.u",
+          "begin": "\\b(use)\\b",
+          "beginCaptures": {
+            "1": {
+              "name": "keyword.declaration.u"
+            }
+          },
+          "end": ";",
+          "patterns": [
+            {
+              "name": "entity.name.namespace.u",
+              "match": "\\b(std)\\b"
+            },
+            {
+              "name": "punctuation.separator.path.u",
+              "match": "::"
+            }
+          ]
         }
       ]
     },
@@ -52,7 +121,26 @@
           "patterns": [
             {
               "name": "constant.character.escape.u",
-              "match": "\\\\."
+              "match": "\\\\[nrt0\\\\\"']"
+            },
+            {
+              "name": "constant.character.escape.hex.u",
+              "match": "\\\\x[0-9a-fA-F]{2}"
+            }
+          ]
+        }
+      ]
+    },
+    "chars": {
+      "patterns": [
+        {
+          "name": "string.quoted.single.u",
+          "begin": "'",
+          "end": "'",
+          "patterns": [
+            {
+              "name": "constant.character.escape.u",
+              "match": "\\\\[nrt0\\\\\"']"
             }
           ]
         }
@@ -61,20 +149,116 @@
     "numbers": {
       "patterns": [
         {
+          "name": "constant.numeric.float.u",
+          "match": "\\b[0-9]+\\.[0-9]+(f32|f64)\\b"
+        },
+        {
           "name": "constant.numeric.integer.u",
-          "match": "\\b[0-9]+(i32|i64|u8|u32|u64|usize)?\\b"
+          "match": "\\b[0-9]+(i8|i16|i32|i64|u8|u16|u32|u64|usize|isize)\\b"
         },
         {
           "name": "constant.numeric.float.u",
-          "match": "\\b[0-9]+\\.[0-9]+(f32|f64)?\\b"
+          "match": "\\b[0-9]+\\.[0-9]+\\b"
+        },
+        {
+          "name": "constant.numeric.integer.u",
+          "match": "\\b[0-9]+\\b"
+        }
+      ]
+    },
+    "operators": {
+      "patterns": [
+        {
+          "name": "keyword.operator.arithmetic.u",
+          "match": "[+\\-*/%]"
+        },
+        {
+          "name": "keyword.operator.comparison.u",
+          "match": "==|!=|<=|>=|<|>"
+        },
+        {
+          "name": "keyword.operator.logical.u",
+          "match": "&&|\\|\\||!"
+        },
+        {
+          "name": "keyword.operator.assignment.u",
+          "match": "="
+        },
+        {
+          "name": "keyword.operator.arrow.u",
+          "match": "->|=>"
+        },
+        {
+          "name": "keyword.operator.address.u",
+          "match": "&"
+        },
+        {
+          "name": "keyword.operator.dereference.u",
+          "match": "\\*"
+        }
+      ]
+    },
+    "punctuation": {
+      "patterns": [
+        {
+          "name": "punctuation.separator.path.u",
+          "match": "::"
+        },
+        {
+          "name": "punctuation.separator.pipe.u",
+          "match": "\\|"
+        },
+        {
+          "name": "punctuation.separator.comma.u",
+          "match": ","
+        },
+        {
+          "name": "punctuation.separator.semicolon.u",
+          "match": ";"
+        },
+        {
+          "name": "punctuation.separator.colon.u",
+          "match": ":"
+        },
+        {
+          "name": "punctuation.brace.round.u",
+          "match": "[()]"
+        },
+        {
+          "name": "punctuation.brace.curly.u",
+          "match": "[{}]"
+        },
+        {
+          "name": "punctuation.brace.square.u",
+          "match": "[\\[\\]]"
+        },
+        {
+          "name": "punctuation.separator.dot.u",
+          "match": "\\."
+        },
+        {
+          "name": "punctuation.separator.ellipsis.u",
+          "match": "\\.\\.\\."
         }
       ]
     },
     "types": {
       "patterns": [
         {
-          "name": "entity.name.type.u",
-          "match": "\\b(i8|i16|i32|i64|u8|u16|u32|u64|usize|isize|f32|f64|bool|str)\\b"
+          "name": "storage.type.primitive.u",
+          "match": "\\b(i8|i16|i32|i64|u8|u16|u32|u64|usize|isize|f32|f64|bool|str|!)\\b"
+        },
+        {
+          "name": "entity.name.type.self.u",
+          "match": "\\bSelf\\b"
+        }
+      ]
+    },
+    "underscore": {
+      "patterns": [
+        {
+          "name": "keyword.other.underscore.u",
+          "match": "_"
         }
       ]
     }

@@ -13,7 +13,9 @@ use std::fs;
 use std::path::Path;
 use std::process;
 
-use crate::ast::{EnumDecl, Function, ImplDecl, Program, StructDecl, TraitDecl, Type, TypeAliasDecl};
+use crate::ast::{
+    EnumDecl, Function, ImplDecl, Program, StructDecl, TraitDecl, Type, TypeAliasDecl,
+};
 
 type OverloadMap = HashMap<String, Vec<(String, Vec<Type>)>>;
 use crate::token::{Span, Token};
@@ -778,7 +780,8 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
                 );
 
                 // Process duplicates and build overload map for this module
-                let (module_funcs, module_overloads) = process_stdlib_functions(stdlib_prog.funcs.clone());
+                let (module_funcs, module_overloads) =
+                    process_stdlib_functions(stdlib_prog.funcs.clone());
 
                 let prefix = if !use_decl.module_path.is_empty() {
                     format!("{}::", use_decl.module_path.join("::"))
@@ -897,7 +900,9 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
                         }
                         // Recursively import struct dependencies (e.g., String depends on Vec)
                         let mut dep_stack: Vec<String> = Vec::new();
-                        if let Some(decl) = stdlib_prog.structs.iter().find(|s| s.name == *target_name) {
+                        if let Some(decl) =
+                            stdlib_prog.structs.iter().find(|s| s.name == *target_name)
+                        {
                             for field in &decl.fields {
                                 dep_stack.extend(collect_struct_deps(&field.ty));
                             }
@@ -1068,7 +1073,7 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
                                 new_func.name = mangled_name.clone();
                                 new_func.is_pub = use_decl.is_pub;
                                 all_funcs.insert(mangled_name, new_func);
-                                
+
                                 let qualified_mangled = format!("{}::{}", module_name, func.name);
                                 all_funcs.entry(qualified_mangled).or_insert(func.clone());
                             }
@@ -1106,7 +1111,8 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
                             }
                             if let Some(mod_name) = canonical_struct_sources.get(struct_name)
                                 && let Some(prog) = all_stdlib_progs.get(mod_name)
-                                && let Some(decl) = prog.structs.iter().find(|s| &s.name == struct_name)
+                                && let Some(decl) =
+                                    prog.structs.iter().find(|s| &s.name == struct_name)
                             {
                                 all_structs
                                     .entry(struct_name.clone())
@@ -1141,10 +1147,10 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
                                 new_func.name = new_name.clone();
                                 new_func.is_pub = use_decl.is_pub;
                                 all_funcs.insert(new_name, new_func);
-                                
+
                                 let qualified_name = format!("{}::{}", module_name, target_name);
                                 all_funcs.entry(qualified_name).or_insert(func.clone());
-                                
+
                                 for other in &module_funcs {
                                     if other.name != *target_name
                                         && other.is_extern
@@ -1198,7 +1204,10 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
                 };
 
                 let has_overloads = all_overloads.contains_key(&source_name);
-                let has_funcs = all_funcs.contains_key(&source_name) || all_funcs.keys().any(|k| k.starts_with(&format!("{}$", source_name)));
+                let has_funcs = all_funcs.contains_key(&source_name)
+                    || all_funcs
+                        .keys()
+                        .any(|k| k.starts_with(&format!("{}$", source_name)));
                 let has_structs = all_structs.contains_key(&source_name);
                 let has_enums = all_enums.contains_key(&source_name);
                 let has_traits = all_traits.contains_key(&source_name);
@@ -1220,7 +1229,7 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
                         let new_list: Vec<(String, Vec<Type>)> = overloads_list
                             .iter()
                             .map(|(mangled, params)| {
-                                let suffix = mangled.split('$').last().unwrap();
+                                let suffix = mangled.split('$').next_back().unwrap();
                                 let new_mangled = format!("{}${}", imported_name, suffix);
                                 (new_mangled, params.clone())
                             })
@@ -1229,7 +1238,7 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
 
                         for (mangled, _) in &overloads_list {
                             if let Some(func) = all_funcs.get(mangled).cloned() {
-                                let suffix = mangled.split('$').last().unwrap();
+                                let suffix = mangled.split('$').next_back().unwrap();
                                 let new_mangled = format!("{}${}", imported_name, suffix);
                                 let mut new_func = func;
                                 new_func.name = new_mangled.clone();

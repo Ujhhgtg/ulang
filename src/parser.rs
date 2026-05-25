@@ -60,7 +60,11 @@ impl<'a> Parser<'a> {
                 Token::Eof => {
                     if is_pub {
                         return Err(ParseError {
-                            span: self.tokens.get(self.pos).map(|(_, s)| *s).unwrap_or_else(|| Span::empty(self.last_span_end())),
+                            span: self
+                                .tokens
+                                .get(self.pos)
+                                .map(|(_, s)| *s)
+                                .unwrap_or_else(|| Span::empty(self.last_span_end())),
                             msg: "expected declaration after 'pub'".to_string(),
                         });
                     }
@@ -116,8 +120,13 @@ impl<'a> Parser<'a> {
                 Token::Impl => {
                     if is_pub {
                         return Err(ParseError {
-                            span: self.tokens.get(self.pos).map(|(_, s)| *s).unwrap_or_else(|| Span::empty(self.last_span_end())),
-                            msg: "visibility modifiers cannot be applied to `impl` blocks".to_string(),
+                            span: self
+                                .tokens
+                                .get(self.pos)
+                                .map(|(_, s)| *s)
+                                .unwrap_or_else(|| Span::empty(self.last_span_end())),
+                            msg: "visibility modifiers cannot be applied to `impl` blocks"
+                                .to_string(),
                         });
                     }
                     impls.push(self.parse_impl_decl()?);
@@ -251,8 +260,13 @@ impl<'a> Parser<'a> {
                 Token::Impl => {
                     if is_nested_pub {
                         return Err(ParseError {
-                            span: self.tokens.get(self.pos).map(|(_, s)| *s).unwrap_or_else(|| Span::empty(self.last_span_end())),
-                            msg: "visibility modifiers cannot be applied to `impl` blocks".to_string(),
+                            span: self
+                                .tokens
+                                .get(self.pos)
+                                .map(|(_, s)| *s)
+                                .unwrap_or_else(|| Span::empty(self.last_span_end())),
+                            msg: "visibility modifiers cannot be applied to `impl` blocks"
+                                .to_string(),
                         });
                     }
                     impls.push(self.parse_impl_decl()?);
@@ -448,7 +462,8 @@ impl<'a> Parser<'a> {
                 let (_, span) = self.current().unwrap_or(&default);
                 return Err(ParseError {
                     span: *span,
-                    msg: "visibility modifiers cannot be applied to `extern` blocks directly".to_string(),
+                    msg: "visibility modifiers cannot be applied to `extern` blocks directly"
+                        .to_string(),
                 });
             }
             self.expect(&Token::LBrace)?;
@@ -1006,7 +1021,8 @@ impl<'a> Parser<'a> {
                 let (_, span) = self.current().unwrap_or(&default);
                 return Err(ParseError {
                     span: *span,
-                    msg: "variadic parameters '...' are only allowed in extern declarations".to_string(),
+                    msg: "variadic parameters '...' are only allowed in extern declarations"
+                        .to_string(),
                 });
             }
             return Ok(params);
@@ -1021,7 +1037,8 @@ impl<'a> Parser<'a> {
                     let (_, span) = self.current().unwrap_or(&default);
                     return Err(ParseError {
                         span: *span,
-                        msg: "variadic parameters '...' are only allowed in extern declarations".to_string(),
+                        msg: "variadic parameters '...' are only allowed in extern declarations"
+                            .to_string(),
                     });
                 }
                 break;
@@ -1949,32 +1966,32 @@ impl<'a> Parser<'a> {
                             }
                             let inner = self.parse_expr()?;
                             self.expect(&Token::RParen)?;
-                            return Ok(Expr::EnumLit {
+                            Ok(Expr::EnumLit {
                                 enum_name: prefix_str,
                                 variant: last_segment,
                                 payload: Some(Box::new(inner)),
-                            });
+                            })
                         } else {
                             let args = self.parse_call_args()?;
-                            return Ok(Expr::QualifiedCall {
+                            Ok(Expr::QualifiedCall {
                                 module: prefix_str,
                                 callee: last_segment,
                                 args,
-                            });
+                            })
                         }
                     } else {
                         if is_enum_variant {
-                            return Ok(Expr::EnumLit {
+                            Ok(Expr::EnumLit {
                                 enum_name: prefix_str,
                                 variant: last_segment,
                                 payload: None,
-                            });
+                            })
                         } else {
-                            return Ok(Expr::QualifiedCall {
+                            Ok(Expr::QualifiedCall {
                                 module: prefix_str,
                                 callee: last_segment,
                                 args: vec![],
-                            });
+                            })
                         }
                     }
                 } else {
@@ -2002,7 +2019,7 @@ impl<'a> Parser<'a> {
                             fields: vec![],
                         });
                     }
-                    return Ok(Expr::Ident(single_name));
+                    Ok(Expr::Ident(single_name))
                 }
             }
             Token::LBracket => {
@@ -3099,12 +3116,20 @@ mod tests {
         // 2. Failure in standard functions
         let res1 = parse("fn my_printf(fmt: *const u8, ...) {}");
         assert!(res1.is_err());
-        assert!(res1.unwrap_err().msg.contains("variadic parameters '...' are only allowed in extern declarations"));
+        assert!(
+            res1.unwrap_err()
+                .msg
+                .contains("variadic parameters '...' are only allowed in extern declarations")
+        );
 
         // 3. Failure in trait methods
         let res2 = parse("trait MyTrait { fn my_printf(fmt: *const u8, ...); }");
         assert!(res2.is_err());
-        assert!(res2.unwrap_err().msg.contains("variadic parameters '...' are only allowed in extern declarations"));
+        assert!(
+            res2.unwrap_err()
+                .msg
+                .contains("variadic parameters '...' are only allowed in extern declarations")
+        );
     }
 
     #[test]

@@ -159,33 +159,33 @@ impl<'ctx> CodeGen<'ctx> {
 
     fn get_module_path_for_item_name(&self, name: &str) -> Vec<String> {
         let mut clean_name = name.to_string();
-        if clean_name.starts_with("__trait_") {
-            if let Some(idx) = clean_name.strip_prefix("__trait_") {
-                let parts: Vec<&str> = idx.split('_').collect();
-                if parts.len() >= 2 {
-                    let mut underscore_count = 0;
-                    let mut start_idx = 0;
-                    for (i, c) in name.char_indices() {
-                        if c == '_' {
-                            underscore_count += 1;
-                            if underscore_count == 4 {
-                                start_idx = i + 1;
-                                break;
-                            }
+        if clean_name.starts_with("__trait_")
+            && let Some(idx) = clean_name.strip_prefix("__trait_")
+        {
+            let parts: Vec<&str> = idx.split('_').collect();
+            if parts.len() >= 2 {
+                let mut underscore_count = 0;
+                let mut start_idx = 0;
+                for (i, c) in name.char_indices() {
+                    if c == '_' {
+                        underscore_count += 1;
+                        if underscore_count == 4 {
+                            start_idx = i + 1;
+                            break;
                         }
                     }
-                    if start_idx > 0 {
-                        clean_name = name[start_idx..].to_string();
-                    }
+                }
+                if start_idx > 0 {
+                    clean_name = name[start_idx..].to_string();
                 }
             }
         }
-        
+
         let mut segs: Vec<String> = clean_name.split("::").map(|s| s.to_string()).collect();
         if segs.is_empty() {
             return Vec::new();
         }
-        
+
         if let Some(last) = segs.last_mut() {
             if let Some(idx) = last.find('/') {
                 *last = last[..idx].to_string();
@@ -194,15 +194,15 @@ impl<'ctx> CodeGen<'ctx> {
                 *last = last[..idx].to_string();
             }
         }
-        
+
         for (i, seg) in segs.iter().enumerate() {
-            if let Some(c) = seg.chars().next() {
-                if c.is_uppercase() {
-                    return segs[0..i].to_vec();
-                }
+            if let Some(c) = seg.chars().next()
+                && c.is_uppercase()
+            {
+                return segs[0..i].to_vec();
             }
         }
-        
+
         if segs.len() > 1 {
             segs[0..segs.len() - 1].to_vec()
         } else {
@@ -210,9 +210,14 @@ impl<'ctx> CodeGen<'ctx> {
         }
     }
 
-    fn check_visibility_of_path(&self, caller_path: &[String], target_name: &str) -> Result<(), String> {
+    fn check_visibility_of_path(
+        &self,
+        caller_path: &[String],
+        target_name: &str,
+    ) -> Result<(), String> {
         let target_def_path = self.get_module_path_for_item_name(target_name);
-        let is_descendant = caller_path.len() >= target_def_path.len() && &caller_path[0..target_def_path.len()] == target_def_path;
+        let is_descendant = caller_path.len() >= target_def_path.len()
+            && caller_path[0..target_def_path.len()] == target_def_path;
         if is_descendant {
             return Ok(());
         }
@@ -221,11 +226,18 @@ impl<'ctx> CodeGen<'ctx> {
         } else {
             target_name
         };
-        let is_pub = self.visibility_map.get(base_target_name).copied()
+        let is_pub = self
+            .visibility_map
+            .get(base_target_name)
+            .copied()
             .or_else(|| self.visibility_map.get(target_name).copied())
             .unwrap_or(true);
         if !is_pub {
-            return Err(format!("error: '{}' is private and cannot be accessed from module '{}'", target_name, caller_path.join("::")));
+            return Err(format!(
+                "error: '{}' is private and cannot be accessed from module '{}'",
+                target_name,
+                caller_path.join("::")
+            ));
         }
         Ok(())
     }
@@ -263,9 +275,15 @@ impl<'ctx> CodeGen<'ctx> {
         Ok(())
     }
 
-    fn check_field_visibility(&self, caller_path: &[String], struct_name: &str, field_name: &str) -> Result<(), String> {
+    fn check_field_visibility(
+        &self,
+        caller_path: &[String],
+        struct_name: &str,
+        field_name: &str,
+    ) -> Result<(), String> {
         let target_def_path = self.get_module_path_for_item_name(struct_name);
-        let is_descendant = caller_path.len() >= target_def_path.len() && &caller_path[0..target_def_path.len()] == target_def_path;
+        let is_descendant = caller_path.len() >= target_def_path.len()
+            && caller_path[0..target_def_path.len()] == target_def_path;
         if is_descendant {
             return Ok(());
         }
@@ -275,21 +293,35 @@ impl<'ctx> CodeGen<'ctx> {
             true
         };
         if !is_pub {
-            return Err(format!("error: field '{}' of struct '{}' is private and cannot be accessed from module '{}'", field_name, struct_name, caller_path.join("::")));
+            return Err(format!(
+                "error: field '{}' of struct '{}' is private and cannot be accessed from module '{}'",
+                field_name,
+                struct_name,
+                caller_path.join("::")
+            ));
         }
         Ok(())
     }
 
-    fn check_struct_literal_construction(&self, caller_path: &[String], struct_name: &str) -> Result<(), String> {
+    fn check_struct_literal_construction(
+        &self,
+        caller_path: &[String],
+        struct_name: &str,
+    ) -> Result<(), String> {
         let target_def_path = self.get_module_path_for_item_name(struct_name);
-        let is_descendant = caller_path.len() >= target_def_path.len() && &caller_path[0..target_def_path.len()] == target_def_path;
+        let is_descendant = caller_path.len() >= target_def_path.len()
+            && caller_path[0..target_def_path.len()] == target_def_path;
         if is_descendant {
             return Ok(());
         }
         if let Some(fields) = self.field_visibility_map.get(struct_name) {
-            for (_, &is_pub) in fields {
+            for &is_pub in fields.values() {
                 if !is_pub {
-                    return Err(format!("error: cannot construct struct '{}' with private fields from module '{}'", struct_name, caller_path.join("::")));
+                    return Err(format!(
+                        "error: cannot construct struct '{}' with private fields from module '{}'",
+                        struct_name,
+                        caller_path.join("::")
+                    ));
                 }
             }
         }
@@ -2035,7 +2067,8 @@ impl<'ctx> CodeGen<'ctx> {
 
             // Inherit visibility for monomorphized struct
             if let Some(base_decl) = self.generic_struct_defs.get(base_name) {
-                self.visibility_map.insert(mangled.clone(), base_decl.is_pub);
+                self.visibility_map
+                    .insert(mangled.clone(), base_decl.is_pub);
                 let mut field_map = HashMap::new();
                 for field in &base_decl.fields {
                     field_map.insert(field.name.clone(), field.is_pub);
@@ -2077,7 +2110,8 @@ impl<'ctx> CodeGen<'ctx> {
 
             // Inherit visibility for monomorphized enum
             if let Some(base_decl) = self.generic_enum_defs.get(base_name) {
-                self.visibility_map.insert(mangled.clone(), base_decl.is_pub);
+                self.visibility_map
+                    .insert(mangled.clone(), base_decl.is_pub);
             }
 
             // Register concrete enum in enum_defs for variant lookup
@@ -2161,7 +2195,8 @@ impl<'ctx> CodeGen<'ctx> {
             for field in &decl.fields {
                 field_map.insert(field.name.clone(), field.is_pub);
             }
-            self.field_visibility_map.insert(decl.name.clone(), field_map);
+            self.field_visibility_map
+                .insert(decl.name.clone(), field_map);
         }
         for decl in &program.enums {
             self.visibility_map.insert(decl.name.clone(), decl.is_pub);
@@ -3795,7 +3830,11 @@ impl<'ctx> CodeGen<'ctx> {
                     };
 
                     if let Some(field_name) = field {
-                        self.check_field_visibility(&self.current_module_path, &struct_name, field_name)?;
+                        self.check_field_visibility(
+                            &self.current_module_path,
+                            &struct_name,
+                            field_name,
+                        )?;
                     }
 
                     let field_idx = if let Some(field_name) = field {
@@ -4418,7 +4457,11 @@ impl<'ctx> CodeGen<'ctx> {
                                 }
                             };
                             if let Some(field_name) = field {
-                                self.check_field_visibility(&self.current_module_path, &struct_name, field_name)?;
+                                self.check_field_visibility(
+                                    &self.current_module_path,
+                                    &struct_name,
+                                    field_name,
+                                )?;
                             }
                             let fields = self
                                 .struct_fields

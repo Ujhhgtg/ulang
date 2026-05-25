@@ -1734,17 +1734,20 @@ impl<'ctx> CodeGen<'ctx> {
                 enum_name, payload, ..
             } => {
                 if one_param_enums.contains(enum_name)
-                    && let Some(payload_expr) = payload {
-                        let payload_ty = Self::literal_type(payload_expr);
-                        // Only for primitive payloads (skip type params like T)
-                        if Self::is_concrete_type(&payload_ty) {
-                            let key =
-                                Self::mangle_generic_instance(enum_name, std::slice::from_ref(&payload_ty));
-                            if seen.insert(key) {
-                                instances.push((enum_name.clone(), vec![payload_ty]));
-                            }
+                    && let Some(payload_expr) = payload
+                {
+                    let payload_ty = Self::literal_type(payload_expr);
+                    // Only for primitive payloads (skip type params like T)
+                    if Self::is_concrete_type(&payload_ty) {
+                        let key = Self::mangle_generic_instance(
+                            enum_name,
+                            std::slice::from_ref(&payload_ty),
+                        );
+                        if seen.insert(key) {
+                            instances.push((enum_name.clone(), vec![payload_ty]));
                         }
                     }
+                }
             }
             Expr::If {
                 cond,
@@ -2518,9 +2521,10 @@ impl<'ctx> CodeGen<'ctx> {
                     qualified_name
                 };
                 if let Some(methods) = self.impl_methods.get(module)
-                    && let Some((_, mangled)) = methods.iter().find(|(name, _)| name == callee) {
-                        name = mangled.clone();
-                    }
+                    && let Some((_, mangled)) = methods.iter().find(|(name, _)| name == callee)
+                {
+                    name = mangled.clone();
+                }
                 self.fn_return_types
                     .get(&name)
                     .cloned()
@@ -3758,10 +3762,10 @@ impl<'ctx> CodeGen<'ctx> {
                 // If not resolved directly, try looking up in impl_methods
                 if resolved_fn_val.is_none()
                     && let Some(methods) = self.impl_methods.get(module)
-                        && let Some((_, mangled)) = methods.iter().find(|(name, _)| name == callee)
-                        {
-                            resolved_fn_val = self.module.get_function(mangled);
-                        }
+                    && let Some((_, mangled)) = methods.iter().find(|(name, _)| name == callee)
+                {
+                    resolved_fn_val = self.module.get_function(mangled);
+                }
 
                 let fn_val = resolved_fn_val
                     .ok_or_else(|| format!("unknown function '{}'", qualified_name))?;
@@ -4965,11 +4969,12 @@ impl<'ctx> CodeGen<'ctx> {
         // === Else block ===
         self.builder.position_at_end(else_bb);
         if let Some(el_block) = else_block
-            && let Some(val) = self.compile_block_get_value(el_block)? {
-                self.builder
-                    .build_store(result_alloca, val)
-                    .map_err(|e| format!("failed to store if_let else result: {}", e))?;
-            }
+            && let Some(val) = self.compile_block_get_value(el_block)?
+        {
+            self.builder
+                .build_store(result_alloca, val)
+                .map_err(|e| format!("failed to store if_let else result: {}", e))?;
+        }
         if self
             .builder
             .get_insert_block()

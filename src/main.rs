@@ -2,6 +2,7 @@ mod ast;
 mod codegen;
 mod error;
 mod lexer;
+mod lsp;
 mod parser;
 mod token;
 
@@ -150,6 +151,8 @@ enum Command {
         #[arg(long = "cc", default_value_t = Cc::Gcc, value_parser = parse_cc)]
         cc: Cc,
     },
+    /// Start the language server (LSP)
+    Lsp,
 }
 
 enum Mode {
@@ -823,6 +826,14 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
 fn main() {
     let cli = Cli::parse();
 
+    if let Command::Lsp = cli.command {
+        if let Err(e) = lsp::run_server() {
+            eprintln!("LSP server error: {}", e);
+            process::exit(1);
+        }
+        return;
+    }
+
     let (mode, path) = match cli.command {
         Command::Run { file, opt } => (Mode::Run { opt }, file),
         Command::Build {
@@ -837,6 +848,7 @@ fn main() {
             opt,
             cc,
         } => (Mode::BuildRun { output, opt, cc }, file),
+        Command::Lsp => unreachable!(),
     };
 
     let source = fs::read_to_string(&path).unwrap_or_else(|e| {

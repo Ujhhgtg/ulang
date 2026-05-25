@@ -382,6 +382,18 @@ impl<'a> Parser<'a> {
         } else {
             Vec::new()
         };
+        // Support unit-like struct syntax: `struct Name;` (no fields)
+        if *self.peek_token() == Token::Semicolon {
+            self.advance();
+            let hi = self.last_span_end();
+            return Ok(StructDecl {
+                name,
+                fields: Vec::new(),
+                type_params,
+                attribs,
+                span: Span::new(lo, hi),
+            });
+        }
         self.expect(&Token::LBrace)?;
         // ... rest of the fields parsing
         let mut fields = Vec::new();
@@ -1213,6 +1225,11 @@ impl<'a> Parser<'a> {
             let expr = self.parse_prefix()?;
             return Ok(Expr::UnaryNot(Box::new(expr)));
         }
+        if *self.peek_token() == Token::Minus {
+            self.advance(); // consume -
+            let expr = self.parse_prefix()?;
+            return Ok(Expr::UnaryMinus(Box::new(expr)));
+        }
         self.parse_postfix()
     }
 
@@ -1700,6 +1717,19 @@ impl<'a> Parser<'a> {
                 if *self.peek_token() == Token::LParen {
                     let args = self.parse_call_args()?;
                     return Ok(Expr::Call { callee: name, args });
+                }
+                // Check for unit struct literal: struct name used as value
+                if self.struct_names.contains(&name)
+                    && self
+                        .struct_defs
+                        .get(&name)
+                        .map(|f| f.is_empty())
+                        .unwrap_or(false)
+                {
+                    return Ok(Expr::StructLit {
+                        struct_name: name,
+                        fields: vec![],
+                    });
                 }
                 Ok(Expr::Ident(name))
             }
@@ -3297,6 +3327,33 @@ mod tests {
         assert_eq!(prog.structs[0].fields[0].ty, Type::I32);
         assert_eq!(prog.structs[0].fields[1].name, "y");
         assert_eq!(prog.structs[0].fields[1].ty, Type::I32);
+    }
+
+    #[test]
+    fn test_struct_decl_unit_semicolon() {
+        let prog = parse("struct Empty;\nfn main() {}").unwrap();
+        assert_eq!(prog.structs.len(), 1);
+        assert_eq!(prog.structs[0].name, "Empty");
+        assert!(prog.structs[0].fields.is_empty());
+    }
+
+    #[test]
+    fn test_struct_unit_literal() {
+        let prog = parse("struct Empty;\nfn main() { let e = Empty; }").unwrap();
+        assert_eq!(prog.structs.len(), 1);
+        match &prog.funcs[0].body.stmts[0] {
+            Stmt::Let { init, .. } => match init {
+                Expr::StructLit {
+                    struct_name,
+                    fields,
+                } => {
+                    assert_eq!(struct_name, "Empty");
+                    assert!(fields.is_empty());
+                }
+                _ => panic!("expected StructLit"),
+            },
+            _ => panic!("expected Let"),
+        }
     }
 
     #[test]

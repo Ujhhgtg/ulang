@@ -140,6 +140,7 @@ pub enum Expr {
         is_mut: bool,
     },
     UnaryNot(Box<Expr>),
+    UnaryMinus(Box<Expr>),
     Deref(Box<Expr>),
     Cast {
         expr: Box<Expr>,

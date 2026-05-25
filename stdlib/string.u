@@ -22,7 +22,9 @@ impl String {
     }
 
     fn len(&self) -> usize { self.len }
+
     fn capacity(&self) -> usize { self.cap }
+    
     fn is_empty(&self) -> bool { self.len == 0 }
 
     fn clear(&mut self) {

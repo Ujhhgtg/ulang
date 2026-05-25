@@ -161,19 +161,19 @@ impl Command {
             _Exit(127);
         };
         if pid < 0 {
-            return 0 - 1;
+            return -1;
         };
         let mut status_val = 0;
         let wait_res = waitpid(pid, &mut status_val, 0);
         if wait_res < 0 {
-            return 0 - 1;
+            return -1;
         };
         let mod_128 = status_val - (status_val / 128) * 128;
         if mod_128 == 0 {
             let div = status_val / 256;
             return div - (div / 256) * 256;
         };
-        0 - 1
+        -1
     }
 
     fn drop(&mut self) {

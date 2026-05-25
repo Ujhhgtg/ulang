@@ -258,8 +258,6 @@ impl<'ctx> CodeGen<'ctx> {
                     .push(("clone".to_string(), fn_name));
             }
 
-            // Copy — marker, no functions
-
             // Eq::eq — returns bool (i1)
             {
                 let fn_name = format!("__builtin_Eq_eq_{}", ty_name);
@@ -601,7 +599,7 @@ impl<'ctx> CodeGen<'ctx> {
             }
 
             // Register in trait_impls
-            let mut traits: HashSet<String> = ["Default", "Clone", "Copy", "Eq", "Ord"]
+            let mut traits: HashSet<String> = ["Default", "Clone", "Eq", "Ord"]
                 .iter()
                 .map(|s| s.to_string())
                 .collect();
@@ -703,9 +701,6 @@ impl<'ctx> CodeGen<'ctx> {
         match trait_name {
             "Default" => self.generate_derive_default(decl)?,
             "Clone" => self.generate_derive_clone(decl)?,
-            "Copy" => {
-                // Marker trait — just register
-            }
             "Eq" => self.generate_derive_eq(decl)?,
             "Ord" => self.generate_derive_ord(decl, "Ord", "cmp")?,
             _ => {
@@ -1338,6 +1333,9 @@ impl<'ctx> CodeGen<'ctx> {
                 Self::m_substitute_types_in_expr(rhs, params, args);
             }
             Expr::UnaryNot(inner) => {
+                Self::m_substitute_types_in_expr(inner, params, args);
+            }
+            Expr::UnaryMinus(inner) => {
                 Self::m_substitute_types_in_expr(inner, params, args);
             }
             Expr::If {
@@ -2015,6 +2013,8 @@ impl<'ctx> CodeGen<'ctx> {
                 };
                 let mut method_func = method.clone();
                 method_func.name = mangled_name.clone();
+                let self_type = Type::Struct(type_name.clone());
+                Self::resolve_self_type(&mut method_func, &self_type);
                 self.declare_function(&method_func)?;
                 self.impl_methods
                     .entry(type_name.clone())
@@ -2639,6 +2639,8 @@ impl<'ctx> CodeGen<'ctx> {
                 inner: Box::new(self.expr_type(inner)),
                 is_mut: *is_mut,
             },
+            Expr::UnaryNot(inner) => self.expr_type(inner),
+            Expr::UnaryMinus(inner) => self.expr_type(inner),
             Expr::Tuple(elems) => Type::Tuple(elems.iter().map(|e| self.expr_type(e)).collect()),
             _ => Self::literal_type(expr),
         }
@@ -2665,6 +2667,8 @@ impl<'ctx> CodeGen<'ctx> {
                     _ => Type::I32,
                 }
             }
+            Expr::UnaryMinus(expr) => Self::literal_type(expr),
+            Expr::UnaryNot(expr) => Self::literal_type(expr),
             Expr::Assign { value, .. } => Self::literal_type(value),
             Expr::Cast { to_type, .. } => to_type.clone(),
             Expr::Tuple(elems) => Type::Tuple(elems.iter().map(Self::literal_type).collect()),
@@ -3180,11 +3184,13 @@ impl<'ctx> CodeGen<'ctx> {
 
             // Compile the elif body
             self.builder.position_at_end(then_bb);
+            let saved_symbols = self.symbols.clone();
             if let Some(val) = self.compile_block_get_value(elif_body)? {
                 self.builder
                     .build_store(result_alloca, val)
                     .map_err(|e| format!("failed to store elif result: {}", e))?;
             }
+            self.symbols = saved_symbols;
             let then_terminated = self
                 .builder
                 .get_insert_block()
@@ -3207,12 +3213,14 @@ impl<'ctx> CodeGen<'ctx> {
                 result_alloca,
                 _result_type,
             )?;
-        } else if let Some(el_block) = else_block
-            && let Some(val) = self.compile_block_get_value(el_block)?
-        {
-            self.builder
-                .build_store(result_alloca, val)
-                .map_err(|e| format!("failed to store else result: {}", e))?;
+        } else if let Some(el_block) = else_block {
+            let saved_symbols = self.symbols.clone();
+            if let Some(val) = self.compile_block_get_value(el_block)? {
+                self.builder
+                    .build_store(result_alloca, val)
+                    .map_err(|e| format!("failed to store else result: {}", e))?;
+            }
+            self.symbols = saved_symbols;
         }
         Ok(())
     }
@@ -4583,19 +4591,18 @@ impl<'ctx> CodeGen<'ctx> {
                     .get_parent()
                     .unwrap();
 
+                let cond_type = self.expr_type(cond);
+                if cond_type != Type::Bool {
+                    return Err(format!(
+                        "if condition must be bool, found {:?}",
+                        cond_type
+                    ));
+                }
                 let cond_val = self.compile_expr(cond)?;
                 let cond_i1 = match cond_val {
-                    BasicValueEnum::IntValue(v) => {
-                        if v.get_type().get_bit_width() != 1 {
-                            self.builder
-                                .build_int_truncate(v, self.bool_type, "cond_i1")
-                                .map_err(|e| format!("failed to trunc condition to i1: {}", e))?
-                        } else {
-                            v
-                        }
-                    }
+                    BasicValueEnum::IntValue(v) => v,
                     _ => {
-                        return Err("if condition must be a boolean or integer".to_string());
+                        return Err("if condition must be a boolean".to_string());
                     }
                 };
 
@@ -4633,11 +4640,13 @@ impl<'ctx> CodeGen<'ctx> {
 
                 // Compile then block
                 self.builder.position_at_end(then_bb);
+                let saved_symbols = self.symbols.clone();
                 if let Some(then_val) = self.compile_block_get_value(then_block)? {
                     self.builder
                         .build_store(result_alloca, then_val)
                         .map_err(|e| format!("failed to store then result: {}", e))?;
                 }
+                self.symbols = saved_symbols;
                 let then_terminated = self
                     .builder
                     .get_insert_block()
@@ -4696,7 +4705,9 @@ impl<'ctx> CodeGen<'ctx> {
                     .map_err(|e| format!("failed to branch to loop header: {}", e))?;
 
                 self.builder.position_at_end(header_bb);
+                let saved_symbols = self.symbols.clone();
                 self.compile_block_get_value(body)?;
+                self.symbols = saved_symbols;
 
                 // Branch back to header
                 let terminated = self
@@ -4736,19 +4747,18 @@ impl<'ctx> CodeGen<'ctx> {
 
                 // Condition block
                 self.builder.position_at_end(cond_bb);
+                let cond_type = self.expr_type(cond);
+                if cond_type != Type::Bool {
+                    return Err(format!(
+                        "while condition must be bool, found {:?}",
+                        cond_type
+                    ));
+                }
                 let cond_val = self.compile_expr(cond)?;
                 let cond_i1 = match cond_val {
-                    BasicValueEnum::IntValue(v) => {
-                        if v.get_type().get_bit_width() != 1 {
-                            self.builder
-                                .build_int_truncate(v, self.bool_type, "while_cond_i1")
-                                .map_err(|e| format!("failed to trunc while cond to i1: {}", e))?
-                        } else {
-                            v
-                        }
-                    }
+                    BasicValueEnum::IntValue(v) => v,
                     _ => {
-                        return Err("while condition must be a boolean or integer".to_string());
+                        return Err("while condition must be a boolean".to_string());
                     }
                 };
                 self.builder
@@ -4757,7 +4767,9 @@ impl<'ctx> CodeGen<'ctx> {
 
                 // Body block
                 self.builder.position_at_end(body_bb);
+                let saved_symbols = self.symbols.clone();
                 self.compile_block_get_value(body)?;
+                self.symbols = saved_symbols;
                 let terminated = self
                     .builder
                     .get_insert_block()
@@ -4785,6 +4797,22 @@ impl<'ctx> CodeGen<'ctx> {
                         .map_err(|e| format!("failed to build unary not: {}", e))?
                         .into()),
                     _ => Err("unary ! requires integer operand".to_string()),
+                }
+            }
+            Expr::UnaryMinus(inner_expr) => {
+                let val = self.compile_expr(inner_expr)?;
+                match val {
+                    BasicValueEnum::IntValue(v) => Ok(self
+                        .builder
+                        .build_int_neg(v, "neg")
+                        .map_err(|e| format!("failed to build unary minus: {}", e))?
+                        .into()),
+                    BasicValueEnum::FloatValue(v) => Ok(self
+                        .builder
+                        .build_float_neg(v, "neg")
+                        .map_err(|e| format!("failed to build unary minus: {}", e))?
+                        .into()),
+                    _ => Err("unary - requires numeric operand".to_string()),
                 }
             }
             Expr::EnumLit {
@@ -4942,6 +4970,7 @@ impl<'ctx> CodeGen<'ctx> {
 
         // === Then block: bind variables, execute body ===
         self.builder.position_at_end(then_bb);
+        let saved = self.symbols.clone();
         for (name, ptr, ty) in &bindings {
             self.symbols.insert(name.clone(), (*ptr, false, ty.clone()));
         }
@@ -4950,10 +4979,7 @@ impl<'ctx> CodeGen<'ctx> {
                 .build_store(result_alloca, val)
                 .map_err(|e| format!("failed to store if_let then result: {}", e))?;
         }
-        // Remove bindings after then block (they're scoped)
-        for (name, _, _) in &bindings {
-            self.symbols.remove(name);
-        }
+        self.symbols = saved;
         if self
             .builder
             .get_insert_block()
@@ -4968,6 +4994,7 @@ impl<'ctx> CodeGen<'ctx> {
 
         // === Else block ===
         self.builder.position_at_end(else_bb);
+        let saved = self.symbols.clone();
         if let Some(el_block) = else_block
             && let Some(val) = self.compile_block_get_value(el_block)?
         {
@@ -4975,6 +5002,7 @@ impl<'ctx> CodeGen<'ctx> {
                 .build_store(result_alloca, val)
                 .map_err(|e| format!("failed to store if_let else result: {}", e))?;
         }
+        self.symbols = saved;
         if self
             .builder
             .get_insert_block()
@@ -5108,6 +5136,7 @@ impl<'ctx> CodeGen<'ctx> {
 
             // Compile arm body
             self.builder.position_at_end(body_bb);
+            let saved = self.symbols.clone();
             for (name, ptr, ty) in &bindings {
                 self.symbols.insert(name.clone(), (*ptr, false, ty.clone()));
             }
@@ -5116,9 +5145,7 @@ impl<'ctx> CodeGen<'ctx> {
                     .build_store(result_alloca, val)
                     .map_err(|e| format!("failed to store match arm result: {}", e))?;
             }
-            for (name, _, _) in &bindings {
-                self.symbols.remove(name);
-            }
+            self.symbols = saved;
             if self
                 .builder
                 .get_insert_block()
@@ -5442,6 +5469,10 @@ impl<'ctx> CodeGen<'ctx> {
             }
             Expr::Ref { .. } => {
                 Err("reference expressions are not supported in const initializers".to_string())
+            }
+            Expr::UnaryMinus(expr) => {
+                let val = self.const_eval(expr)?;
+                Ok(-val)
             }
             Expr::Deref(_) => {
                 Err("dereference expressions are not supported in const initializers".to_string())
@@ -6574,20 +6605,20 @@ mod tests {
 
     #[test]
     fn test_jit_if_as_stmt() {
-        assert_eq!(jit("fn main() { if 1 { 2 } else { 3 }; }").unwrap(), 0);
+        assert_eq!(jit("fn main() { if true { 2 } else { 3 }; }").unwrap(), 0);
     }
 
     #[test]
     fn test_jit_if_else_as_stmt() {
         // if as expression statement with ; — result discarded, main returns 0
-        assert_eq!(jit("fn main() { if 0 { 2 } else { 3 }; }").unwrap(), 0);
+        assert_eq!(jit("fn main() { if false { 2 } else { 3 }; }").unwrap(), 0);
     }
 
     #[test]
     fn test_jit_if_else_if() {
         // if as expression statement with ;
         assert_eq!(
-            jit("fn main() { if 0 { 1 } else if 1 { 2 } else { 3 }; }").unwrap(),
+            jit("fn main() { if false { 1 } else if true { 2 } else { 3 }; }").unwrap(),
             0
         );
     }
@@ -6600,7 +6631,7 @@ mod tests {
 
     #[test]
     fn test_jit_while_as_stmt() {
-        assert_eq!(jit("fn main() { while 0 { 1 } }").unwrap(), 0);
+        assert_eq!(jit("fn main() { while false { 1 } }").unwrap(), 0);
     }
 
     #[test]
@@ -6616,7 +6647,7 @@ mod tests {
     #[test]
     fn test_jit_return_in_if() {
         assert_eq!(
-            jit("fn main() -> i32 { if 1 { return 42; } else { return 0; }; 0 }").unwrap(),
+            jit("fn main() -> i32 { if true { return 42; } else { return 0; }; 0 }").unwrap(),
             42
         );
     }
@@ -6625,7 +6656,7 @@ mod tests {
     fn test_jit_while_with_if_break() {
         // while with a return inside
         assert_eq!(
-            jit("fn main() -> i32 { while 1 { return 42; } }").unwrap(),
+            jit("fn main() -> i32 { while true { return 42; } }").unwrap(),
             42
         );
     }
@@ -6634,7 +6665,7 @@ mod tests {
     fn test_jit_nested_if() {
         // nested if as expression statement with ;
         assert_eq!(
-            jit("fn main() { if 1 { if 0 { 1 } else { 2 } }; }").unwrap(),
+            jit("fn main() { if true { if false { 1 } else { 2 } }; }").unwrap(),
             0
         );
     }
@@ -6756,6 +6787,70 @@ mod tests {
         assert_eq!(
             jit(&string_prog("let s = String::new(); s.is_empty();")).unwrap(),
             0
+        );
+    }
+
+    #[test]
+    fn test_jit_same_scope_shadowing() {
+        // Same-scope shadowing: let x = 1; let x = x + 1; → x is 2
+        assert_eq!(
+            jit("fn main() -> i32 { let x = 1; let x = x + 1; x }").unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn test_jit_if_block_shadowing_restores_outer() {
+        // Nested if-block shadowing: outer x must be restored after the block
+        assert_eq!(
+            jit("fn main() -> i32 { let x = 1; if true { let x = 2; }; x }").unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_jit_loop_block_shadowing_restores_outer() {
+        // Nested loop-block shadowing
+        assert_eq!(
+            jit("fn main() -> i32 { loop { let x = 2; return x; }; 0 }").unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn test_jit_while_block_shadowing_restores_outer() {
+        // Nested while-block shadowing
+        assert_eq!(
+            jit("fn main() -> i32 { let x = 1; while false { let x = 2; }; x }").unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_jit_if_else_block_shadowing_restores_outer() {
+        // Shadowing in else block
+        assert_eq!(
+            jit("fn main() -> i32 { let x = 1; if false { let x = 2; } else { let x = 3; }; x }")
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_jit_else_if_block_shadowing_restores_outer() {
+        // Shadowing in else-if block
+        assert_eq!(
+            jit("fn main() -> i32 { let x = 1; if false { } else if true { let x = 4; }; x }").unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_jit_shadowing_changes_type() {
+        // Shadowing can change type (like Rust)
+        assert_eq!(
+            jit("fn main() -> i32 { let x = 1; let x = true; x as i32 }").unwrap(),
+            1
         );
     }
 }

@@ -220,17 +220,17 @@ fn test_impl_for_trait() {
 
 #[test]
 fn test_if_expression() {
-    assert!(run_test("if_expr", "fn main() { if 1 { }; }\n"));
+    assert!(run_test("if_expr", "fn main() { if true { }; }\n"));
 }
 
 #[test]
 fn test_if_else_expression() {
-    assert!(run_test("if_else", "fn main() { if 0 { } else { }; }\n"));
+    assert!(run_test("if_else", "fn main() { if false { } else { }; }\n"));
 }
 
 #[test]
 fn test_while_loop() {
-    assert!(run_test("while_loop", "fn main() { while 0 { }; }\n"));
+    assert!(run_test("while_loop", "fn main() { while false { }; }\n"));
 }
 
 #[test]
@@ -252,7 +252,7 @@ fn test_comparison_eq() {
 fn test_if_return() {
     assert!(run_test(
         "if_return",
-        "fn main() -> i32 { if 1 { return 42; }; 0 }\n"
+        "fn main() -> i32 { if true { return 42; }; 0 }\n"
     ));
 }
 
@@ -606,5 +606,89 @@ fn test_operator_overloading_ord() {
             return 1;
         }
         "#
+    ));
+}
+
+#[test]
+fn test_empty_struct() {
+    assert!(run_test(
+        "empty_struct",
+        r#"
+struct Empty;
+
+impl Empty {
+    fn can_have_fn() {}
+}
+
+fn main() {
+    let e = Empty;
+    e.can_have_fn();
+}
+"#,
+    ));
+}
+
+#[test]
+fn test_same_scope_shadowing() {
+    assert!(run_test(
+        "same_scope_shadow",
+        "fn main() -> i32 { let x = 1; let x = x + 1; x }\n"
+    ));
+}
+
+#[test]
+fn test_if_block_shadowing() {
+    assert!(run_test(
+        "if_shadow",
+        "fn main() -> i32 { let x = 1; if true { let x = 99; }; x }\n"
+    ));
+}
+
+#[test]
+fn test_while_block_no_exec_shadowing() {
+    assert!(run_test(
+        "while_shadow",
+        "fn main() -> i32 { let x = 1; while false { let x = 99; }; x }\n"
+    ));
+}
+
+#[test]
+fn test_else_block_shadowing() {
+    assert!(run_test(
+        "else_shadow",
+        "fn main() -> i32 { let x = 1; if false { } else { let x = 99; }; x }\n"
+    ));
+}
+
+#[test]
+fn test_else_if_block_shadowing() {
+    assert!(run_test(
+        "elif_shadow",
+        "fn main() -> i32 { let x = 1; if false { } else if true { let x = 99; }; x }\n"
+    ));
+}
+
+#[test]
+fn test_shadowing_changes_type() {
+    assert!(run_test(
+        "type_shadow",
+        "fn main() -> i32 { let x = 1; let x = true; x as i32 }\n"
+    ));
+}
+
+#[test]
+fn test_shadowing_with_loop_body() {
+    assert!(run_test(
+        "loop_shadow",
+        "fn main() -> i32 { loop { let x = 2; return x; }; 0 }\n"
+    ));
+}
+
+#[test]
+fn test_nested_shadowing() {
+    // Shadowing inside a block that itself shadows
+    assert!(run_test(
+        "nested_shadow",
+        "fn main() -> i32 { let x = 1; if true { let x = 2; if true { let x = 3; }; x }; 1 }\n"
     ));
 }

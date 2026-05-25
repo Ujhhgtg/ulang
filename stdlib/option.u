@@ -12,12 +12,14 @@ impl<T> Option<T> {
             Option::None => false,
         }
     }
+
     fn is_none(&self) -> bool {
         match *self {
             Option::Some(_) => false,
             Option::None => true,
         }
     }
+
     fn unwrap(&self) -> T {
         match *self {
             Option::Some(val) => val,
@@ -26,6 +28,7 @@ impl<T> Option<T> {
             }
         }
     }
+    
     fn unwrap_or(&self, default: T) -> T {
         match *self {
             Option::Some(val) => val,

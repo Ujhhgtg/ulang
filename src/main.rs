@@ -13,7 +13,7 @@ use std::fs;
 use std::path::Path;
 use std::process;
 
-use crate::ast::{EnumDecl, Function, ImplDecl, Program, StructDecl, Type};
+use crate::ast::{EnumDecl, Function, ImplDecl, Program, StructDecl, TraitDecl, Type};
 
 type OverloadMap = HashMap<String, Vec<(String, Vec<Type>)>>;
 use crate::token::{Span, Token};
@@ -425,6 +425,7 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
     let mut all_structs: HashMap<String, StructDecl> = HashMap::new();
     let mut all_enums: HashMap<String, EnumDecl> = HashMap::new();
     let mut all_impls: Vec<ImplDecl> = Vec::new();
+    let mut all_traits: HashMap<String, TraitDecl> = HashMap::new();
     // Collect user-defined functions, structs, impls first
     for func in program.funcs {
         all_funcs.insert(func.name.clone(), func);
@@ -439,7 +440,12 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
         all_impls.push(decl.clone());
     }
 
-    // Cache all parsed stdlib modules for cross-module struct resolution.
+    // Collect user-defined traits (user declarations take priority)
+    for decl in program.traits {
+        all_traits.entry(decl.name.clone()).or_insert(decl);
+    }
+
+    // Cache all parsed stdlib modules
     // Pre-load all stdlib modules so cross-module type references resolve.
     let mut all_stdlib_progs: HashMap<String, Program> = HashMap::new();
     // Map from struct name to canonical source module (e.g., "String" → "string")
@@ -546,8 +552,8 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
                     all_impls.push(decl);
                 }
                 // Import all traits from the module
-                for _trait_decl in stdlib_prog.traits {
-                    // TODO: merge traits (not currently needed for basic String)
+                for decl in stdlib_prog.traits {
+                    all_traits.entry(decl.name.clone()).or_insert(decl);
                 }
                 // Import all extern "C" functions from the module
                 for func in &module_funcs {
@@ -693,6 +699,14 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
                             all_funcs.insert(func.name.clone(), func.clone());
                         }
                     }
+                } else if stdlib_prog.traits.iter().any(|t| t.name == *target_name) {
+                    // Import the trait
+                    for decl in stdlib_prog.traits {
+                        if decl.name == *target_name {
+                            all_traits.entry(decl.name.clone()).or_insert(decl);
+                            break;
+                        }
+                    }
                 } else if let Some(overload_map) = module_overloads.get(target_name) {
                     // Overloaded function — import all variants under mangled names
                     // and register the overload map entry
@@ -815,7 +829,7 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
             funcs: all_funcs.into_values().collect(),
             structs: all_structs.into_values().collect(),
             enums: all_enums.into_values().collect(),
-            traits: program.traits,
+            traits: all_traits.into_values().collect(),
             impls: all_impls,
             type_aliases: Vec::new(),
         },

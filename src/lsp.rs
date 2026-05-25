@@ -1,15 +1,15 @@
-use std::collections::HashMap;
-use lsp_server::{Connection, Message, Request, Response, Notification};
-use lsp_types::{
-    InitializeParams, ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind,
-    HoverProviderCapability, OneOf, Url, Diagnostic, DiagnosticSeverity, Position, Range,
-    Hover, HoverParams, HoverContents, MarkupContent, MarkupKind, GotoDefinitionParams,
-    GotoDefinitionResponse, Location, PublishDiagnosticsParams,
-};
-use crate::token::{Span, Token};
+use crate::ast::Program;
 use crate::lexer::Lexer;
 use crate::parser::Parser;
-use crate::ast::Program;
+use crate::token::{Span, Token};
+use lsp_server::{Connection, Message, Notification, Request, Response};
+use lsp_types::{
+    Diagnostic, DiagnosticSeverity, GotoDefinitionParams, GotoDefinitionResponse, Hover,
+    HoverContents, HoverParams, HoverProviderCapability, InitializeParams, Location, MarkupContent,
+    MarkupKind, OneOf, Position, PublishDiagnosticsParams, Range, ServerCapabilities,
+    TextDocumentSyncCapability, TextDocumentSyncKind, Url,
+};
+use std::collections::HashMap;
 
 struct DocumentState {
     source: String,
@@ -112,64 +112,97 @@ fn type_to_string(ty: &crate::ast::Type) -> String {
 fn get_hover_text_from_program(program: &Program, name: &str) -> Option<String> {
     // 1. Search functions
     if let Some(func) = program.funcs.iter().find(|f| f.name == name) {
-        let params: Vec<String> = func.params.iter().map(|p| {
-            format!("{}: {}", p.name, type_to_string(&p.ty))
-        }).collect();
+        let params: Vec<String> = func
+            .params
+            .iter()
+            .map(|p| format!("{}: {}", p.name, type_to_string(&p.ty)))
+            .collect();
         let ret = match &func.return_type {
             Some(ty) => format!(" -> {}", type_to_string(ty)),
             None => "".to_string(),
         };
         let is_ext = if func.is_extern { "extern \"C\" " } else { "" };
-        return Some(format!("```rust\n{}fn {}({}){}\n```", is_ext, name, params.join(", "), ret));
+        return Some(format!(
+            "```rust\n{}fn {}({}){}\n```",
+            is_ext,
+            name,
+            params.join(", "),
+            ret
+        ));
     }
 
     // 2. Search structs
     if let Some(st) = program.structs.iter().find(|s| s.name == name) {
-        let fields: Vec<String> = st.fields.iter().map(|f| {
-            format!("    {}: {}", f.name, type_to_string(&f.ty))
-        }).collect();
+        let fields: Vec<String> = st
+            .fields
+            .iter()
+            .map(|f| format!("    {}: {}", f.name, type_to_string(&f.ty)))
+            .collect();
         let type_params = if st.type_params.is_empty() {
             "".to_string()
         } else {
             format!("<{}>", st.type_params.join(", "))
         };
-        return Some(format!("```rust\nstruct {}{} {{\n{}\n}}\n```", name, type_params, fields.join(",\n")));
+        return Some(format!(
+            "```rust\nstruct {}{} {{\n{}\n}}\n```",
+            name,
+            type_params,
+            fields.join(",\n")
+        ));
     }
 
     // 3. Search enums
     if let Some(en) = program.enums.iter().find(|e| e.name == name) {
-        let variants: Vec<String> = en.variants.iter().map(|v| {
-            match &v.ty {
+        let variants: Vec<String> = en
+            .variants
+            .iter()
+            .map(|v| match &v.ty {
                 Some(ty) => format!("    {}({})", v.name, type_to_string(ty)),
                 None => format!("    {}", v.name),
-            }
-        }).collect();
+            })
+            .collect();
         let type_params = if en.type_params.is_empty() {
             "".to_string()
         } else {
             format!("<{}>", en.type_params.join(", "))
         };
-        return Some(format!("```rust\nenum {}{} {{\n{}\n}}\n```", name, type_params, variants.join(",\n")));
+        return Some(format!(
+            "```rust\nenum {}{} {{\n{}\n}}\n```",
+            name,
+            type_params,
+            variants.join(",\n")
+        ));
     }
 
     // 4. Search traits
     if let Some(tr) = program.traits.iter().find(|t| t.name == name) {
-        let methods: Vec<String> = tr.methods.iter().map(|m| {
-            let params: Vec<String> = m.params.iter().map(|p| {
-                format!("{}: {}", p.name, type_to_string(&p.ty))
-            }).collect();
-            let ret = match &m.return_type {
-                Some(ty) => format!(" -> {}", type_to_string(ty)),
-                None => "".to_string(),
-            };
-            format!("    fn {}({}){};", m.name, params.join(", "), ret)
-        }).collect();
+        let methods: Vec<String> = tr
+            .methods
+            .iter()
+            .map(|m| {
+                let params: Vec<String> = m
+                    .params
+                    .iter()
+                    .map(|p| format!("{}: {}", p.name, type_to_string(&p.ty)))
+                    .collect();
+                let ret = match &m.return_type {
+                    Some(ty) => format!(" -> {}", type_to_string(ty)),
+                    None => "".to_string(),
+                };
+                format!("    fn {}({}){};", m.name, params.join(", "), ret)
+            })
+            .collect();
         let type_params = if tr.type_params.is_empty() {
             "".to_string()
         } else {
             format!("<{}>", tr.type_params.join(", "))
         };
-        return Some(format!("```rust\ntrait {}{} {{\n{}\n}}\n```", name, type_params, methods.join("\n")));
+        return Some(format!(
+            "```rust\ntrait {}{} {{\n{}\n}}\n```",
+            name,
+            type_params,
+            methods.join("\n")
+        ));
     }
 
     // 5. Search type aliases
@@ -179,15 +212,22 @@ fn get_hover_text_from_program(program: &Program, name: &str) -> Option<String> 
         } else {
             format!("<{}>", ta.type_params.join(", "))
         };
-        return Some(format!("```rust\ntype {}{} = {};\n```", name, type_params, type_to_string(&ta.aliased_type)));
+        return Some(format!(
+            "```rust\ntype {}{} = {};\n```",
+            name,
+            type_params,
+            type_to_string(&ta.aliased_type)
+        ));
     }
 
     // 6. Search impl methods
     for imp in &program.impls {
         if let Some(method) = imp.methods.iter().find(|m| m.name == name) {
-            let params: Vec<String> = method.params.iter().map(|p| {
-                format!("{}: {}", p.name, type_to_string(&p.ty))
-            }).collect();
+            let params: Vec<String> = method
+                .params
+                .iter()
+                .map(|p| format!("{}: {}", p.name, type_to_string(&p.ty)))
+                .collect();
             let ret = match &method.return_type {
                 Some(ty) => format!(" -> {}", type_to_string(ty)),
                 None => "".to_string(),
@@ -212,7 +252,9 @@ fn get_hover_text_from_program(program: &Program, name: &str) -> Option<String> 
 
 fn find_definition_span(tokens: &[(Token, Span)], name: &str, hover_offset: usize) -> Option<Span> {
     // 1. Local backward search for variables or parameters
-    let hover_index = tokens.iter().position(|(_, span)| span.lo <= hover_offset && hover_offset <= span.hi);
+    let hover_index = tokens
+        .iter()
+        .position(|(_, span)| span.lo <= hover_offset && hover_offset <= span.hi);
     if let Some(idx) = hover_index {
         let mut i = idx;
         while i > 0 {
@@ -220,7 +262,8 @@ fn find_definition_span(tokens: &[(Token, Span)], name: &str, hover_offset: usiz
             if i + 1 < tokens.len() {
                 if let Token::Ident(ref id) = tokens[i].0 {
                     if id == name {
-                        if i > 0 && (tokens[i - 1].0 == Token::Let || tokens[i - 1].0 == Token::Mut) {
+                        if i > 0 && (tokens[i - 1].0 == Token::Let || tokens[i - 1].0 == Token::Mut)
+                        {
                             return Some(tokens[i].1);
                         }
                     }
@@ -235,7 +278,10 @@ fn find_definition_span(tokens: &[(Token, Span)], name: &str, hover_offset: usiz
                 // Check parameters of this enclosing function boundary
                 let mut j = i + 1;
                 let mut in_params = false;
-                while j < tokens.len() && tokens[j].0 != Token::LBrace && tokens[j].0 != Token::Semicolon {
+                while j < tokens.len()
+                    && tokens[j].0 != Token::LBrace
+                    && tokens[j].0 != Token::Semicolon
+                {
                     if tokens[j].0 == Token::LParen {
                         in_params = true;
                     } else if tokens[j].0 == Token::RParen {
@@ -333,12 +379,12 @@ fn update_document(
     text: String,
 ) -> Vec<Diagnostic> {
     let diags = get_diagnostics(&text);
-    
+
     let mut lexer = Lexer::new(&text);
     let mut tokens = Vec::new();
     let mut parse_success = false;
     let mut valid_prog = None;
-    
+
     loop {
         match lexer.next_token() {
             Ok((token, span)) => {
@@ -350,7 +396,7 @@ fn update_document(
             Err(_) => break,
         }
     }
-    
+
     if !tokens.is_empty() && matches!(tokens.last().unwrap().0, Token::Eof) {
         let mut parser = Parser::new(&tokens);
         if let Ok(prog) = parser.parse_program() {
@@ -358,19 +404,22 @@ fn update_document(
             parse_success = true;
         }
     }
-    
+
     if let Some(doc) = documents.get_mut(&url) {
         doc.source = text;
         if parse_success {
             doc.last_valid_program = valid_prog;
         }
     } else {
-        documents.insert(url, DocumentState {
-            source: text,
-            last_valid_program: valid_prog,
-        });
+        documents.insert(
+            url,
+            DocumentState {
+                source: text,
+                last_valid_program: valid_prog,
+            },
+        );
     }
-    
+
     diags
 }
 
@@ -381,20 +430,19 @@ fn publish_diagnostics(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let params = PublishDiagnosticsParams::new(url, diagnostics, None);
     let notification = Notification::new("textDocument/publishDiagnostics".to_string(), params);
-    connection.sender.send(Message::Notification(notification))?;
+    connection
+        .sender
+        .send(Message::Notification(notification))?;
     Ok(())
 }
 
-fn handle_hover(
-    documents: &HashMap<Url, DocumentState>,
-    params: HoverParams,
-) -> Option<Hover> {
+fn handle_hover(documents: &HashMap<Url, DocumentState>, params: HoverParams) -> Option<Hover> {
     let url = params.text_document_position_params.text_document.uri;
     let doc = documents.get(&url)?;
     let position = params.text_document_position_params.position;
-    
+
     let offset = position_to_offset(&doc.source, position);
-    
+
     let mut lexer = Lexer::new(&doc.source);
     let mut tokens = Vec::new();
     loop {
@@ -408,18 +456,18 @@ fn handle_hover(
             Err(_) => break,
         }
     }
-    
-    let hovered_token = tokens.iter().find(|(_, span)| {
-        span.lo <= offset && offset <= span.hi
-    })?;
-    
+
+    let hovered_token = tokens
+        .iter()
+        .find(|(_, span)| span.lo <= offset && offset <= span.hi)?;
+
     if let Token::Ident(ref name) = hovered_token.0 {
         let hover_text = if let Some(prog) = &doc.last_valid_program {
             get_hover_text_from_program(prog, name)
         } else {
             None
         };
-        
+
         if let Some(contents) = hover_text {
             return Some(Hover {
                 contents: HoverContents::Markup(MarkupContent {
@@ -433,7 +481,7 @@ fn handle_hover(
             });
         }
     }
-    
+
     None
 }
 
@@ -444,9 +492,9 @@ fn handle_definition(
     let url = params.text_document_position_params.text_document.uri;
     let doc = documents.get(&url)?;
     let position = params.text_document_position_params.position;
-    
+
     let offset = position_to_offset(&doc.source, position);
-    
+
     let mut lexer = Lexer::new(&doc.source);
     let mut tokens = Vec::new();
     loop {
@@ -460,11 +508,11 @@ fn handle_definition(
             Err(_) => break,
         }
     }
-    
-    let clicked_token = tokens.iter().find(|(_, span)| {
-        span.lo <= offset && offset <= span.hi
-    })?;
-    
+
+    let clicked_token = tokens
+        .iter()
+        .find(|(_, span)| span.lo <= offset && offset <= span.hi)?;
+
     if let Token::Ident(ref name) = clicked_token.0 {
         if let Some(def_span) = find_definition_span(&tokens, name, offset) {
             let start = offset_to_position(&doc.source, def_span.lo);
@@ -473,11 +521,13 @@ fn handle_definition(
             return Some(GotoDefinitionResponse::Scalar(Location::new(url, range)));
         }
     }
-    
+
     None
 }
 
-fn cast_request<R>(req: Request) -> Result<(lsp_server::RequestId, R::Params), Box<dyn std::error::Error + Send + Sync>>
+fn cast_request<R>(
+    req: Request,
+) -> Result<(lsp_server::RequestId, R::Params), Box<dyn std::error::Error + Send + Sync>>
 where
     R: lsp_types::request::Request,
     R::Params: serde::de::DeserializeOwned,
@@ -486,7 +536,9 @@ where
         .map_err(|e| format!("failed to extract request: {:?}", e).into())
 }
 
-fn cast_notification<N>(not: Notification) -> Result<N::Params, Box<dyn std::error::Error + Send + Sync>>
+fn cast_notification<N>(
+    not: Notification,
+) -> Result<N::Params, Box<dyn std::error::Error + Send + Sync>>
 where
     N: lsp_types::notification::Notification,
     N::Params: serde::de::DeserializeOwned,
@@ -509,42 +561,47 @@ fn main_loop(connection: Connection) -> Result<(), Box<dyn std::error::Error + S
                         let (id, params) = cast_request::<lsp_types::request::HoverRequest>(req)?;
                         let response = handle_hover(&documents, params);
                         let result = serde_json::to_value(&response)?;
-                        connection.sender.send(Message::Response(Response::new_ok(id, result)))?;
+                        connection
+                            .sender
+                            .send(Message::Response(Response::new_ok(id, result)))?;
                     }
                     "textDocument/definition" => {
                         let (id, params) = cast_request::<lsp_types::request::GotoDefinition>(req)?;
                         let response = handle_definition(&documents, params);
                         let result = serde_json::to_value(&response)?;
-                        connection.sender.send(Message::Response(Response::new_ok(id, result)))?;
+                        connection
+                            .sender
+                            .send(Message::Response(Response::new_ok(id, result)))?;
                     }
                     _ => {}
                 }
             }
-            Message::Notification(not) => {
-                match not.method.as_str() {
-                    "textDocument/didOpen" => {
-                        let params = cast_notification::<lsp_types::notification::DidOpenTextDocument>(not)?;
-                        let url = params.text_document.uri;
-                        let text = params.text_document.text;
-                        
-                        let diags = update_document(&mut documents, url.clone(), text);
+            Message::Notification(not) => match not.method.as_str() {
+                "textDocument/didOpen" => {
+                    let params =
+                        cast_notification::<lsp_types::notification::DidOpenTextDocument>(not)?;
+                    let url = params.text_document.uri;
+                    let text = params.text_document.text;
+
+                    let diags = update_document(&mut documents, url.clone(), text);
+                    publish_diagnostics(&connection, url, diags)?;
+                }
+                "textDocument/didChange" => {
+                    let params =
+                        cast_notification::<lsp_types::notification::DidChangeTextDocument>(not)?;
+                    let url = params.text_document.uri;
+                    if let Some(change) = params.content_changes.into_iter().next() {
+                        let diags = update_document(&mut documents, url.clone(), change.text);
                         publish_diagnostics(&connection, url, diags)?;
                     }
-                    "textDocument/didChange" => {
-                        let params = cast_notification::<lsp_types::notification::DidChangeTextDocument>(not)?;
-                        let url = params.text_document.uri;
-                        if let Some(change) = params.content_changes.into_iter().next() {
-                            let diags = update_document(&mut documents, url.clone(), change.text);
-                            publish_diagnostics(&connection, url, diags)?;
-                        }
-                    }
-                    "textDocument/didClose" => {
-                        let params = cast_notification::<lsp_types::notification::DidCloseTextDocument>(not)?;
-                        documents.remove(&params.text_document.uri);
-                    }
-                    _ => {}
                 }
-            }
+                "textDocument/didClose" => {
+                    let params =
+                        cast_notification::<lsp_types::notification::DidCloseTextDocument>(not)?;
+                    documents.remove(&params.text_document.uri);
+                }
+                _ => {}
+            },
             Message::Response(_) => {}
         }
     }
@@ -580,18 +637,18 @@ mod tests {
     #[test]
     fn test_offset_conversion() {
         let src = "fn main() {\n    let x = 42;\n}";
-        
+
         let pos1 = offset_to_position(src, 0);
         assert_eq!(pos1.line, 0);
         assert_eq!(pos1.character, 0);
-        
+
         let pos2 = offset_to_position(src, 12);
         assert_eq!(pos2.line, 1);
         assert_eq!(pos2.character, 0);
-        
+
         let offset1 = position_to_offset(src, pos1);
         assert_eq!(offset1, 0);
-        
+
         let offset2 = position_to_offset(src, pos2);
         assert_eq!(offset2, 12);
     }

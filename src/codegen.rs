@@ -883,11 +883,25 @@ impl<'ctx> CodeGen<'ctx> {
                 .get(name)
                 .map(|traits| traits.contains(trait_name))
                 .unwrap_or(false),
+            Type::GenericInstance(name, args) => {
+                let mangled = Self::mangle_generic_instance(name, args);
+                self.trait_impls
+                    .get(&mangled)
+                    .map(|traits| traits.contains(trait_name))
+                    .unwrap_or(false)
+            }
             Type::Ref { inner, .. } => self.check_type_implements_trait(inner, trait_name),
-            Type::Array { .. } => {
+            Type::Array { inner, len } => {
                 // Arrays implement Index/IndexMut (builtin), and also
-                // any trait their element type implements (for derive checks)
-                trait_name == "Index" || trait_name == "IndexMut"
+                // any trait registered for this array type (e.g. from slice impl blocks)
+                let key = Self::array_type_key(inner, *len);
+                trait_name == "Index"
+                    || trait_name == "IndexMut"
+                    || self
+                        .trait_impls
+                        .get(&key)
+                        .map(|traits| traits.contains(trait_name))
+                        .unwrap_or(false)
             }
             // Tuple/unit types are not derivable (no plan for these)
             _ => false,
@@ -1593,6 +1607,16 @@ impl<'ctx> CodeGen<'ctx> {
                 *cond = cond_box;
                 Self::m_substitute_block(body, params, args);
             }
+            Expr::For {
+                pattern: _,
+                container,
+                body,
+            } => {
+                let mut container_box = Box::new((**container).clone());
+                Self::m_substitute_types_in_expr(&mut container_box, params, args);
+                *container = container_box;
+                Self::m_substitute_block(body, params, args);
+            }
             Expr::IfLet {
                 scrutinee,
                 then_block,
@@ -1799,7 +1823,17 @@ impl<'ctx> CodeGen<'ctx> {
                     Self::m_substitute_const_block(block, const_params, values);
                 }
             }
-            Expr::Loop { body } | Expr::While { body, .. } => {
+            Expr::Loop { body } => {
+                Self::m_substitute_const_block(body, const_params, values);
+            }
+            Expr::While { cond, body } => {
+                Self::m_substitute_const_in_expr(cond, const_params, values);
+                Self::m_substitute_const_block(body, const_params, values);
+            }
+            Expr::For {
+                container, body, ..
+            } => {
+                Self::m_substitute_const_in_expr(container, const_params, values);
                 Self::m_substitute_const_block(body, const_params, values);
             }
             Expr::IfLet {
@@ -2142,6 +2176,19 @@ impl<'ctx> CodeGen<'ctx> {
                     Self::collect_enum_lits_from_block(&arm.body, instances, seen, one_param_enums);
                 }
             }
+            Expr::While { cond, body } => {
+                Self::collect_enum_lits_from_expr(cond, instances, seen, one_param_enums);
+                Self::collect_enum_lits_from_block(body, instances, seen, one_param_enums);
+            }
+            Expr::Loop { body } => {
+                Self::collect_enum_lits_from_block(body, instances, seen, one_param_enums);
+            }
+            Expr::For {
+                container, body, ..
+            } => {
+                Self::collect_enum_lits_from_expr(container, instances, seen, one_param_enums);
+                Self::collect_enum_lits_from_block(body, instances, seen, one_param_enums);
+            }
             _ => {}
         }
     }
@@ -2276,6 +2323,12 @@ impl<'ctx> CodeGen<'ctx> {
         self.current_monomorphization = Some((base_name.to_string(), mangled.clone()));
 
         for (impl_params, impl_decl) in &impl_blocks {
+            if let Some(ref tname) = impl_decl.trait_name {
+                self.trait_impls
+                    .entry(mangled.clone())
+                    .or_default()
+                    .insert(tname.clone());
+            }
             for method in &impl_decl.methods {
                 let mut method_func = method.clone();
 
@@ -2324,6 +2377,10 @@ impl<'ctx> CodeGen<'ctx> {
         Ok(())
     }
 
+    pub fn emit_ir(&self) -> String {
+        self.module.print_to_string().to_string()
+    }
+
     pub fn compile_module(&mut self, program: &Program) -> Result<(), String> {
         // Populate visibility map
         for func in &program.funcs {
@@ -2353,6 +2410,12 @@ impl<'ctx> CodeGen<'ctx> {
                 Type::GenericInstance(name, _) => name.clone(),
                 _ => continue,
             };
+            if let Some(ref tname) = decl.trait_name {
+                self.trait_impls
+                    .entry(type_name.clone())
+                    .or_default()
+                    .insert(tname.clone());
+            }
             for method in &decl.methods {
                 let mangled_name = if let Some(ref trait_name) = decl.trait_name {
                     format!("__trait_{}_{}_{}", trait_name, method.name, type_name)
@@ -2645,6 +2708,13 @@ impl<'ctx> CodeGen<'ctx> {
                 ];
                 self.context.struct_type(&elems, false).into()
             }
+            Type::Ref { inner, .. } if matches!(inner.as_ref(), Type::Slice { .. }) => {
+                let elems: [BasicTypeEnum; 2] = [
+                    self.context.ptr_type(AddressSpace::default()).into(),
+                    self.i64_type.into(),
+                ];
+                self.context.struct_type(&elems, false).into()
+            }
             Type::Ref { .. } => self.context.ptr_type(AddressSpace::default()).into(),
             Type::Ptr { .. } => self.context.ptr_type(AddressSpace::default()).into(),
             Type::Array { inner, len } => {
@@ -2693,7 +2763,11 @@ impl<'ctx> CodeGen<'ctx> {
                 panic!("SelfType used outside of impl context");
             }
             Type::Slice { .. } => {
-                panic!("Slice type cannot be used as a value type (unsized)");
+                let elems: [BasicTypeEnum; 2] = [
+                    self.context.ptr_type(AddressSpace::default()).into(),
+                    self.i64_type.into(),
+                ];
+                self.context.struct_type(&elems, false).into()
             }
             Type::GenericArray { .. } => {
                 panic!("GenericArray type must be resolved to Array before codegen");
@@ -2741,6 +2815,31 @@ impl<'ctx> CodeGen<'ctx> {
                     && method == "len"
                 {
                     return Type::Usize;
+                }
+                // .len() on &[T] or [T] returns Usize
+                if method == "len" {
+                    let is_slice = matches!(&receiver_type, Type::Slice { .. })
+                        || matches!(&receiver_type, Type::Ref { inner, .. } if matches!(inner.as_ref(), Type::Slice { .. }));
+                    if is_slice {
+                        return Type::Usize;
+                    }
+                }
+                // .as_ptr() on &[T] returns *const T
+                if method == "as_ptr" {
+                    if let Type::Ref { inner, .. } = &receiver_type {
+                        if let Type::Slice { inner: elem_ty } = inner.as_ref() {
+                            return Type::Ptr {
+                                inner: elem_ty.clone(),
+                                is_mut: false,
+                            };
+                        }
+                    }
+                    if let Type::Slice { inner: elem_ty } = &receiver_type {
+                        return Type::Ptr {
+                            inner: elem_ty.clone(),
+                            is_mut: false,
+                        };
+                    }
                 }
                 // For struct/primitive methods, look up return type from impl methods
                 let type_name = match &receiver_type {
@@ -2915,6 +3014,7 @@ impl<'ctx> CodeGen<'ctx> {
                     })
                     .unwrap_or(Type::Unit)
             }
+            Expr::For { .. } => Type::Unit,
             Expr::Match { arms, .. } => {
                 // Result type from first arm (all arms must have same type)
                 arms.first()
@@ -3046,8 +3146,10 @@ impl<'ctx> CodeGen<'ctx> {
                 let array_ty = self.expr_type(array);
                 match &array_ty {
                     Type::Array { inner, .. } => *inner.clone(),
+                    Type::Slice { inner, .. } => *inner.clone(),
                     Type::Ref { inner, .. } => match inner.as_ref() {
                         Type::Array { inner: ai, .. } => *ai.clone(),
+                        Type::Slice { inner: si, .. } => *si.clone(),
                         _ => Type::I32,
                     },
                     _ => Type::I32,
@@ -3170,9 +3272,15 @@ impl<'ctx> CodeGen<'ctx> {
                 let array_ty = Self::literal_type(array);
                 match &array_ty {
                     Type::Array { inner, .. } => *inner.clone(),
+                    Type::Slice { inner, .. } => *inner.clone(),
+                    Type::Ref { inner, .. } => match inner.as_ref() {
+                        Type::Slice { inner: si, .. } => *si.clone(),
+                        _ => Type::I32,
+                    },
                     _ => Type::I32,
                 }
             }
+            Expr::Loop { .. } | Expr::While { .. } | Expr::For { .. } => Type::Unit,
             _ => Type::I32,
         }
     }
@@ -3753,6 +3861,12 @@ impl<'ctx> CodeGen<'ctx> {
                 Type::GenericArray { len_var, .. } => len_var.clone(),
                 _ => continue,
             };
+            if let Some(ref tname) = impl_decl.trait_name {
+                self.trait_impls
+                    .entry(key.clone())
+                    .or_default()
+                    .insert(tname.clone());
+            }
             let type_params = &impl_decl.type_params;
             let const_params = &impl_decl.const_params;
             let inner_type_name = match &impl_decl.impl_type {
@@ -4207,6 +4321,41 @@ impl<'ctx> CodeGen<'ctx> {
                 }
                 Expr::Index { array, index } => {
                     let array_ty = self.expr_type(array);
+                    // Handle slice/slice-ref indexing write (fat pointer → GEP → store)
+                    let is_slice = matches!(&array_ty, Type::Slice { .. })
+                        || matches!(&array_ty, Type::Ref { inner, .. } if matches!(inner.as_ref(), Type::Slice { .. }));
+                    if is_slice {
+                        let fat_ptr_val = self.compile_expr(array)?;
+                        let ptr_field = match fat_ptr_val {
+                            BasicValueEnum::StructValue(sv) => self
+                                .builder
+                                .build_extract_value(sv, 0, "slice_ptr")
+                                .map_err(|e| format!("failed to extract slice ptr: {}", e))?,
+                            _ => return Err("expected slice fat pointer".to_string()),
+                        };
+                        let ptr = ptr_field.into_pointer_value();
+                        let elem_ty = match &array_ty {
+                            Type::Slice { inner } => inner.as_ref().clone(),
+                            Type::Ref { inner, .. } => match inner.as_ref() {
+                                Type::Slice { inner } => inner.as_ref().clone(),
+                                _ => unreachable!(),
+                            },
+                            _ => unreachable!(),
+                        };
+                        let elem_llvm = self.type_to_llvm(&elem_ty);
+                        let idx_val = self.compile_expr(index)?;
+                        let idx = idx_val.into_int_value();
+                        let elem_ptr = unsafe {
+                            self.builder
+                                .build_in_bounds_gep(elem_llvm, ptr, &[idx], "slice_index_mut")
+                                .map_err(|e| format!("failed to GEP into slice: {}", e))?
+                        };
+                        let val = self.compile_expr(value)?;
+                        self.builder
+                            .build_store(elem_ptr, val)
+                            .map_err(|e| format!("failed to store slice element: {}", e))?;
+                        return Ok(val);
+                    }
                     let (elem_ty, len) = match &array_ty {
                         Type::Array { inner, len } => (*inner.clone(), *len),
                         Type::Ref { inner, .. } => match inner.as_ref() {
@@ -4371,11 +4520,17 @@ impl<'ctx> CodeGen<'ctx> {
                     .ok_or_else(|| format!("unknown function '{}'", callee))?;
                 let mut arg_values = self.compile_args_vec(args)?;
                 // Coerce arguments to match declared parameter types
-                if let Some(param_tys) = self.fn_param_types.get(callee) {
+                let resolved_name = fn_val.get_name().to_string_lossy().to_string();
+                let param_tys_key = if self.fn_param_types.contains_key(&resolved_name) {
+                    resolved_name
+                } else {
+                    callee.to_string()
+                };
+                if let Some(param_tys) = self.fn_param_types.get(&param_tys_key) {
                     for (i, arg_val) in arg_values.iter_mut().enumerate() {
                         if let Some(param_ty) = param_tys.get(i) {
+                            let arg_ty = self.expr_type(&args[i]);
                             let param_llvm_ty = self.type_to_llvm(param_ty);
-                            // Compare types by extracting BasicValueEnum
                             let bv = match arg_val {
                                 BasicMetadataValueEnum::IntValue(v) => BasicValueEnum::IntValue(*v),
                                 BasicMetadataValueEnum::FloatValue(v) => {
@@ -4387,15 +4542,19 @@ impl<'ctx> CodeGen<'ctx> {
                                 BasicMetadataValueEnum::StructValue(v) => {
                                     BasicValueEnum::StructValue(*v)
                                 }
+                                BasicMetadataValueEnum::ArrayValue(v) => {
+                                    BasicValueEnum::ArrayValue(*v)
+                                }
                                 &mut _ => continue,
                             };
                             if bv.get_type() != param_llvm_ty {
-                                let cast = self.emit_cast(bv, param_ty)?;
+                                let cast = self.coerce_arg(bv, &arg_ty, param_ty)?;
                                 *arg_val = match cast {
                                     BasicValueEnum::IntValue(v) => v.into(),
                                     BasicValueEnum::FloatValue(v) => v.into(),
                                     BasicValueEnum::PointerValue(v) => v.into(),
                                     BasicValueEnum::StructValue(v) => v.into(),
+                                    BasicValueEnum::ArrayValue(v) => v.into(),
                                     _ => continue,
                                 };
                             }
@@ -4450,6 +4609,7 @@ impl<'ctx> CodeGen<'ctx> {
                 if let Some(param_tys) = self.fn_param_types.get(&resolved_name) {
                     for (i, arg_val) in arg_values.iter_mut().enumerate() {
                         if let Some(param_ty) = param_tys.get(i) {
+                            let arg_ty = self.expr_type(&args[i]);
                             let param_llvm_ty = self.type_to_llvm(param_ty);
                             let bv = match arg_val {
                                 BasicMetadataValueEnum::IntValue(v) => BasicValueEnum::IntValue(*v),
@@ -4462,15 +4622,19 @@ impl<'ctx> CodeGen<'ctx> {
                                 BasicMetadataValueEnum::StructValue(v) => {
                                     BasicValueEnum::StructValue(*v)
                                 }
+                                BasicMetadataValueEnum::ArrayValue(v) => {
+                                    BasicValueEnum::ArrayValue(*v)
+                                }
                                 &mut _ => continue,
                             };
                             if bv.get_type() != param_llvm_ty {
-                                let cast = self.emit_cast(bv, param_ty)?;
+                                let cast = self.coerce_arg(bv, &arg_ty, param_ty)?;
                                 *arg_val = match cast {
                                     BasicValueEnum::IntValue(v) => v.into(),
                                     BasicValueEnum::FloatValue(v) => v.into(),
                                     BasicValueEnum::PointerValue(v) => v.into(),
                                     BasicValueEnum::StructValue(v) => v.into(),
+                                    BasicValueEnum::ArrayValue(v) => v.into(),
                                     _ => continue,
                                 };
                             }
@@ -4839,21 +5003,50 @@ impl<'ctx> CodeGen<'ctx> {
                 method,
                 args,
             } => {
-                // Special case: .len() on &str
+                // Special case: .len() on &str and &[T]
                 if method == "len" && args.is_empty() {
                     let rt = self.expr_type(receiver);
                     let is_str = matches!(&rt, Type::Ref { inner, .. } if **inner == Type::Str);
-                    if is_str {
+                    let is_slice = matches!(&rt, Type::Slice { .. })
+                        || matches!(&rt, Type::Ref { inner, .. } if matches!(inner.as_ref(), Type::Slice { .. }));
+                    if is_str || is_slice {
                         let val = self.compile_expr(receiver)?;
                         match val {
                             BasicValueEnum::StructValue(sv) => {
                                 let len = self
                                     .builder
-                                    .build_extract_value(sv, 1, "str_len")
-                                    .map_err(|e| format!("failed to extract str length: {}", e))?;
+                                    .build_extract_value(sv, 1, "len")
+                                    .map_err(|e| format!("failed to extract length: {}", e))?;
                                 return Ok(len);
                             }
-                            _ => return Err("cannot call .len() on a non-string value".to_string()),
+                            _ => {
+                                return Err(
+                                    "cannot call .len() on a non-fat-pointer value".to_string()
+                                );
+                            }
+                        }
+                    }
+                }
+                // Special case: .as_ptr() on &[T]
+                if method == "as_ptr" && args.is_empty() {
+                    let rt = self.expr_type(receiver);
+                    let is_slice_ref = matches!(&rt, Type::Ref { inner, .. } if matches!(inner.as_ref(), Type::Slice { .. }));
+                    let is_slice_val = matches!(&rt, Type::Slice { .. });
+                    if is_slice_ref || is_slice_val {
+                        let val = self.compile_expr(receiver)?;
+                        match val {
+                            BasicValueEnum::StructValue(sv) => {
+                                let ptr = self
+                                    .builder
+                                    .build_extract_value(sv, 0, "as_ptr")
+                                    .map_err(|e| format!("failed to extract slice ptr: {}", e))?;
+                                return Ok(ptr);
+                            }
+                            _ => {
+                                return Err(
+                                    "cannot call .as_ptr() on a non-fat-pointer value".to_string()
+                                );
+                            }
                         }
                     }
                 }
@@ -5057,9 +5250,37 @@ impl<'ctx> CodeGen<'ctx> {
                 };
 
                 let mut all_args = vec![receiver_ptr.into()];
-                for arg in args {
+                for (i, arg) in args.iter().enumerate() {
                     let val = self.compile_expr(arg)?;
                     all_args.push(val.into());
+                    // Coerce argument to match declared parameter type
+                    let param_idx = i + 1; // param 0 is the receiver (&self)
+                    if let Some(param_tys) = self.fn_param_types.get(&mangled)
+                        && let Some(param_ty) = param_tys.get(param_idx)
+                    {
+                        let arg_ty = self.expr_type(arg);
+                        let param_llvm_ty = self.type_to_llvm(param_ty);
+                        let bv = match val {
+                            BasicValueEnum::IntValue(v) => BasicValueEnum::IntValue(v),
+                            BasicValueEnum::FloatValue(v) => BasicValueEnum::FloatValue(v),
+                            BasicValueEnum::PointerValue(v) => BasicValueEnum::PointerValue(v),
+                            BasicValueEnum::StructValue(v) => BasicValueEnum::StructValue(v),
+                            BasicValueEnum::ArrayValue(v) => BasicValueEnum::ArrayValue(v),
+                            _ => continue,
+                        };
+                        if bv.get_type() != param_llvm_ty {
+                            let cast = self.coerce_arg(bv, &arg_ty, param_ty)?;
+                            let idx = all_args.len() - 1;
+                            all_args[idx] = match cast {
+                                BasicValueEnum::IntValue(v) => v.into(),
+                                BasicValueEnum::FloatValue(v) => v.into(),
+                                BasicValueEnum::PointerValue(v) => v.into(),
+                                BasicValueEnum::StructValue(v) => v.into(),
+                                BasicValueEnum::ArrayValue(v) => v.into(),
+                                _ => continue,
+                            };
+                        }
+                    }
                 }
 
                 let result = self
@@ -5207,6 +5428,41 @@ impl<'ctx> CodeGen<'ctx> {
             }
             Expr::Index { array, index } => {
                 let array_ty = self.expr_type(array);
+                // Handle slice/slice-ref indexing (fat pointer → GEP → load)
+                let is_slice = matches!(&array_ty, Type::Slice { .. })
+                    || matches!(&array_ty, Type::Ref { inner, .. } if matches!(inner.as_ref(), Type::Slice { .. }));
+                if is_slice {
+                    let fat_ptr_val = self.compile_expr(array)?;
+                    let ptr_field = match fat_ptr_val {
+                        BasicValueEnum::StructValue(sv) => self
+                            .builder
+                            .build_extract_value(sv, 0, "slice_ptr")
+                            .map_err(|e| format!("failed to extract slice ptr: {}", e))?,
+                        _ => return Err("expected slice fat pointer".to_string()),
+                    };
+                    let ptr = ptr_field.into_pointer_value();
+                    let elem_ty = match &array_ty {
+                        Type::Slice { inner } => inner.as_ref().clone(),
+                        Type::Ref { inner, .. } => match inner.as_ref() {
+                            Type::Slice { inner } => inner.as_ref().clone(),
+                            _ => unreachable!(),
+                        },
+                        _ => unreachable!(),
+                    };
+                    let elem_llvm = self.type_to_llvm(&elem_ty);
+                    let idx_val = self.compile_expr(index)?;
+                    let idx = idx_val.into_int_value();
+                    let elem_ptr = unsafe {
+                        self.builder
+                            .build_in_bounds_gep(elem_llvm, ptr, &[idx], "slice_index")
+                            .map_err(|e| format!("failed to GEP into slice: {}", e))?
+                    };
+                    let loaded = self
+                        .builder
+                        .build_load(elem_llvm, elem_ptr, "slice_load")
+                        .map_err(|e| format!("failed to load slice element: {}", e))?;
+                    return Ok(loaded);
+                }
                 let (elem_ty, len) = match &array_ty {
                     Type::Array { inner, len } => (*inner.clone(), *len),
                     Type::Ref { inner, .. } => match inner.as_ref() {
@@ -5609,6 +5865,11 @@ impl<'ctx> CodeGen<'ctx> {
                     _ => Err(format!("expected struct value for enum '{}'", enum_name)),
                 }
             }
+            Expr::For {
+                pattern,
+                container,
+                body,
+            } => self.compile_for(pattern, container, body),
             Expr::IfLet {
                 pattern,
                 scrutinee,
@@ -5725,6 +5986,134 @@ impl<'ctx> CodeGen<'ctx> {
                 .map_err(|e| format!("failed to load if_let result: {}", e))?;
             Ok(result)
         }
+    }
+
+    fn compile_for(
+        &mut self,
+        pattern: &Pattern,
+        container: &Expr,
+        body: &Block,
+    ) -> Result<BasicValueEnum<'ctx>, String> {
+        let container_type = self.expr_type(container);
+        let mut base_ty = &container_type;
+        while let Type::Ref { inner, .. } = base_ty {
+            base_ty = inner.as_ref();
+        }
+        if let Type::Array { inner, len } = base_ty {
+            self.ensure_slice_methods(inner, *len)?;
+        }
+        let is_into_iter = self.check_type_implements_trait(&container_type, "IntoIterator");
+        let is_iter = self.check_type_implements_trait(&container_type, "Iterator");
+        let iterator_expr = if is_into_iter {
+            Expr::MethodCall {
+                expr: Box::new(container.clone()),
+                method: "iter".to_string(),
+                args: vec![],
+            }
+        } else if is_iter {
+            container.clone()
+        } else {
+            return Err(format!(
+                "type {:?} does not implement IntoIterator or Iterator",
+                container_type
+            ));
+        };
+        // Determine loop element type by simulating calling next() on the iterator
+        let next_expr = Expr::MethodCall {
+            expr: Box::new(Expr::Ident("__for_loop_iter".to_string())),
+            method: "next".to_string(),
+            args: vec![],
+        };
+        // Create a temporary mock scope to retrieve the return type of iterator.next()
+        let iter_ty = self.expr_type(&iterator_expr);
+        let outer_saved_symbols = self.symbols.clone();
+        self.symbols.insert(
+            "__for_loop_iter".to_string(),
+            (
+                self.context.ptr_type(AddressSpace::default()).const_null(),
+                true,
+                iter_ty.clone(),
+            ),
+        );
+        let option_ty = self.expr_type(&next_expr);
+        self.symbols = outer_saved_symbols.clone();
+        let elem_ty = match &option_ty {
+            Type::GenericInstance(name, args) if name == "Option" && args.len() == 1 => {
+                args[0].clone()
+            }
+            _ => {
+                return Err(format!(
+                    "iterator's next() must return Option<T>, found {:?}",
+                    option_ty
+                ));
+            }
+        };
+        // Ensure Option<elem_ty> is monomorphized so that pattern matching tag layouts are available
+        self.ensure_monomorphized("Option", &[elem_ty.clone()])?;
+        // Compile iterator value and store in alloca `__for_loop_iter`
+        let iter_llvm_ty = self.type_to_llvm(&iter_ty);
+        let iter_alloca = self
+            .builder
+            .build_alloca(iter_llvm_ty, "__for_loop_iter")
+            .map_err(|e| format!("failed to build alloca for iterator: {}", e))?;
+        let iter_value = self.compile_expr(&iterator_expr)?;
+        self.builder
+            .build_store(iter_alloca, iter_value)
+            .map_err(|e| format!("failed to store iterator: {}", e))?;
+        self.symbols
+            .insert("__for_loop_iter".to_string(), (iter_alloca, true, iter_ty));
+        // Create loop blocks
+        let parent_fn = self
+            .builder
+            .get_insert_block()
+            .unwrap()
+            .get_parent()
+            .unwrap();
+        let cond_bb = self.context.append_basic_block(parent_fn, "for_cond");
+        let body_bb = self.context.append_basic_block(parent_fn, "for_body");
+        let after_bb = self.context.append_basic_block(parent_fn, "for_after");
+        self.builder
+            .build_unconditional_branch(cond_bb)
+            .map_err(|e| format!("failed to branch to for cond: {}", e))?;
+        // --- Condition block ---
+        self.builder.position_at_end(cond_bb);
+        let option_val = self.compile_expr(&next_expr)?;
+        let some_pattern = Pattern::EnumVariant {
+            enum_name: None,
+            variant: "Some".to_string(),
+            payload: Some(Box::new(pattern.clone())),
+        };
+        let (matches_val, bindings) =
+            self.gen_pattern_check(&some_pattern, option_val, &option_ty)?;
+        self.builder
+            .build_conditional_branch(matches_val, body_bb, after_bb)
+            .map_err(|e| format!("failed to build conditional branch for loop: {}", e))?;
+        // --- Body block ---
+        self.builder.position_at_end(body_bb);
+        let saved_symbols = self.symbols.clone();
+        for (name, ptr, ty) in &bindings {
+            self.symbols.insert(name.clone(), (*ptr, false, ty.clone()));
+        }
+        self.compile_block_get_value(body)?;
+        self.symbols = saved_symbols;
+        let terminated = self
+            .builder
+            .get_insert_block()
+            .unwrap()
+            .get_terminator()
+            .is_some();
+        if !terminated {
+            self.builder
+                .build_unconditional_branch(cond_bb)
+                .map_err(|e| format!("failed to branch back in loop: {}", e))?;
+        }
+        // --- After block ---
+        self.builder.position_at_end(after_bb);
+        // Restore outer symbols
+        self.symbols = outer_saved_symbols;
+        // Loop produces unit value
+        let unit_ty = self.context.struct_type(&[], false);
+        Ok(unit_ty.get_undef().into())
     }
 
     /// Compile `match` expression with sequential arm checking.
@@ -6342,6 +6731,85 @@ impl<'ctx> CodeGen<'ctx> {
             Expr::Cast { expr, .. } => self.const_eval(expr),
             _ => Err("non-constant expression in const initializer".to_string()),
         }
+    }
+
+    /// Coerce an argument value to match the expected parameter type.
+    /// Handles array-to-slice coercion where an array `[T; L]` or `&[T; L]` is passed
+    /// to a function expecting `[T]` or `&[T]` by building a fat pointer `{ ptr, len }`.
+    fn coerce_arg(
+        &self,
+        arg_val: BasicValueEnum<'ctx>,
+        arg_ty: &Type,
+        param_ty: &Type,
+    ) -> Result<BasicValueEnum<'ctx>, String> {
+        // Check if the parameter expects a slice fat pointer
+        let param_is_slice = matches!(param_ty, Type::Slice { .. })
+            || matches!(
+                param_ty,
+                Type::Ref {
+                    inner,
+                    ..
+                } if matches!(inner.as_ref(), Type::Slice { .. })
+            );
+
+        if !param_is_slice {
+            return self.emit_cast(arg_val, param_ty);
+        }
+
+        // Extract the length and indirection kind from the argument type
+        let (arg_len, is_ref) = match arg_ty {
+            Type::Array { len, .. } => (*len, false),
+            Type::Ref { inner, .. } => match inner.as_ref() {
+                Type::Array { len, .. } => (*len, true),
+                _ => {
+                    // Not an array argument — use regular cast
+                    return self.emit_cast(arg_val, param_ty);
+                }
+            },
+            _ => {
+                // Not an array argument — use regular cast
+                return self.emit_cast(arg_val, param_ty);
+            }
+        };
+
+        // Build the fat pointer { ptr, len }
+        let ptr_type = self.context.ptr_type(AddressSpace::default());
+        let ptr_val: PointerValue<'ctx> = if is_ref {
+            // arg_val is already a pointer to the array; bitcast to generic ptr
+            self.builder
+                .build_bit_cast(arg_val.into_pointer_value(), ptr_type, "slice_coerce_ptr")
+                .map_err(|e| format!("failed to bitcast array ptr for slice coercion: {}", e))?
+                .into_pointer_value()
+        } else {
+            // arg_val is the array value itself; alloca it first, then take pointer
+            let alloca = self
+                .builder
+                .build_alloca(arg_val.get_type(), "slice_coerce_temp")
+                .map_err(|e| format!("failed to alloca array for slice coercion: {}", e))?;
+            self.builder
+                .build_store(alloca, arg_val)
+                .map_err(|e| format!("failed to store array for slice coercion: {}", e))?;
+            self.builder
+                .build_bit_cast(alloca, ptr_type, "slice_coerce_ptr")
+                .map_err(|e| format!("failed to bitcast alloca for slice coercion: {}", e))?
+                .into_pointer_value()
+        };
+
+        let len_val = self.ptr_int_type.const_int(arg_len as u64, false);
+
+        // Build the fat pointer struct { ptr, len }
+        let elems: [BasicTypeEnum; 2] = [ptr_type.into(), self.i64_type.into()];
+        let struct_ty = self.context.struct_type(&elems, false);
+        let fat_ptr = struct_ty.get_undef();
+        let fat_ptr = self
+            .builder
+            .build_insert_value(fat_ptr, ptr_val, 0, "fat_ptr")
+            .map_err(|e| format!("failed to build fat ptr insert: {}", e))?;
+        let fat_ptr = self
+            .builder
+            .build_insert_value(fat_ptr, len_val, 1, "fat_len")
+            .map_err(|e| format!("failed to build fat len insert: {}", e))?;
+        Ok(fat_ptr.into_struct_value().into())
     }
 
     fn emit_cast(
@@ -7798,6 +8266,95 @@ mod tests {
         assert_eq!(
             jit("fn main() -> usize { let a = [1.0, 2.0, 3.0]; a.len() }").unwrap(),
             3
+        );
+    }
+
+    // --- Slice argument type tests ---
+
+    #[test]
+    fn test_jit_slice_arg_ref_with_variable() {
+        // Pass &[i32; N] to a function expecting &[i32]
+        assert_eq!(
+            jit("fn sum(s: &[i32]) -> i32 { s[0] + s[1] + s[2] } fn main() -> i32 { let a = [10, 20, 30]; sum(&a) }").unwrap(),
+            60
+        );
+    }
+
+    #[test]
+    fn test_jit_slice_arg_ref_with_literal() {
+        // Pass &[i32; N] literal to a function expecting &[i32]
+        assert_eq!(
+            jit("fn first(s: &[i32]) -> i32 { s[0] } fn main() -> i32 { first(&[42, 99]) }")
+                .unwrap(),
+            42
+        );
+    }
+
+    #[test]
+    fn test_jit_slice_arg_val_with_variable() {
+        // Pass [i32; N] by value to a function expecting [i32]
+        assert_eq!(
+            jit("fn sum(s: [i32]) -> i32 { s[0] + s[1] } fn main() -> i32 { let a = [7, 8]; sum(a) }").unwrap(),
+            15
+        );
+    }
+
+    #[test]
+    fn test_jit_slice_arg_val_with_literal() {
+        // Pass [i32; N] literal to a function expecting [i32]
+        assert_eq!(
+            jit("fn first(s: [i32]) -> i32 { s[0] } fn main() -> i32 { first([99, 100]) }")
+                .unwrap(),
+            99
+        );
+    }
+
+    #[test]
+    fn test_jit_slice_arg_len() {
+        // .len() on &[i32] parameter
+        assert_eq!(
+            jit("fn count(s: &[i32]) -> usize { s.len() } fn main() -> usize { count(&[1, 2, 3, 4, 5]) }").unwrap(),
+            5
+        );
+    }
+
+    #[test]
+    fn test_jit_slice_arg_val_len() {
+        // .len() on [i32] parameter
+        assert_eq!(
+            jit(
+                "fn count(s: [i32]) -> usize { s.len() } fn main() -> usize { count([10, 20, 30]) }"
+            )
+            .unwrap(),
+            3
+        );
+    }
+
+    #[test]
+    fn test_jit_slice_arg_mutate_through_ref() {
+        // Mutate elements through &[i32]
+        assert_eq!(
+            jit("fn set_first(s: &mut [i32]) { s[0] = 77; } fn main() -> i32 { let mut a = [1, 2, 3]; set_first(&mut a); a[0] }").unwrap(),
+            77
+        );
+    }
+
+    #[test]
+    fn test_jit_slice_arg_empty_array() {
+        // Warning: empty arrays are not supported by the language at present
+        // but single-element arrays coerce just fine
+        assert_eq!(
+            jit("fn first(s: &[i32]) -> i32 { s[0] } fn main() -> i32 { first(&[55]) }").unwrap(),
+            55
+        );
+    }
+
+    #[test]
+    fn test_jit_slice_arg_val_multi_element() {
+        // Value slice with multiple accesses
+        assert_eq!(
+            jit("fn sum3(s: [i32]) -> i32 { s[0] + s[1] + s[2] } fn main() -> i32 { sum3([1, 10, 100]) }").unwrap(),
+            111
         );
     }
 }

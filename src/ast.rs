@@ -195,6 +195,11 @@ pub enum Expr {
         cond: Box<Expr>,
         body: Block,
     },
+    For {
+        pattern: Pattern,
+        container: Box<Expr>,
+        body: Block,
+    },
     Array(Vec<Expr>),
     Repeat(Box<Expr>, usize),
     Index {

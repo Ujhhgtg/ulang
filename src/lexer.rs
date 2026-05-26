@@ -220,6 +220,7 @@ impl<'a> Lexer<'a> {
                     "impl" => Token::Impl,
                     "trait" => Token::Trait,
                     "for" => Token::For,
+                    "in" => Token::In,
                     "self" => Token::Self_,
                     "Self" => Token::SelfType,
                     "_" => Token::Underscore,
@@ -432,14 +433,15 @@ mod tests {
 
     #[test]
     fn test_keywords() {
-        let tokens = lex_all("fn let mut const mod pub");
+        let tokens = lex_all("fn let mut const mod pub in");
         assert_eq!(tokens[0].0, Token::Fn);
         assert_eq!(tokens[1].0, Token::Let);
         assert_eq!(tokens[2].0, Token::Mut);
         assert_eq!(tokens[3].0, Token::Const);
         assert_eq!(tokens[4].0, Token::Mod);
         assert_eq!(tokens[5].0, Token::Pub);
-        assert!(matches!(tokens[6].0, Token::Eof));
+        assert_eq!(tokens[6].0, Token::In);
+        assert!(matches!(tokens[7].0, Token::Eof));
     }
 
     #[test]

@@ -1220,6 +1220,10 @@ impl<'a> Parser<'a> {
                         self.advance();
                         s
                     }
+                    Token::Underscore => {
+                        self.advance();
+                        "_".to_string()
+                    }
                     _ => {
                         let (_, span) = self.current().unwrap();
                         return Err(ParseError {
@@ -2172,6 +2176,7 @@ impl<'a> Parser<'a> {
             Token::If => self.parse_if_expr(),
             Token::Loop => self.parse_loop_expr(),
             Token::While => self.parse_while_expr(),
+            Token::For => self.parse_for_expr(),
             Token::Match => self.parse_match_expr(),
             _ => {
                 let default = (Token::Eof, Span::empty(0));
@@ -2271,6 +2276,21 @@ impl<'a> Parser<'a> {
         let body = self.parse_block()?;
         Ok(Expr::While {
             cond: Box::new(cond),
+            body,
+        })
+    }
+
+    fn parse_for_expr(&mut self) -> Result<Expr, ParseError> {
+        self.expect(&Token::For)?;
+        let pattern = self.parse_pattern()?;
+        self.expect(&Token::In)?;
+        self.suppress_struct_lit = true;
+        let container = self.parse_expr()?;
+        self.suppress_struct_lit = false;
+        let body = self.parse_block()?;
+        Ok(Expr::For {
+            pattern,
+            container: Box::new(container),
             body,
         })
     }
@@ -4002,6 +4022,24 @@ mod tests {
                 assert!(body.tail_expr.is_some());
             }
             _ => panic!("expected While expr"),
+        }
+    }
+
+    #[test]
+    fn test_for_expr() {
+        let prog = parse("fn main() { for x in container { 2 } }").unwrap();
+        assert!(prog.funcs[0].body.tail_expr.is_some());
+        match prog.funcs[0].body.tail_expr.as_ref().unwrap().as_ref() {
+            Expr::For {
+                pattern,
+                container,
+                body,
+            } => {
+                assert!(matches!(pattern, Pattern::Binding(_)));
+                assert!(matches!(container.as_ref(), Expr::Ident(_)));
+                assert!(body.tail_expr.is_some());
+            }
+            _ => panic!("expected For expr"),
         }
     }
 

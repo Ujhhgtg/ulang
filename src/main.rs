@@ -399,6 +399,15 @@ enum Command {
         /// Name of the project
         name: String,
     },
+    /// Emit LLVM IR for the source file
+    #[command(name = "emit-ir")]
+    EmitIr {
+        /// Path to .u source file
+        file: String,
+        /// Optimization level (0|none, 1|less, 2|default, 3|aggressive)
+        #[arg(short = 'o', long = "opt", value_parser = parse_opt_level)]
+        opt: Option<OptLevel>,
+    },
     /// Start the language server (LSP)
     Lsp,
 }
@@ -416,6 +425,9 @@ enum Mode {
         output: Option<String>,
         opt: OptLevel,
         cc: Cc,
+    },
+    EmitIr {
+        opt: OptLevel,
     },
 }
 
@@ -1444,6 +1456,7 @@ fn main() {
         Command::Run { script, .. } => *script,
         Command::Build { script, .. } => *script,
         Command::BuildRun { script, .. } => *script,
+        Command::EmitIr { .. } => true,
         _ => false,
     };
 
@@ -1454,6 +1467,7 @@ fn main() {
                 Command::Run { file, .. } => file.clone(),
                 Command::Build { file, .. } => file.clone(),
                 Command::BuildRun { file, .. } => file.clone(),
+                Command::EmitIr { file, .. } => Some(file.clone()),
                 _ => None,
             };
             let path = match file_opt {
@@ -1481,6 +1495,9 @@ fn main() {
                     output: output.clone(),
                     opt: *opt,
                     cc: *cc,
+                },
+                Command::EmitIr { opt, .. } => Mode::EmitIr {
+                    opt: opt.unwrap_or(OptLevel::Default),
                 },
                 _ => unreachable!(),
             };
@@ -1593,6 +1610,7 @@ fn main() {
             Command::Run { file, .. } => file.clone(),
             Command::Build { file, .. } => file.clone(),
             Command::BuildRun { file, .. } => file.clone(),
+            Command::EmitIr { file, .. } => Some(file.clone()),
             _ => None,
         };
         let path = match file_opt {
@@ -1622,6 +1640,9 @@ fn main() {
                 output: output.clone(),
                 opt: *opt,
                 cc: *cc,
+            },
+            Command::EmitIr { opt, .. } => Mode::EmitIr {
+                opt: opt.unwrap_or(OptLevel::Default),
             },
             _ => unreachable!(),
         };
@@ -1703,6 +1724,19 @@ fn main() {
             if !status.success() {
                 process::exit(status.code().unwrap_or(1));
             }
+        }
+        Mode::EmitIr { opt } => {
+            let opt_level: inkwell::OptimizationLevel = opt.into();
+            let mut codegen = codegen::CodeGen::new_native(&context, opt_level);
+            codegen.overloads = overloads;
+
+            if let Err(msg) = codegen.compile_module(&program) {
+                eprintln!("codegen error: {}", msg);
+                process::exit(1);
+            }
+
+            let ir = codegen.emit_ir();
+            print!("{}", ir);
         }
     }
 }

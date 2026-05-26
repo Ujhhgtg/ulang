@@ -52,71 +52,13 @@ impl Command {
         self
     }
 
-    pub fn args(&mut self, args: [&str; 1]) -> &mut Command {
-        self.arg(args[0]);
-        self
-    }
-
-    pub fn args(&mut self, args: [&str; 2]) -> &mut Command {
-        self.arg(args[0]);
-        self.arg(args[1]);
-        self
-    }
-
-    pub fn args(&mut self, args: [&str; 3]) -> &mut Command {
-        self.arg(args[0]);
-        self.arg(args[1]);
-        self.arg(args[2]);
-        self
-    }
-
-    pub fn args(&mut self, args: [&str; 4]) -> &mut Command {
-        self.arg(args[0]);
-        self.arg(args[1]);
-        self.arg(args[2]);
-        self.arg(args[3]);
-        self
-    }
-
-    pub fn args(&mut self, args: [&str; 5]) -> &mut Command {
-        self.arg(args[0]);
-        self.arg(args[1]);
-        self.arg(args[2]);
-        self.arg(args[3]);
-        self.arg(args[4]);
-        self
-    }
-
-    pub fn args(&mut self, args: [&str; 6]) -> &mut Command {
-        self.arg(args[0]);
-        self.arg(args[1]);
-        self.arg(args[2]);
-        self.arg(args[3]);
-        self.arg(args[4]);
-        self.arg(args[5]);
-        self
-    }
-
-    pub fn args(&mut self, args: [&str; 7]) -> &mut Command {
-        self.arg(args[0]);
-        self.arg(args[1]);
-        self.arg(args[2]);
-        self.arg(args[3]);
-        self.arg(args[4]);
-        self.arg(args[5]);
-        self.arg(args[6]);
-        self
-    }
-
-    pub fn args(&mut self, args: [&str; 8]) -> &mut Command {
-        self.arg(args[0]);
-        self.arg(args[1]);
-        self.arg(args[2]);
-        self.arg(args[3]);
-        self.arg(args[4]);
-        self.arg(args[5]);
-        self.arg(args[6]);
-        self.arg(args[7]);
+    pub fn args(&mut self, args: &[&str]) -> &mut Command {
+        let mut i = 0;
+        let len = args.len();
+        while i < len {
+            self.arg(args[i]);
+            i = i + 1;
+        };
         self
     }
 

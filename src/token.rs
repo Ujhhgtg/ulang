@@ -87,6 +87,7 @@ mod tests {
         assert_eq!(Token::Type, Token::Type);
         assert_eq!(Token::Trait, Token::Trait);
         assert_eq!(Token::For, Token::For);
+        assert_eq!(Token::In, Token::In);
         assert_eq!(Token::Self_, Token::Self_);
         assert_eq!(Token::SelfType, Token::SelfType);
         assert_eq!(Token::Underscore, Token::Underscore);
@@ -183,6 +184,7 @@ pub enum Token {
     Trait,
     Type,
     For,
+    In,
     Self_,
     SelfType,
     Underscore,

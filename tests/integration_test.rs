@@ -1038,3 +1038,172 @@ fn test_vec_iter_mut() {
         "#
     ));
 }
+
+#[test]
+fn test_for_loop_array() {
+    assert!(run_test(
+        "for_loop_array",
+        r#"
+        use std::iter::IntoIterator;
+        use std::iter::Iterator;
+        use std::io::print;
+
+        fn main() {
+            let a = [10, 20, 30];
+            for x in a {
+                print(*x);
+            }
+        }
+        "#
+    ));
+}
+
+#[test]
+fn test_for_loop_vec() {
+    assert!(run_test(
+        "for_loop_vec",
+        r#"
+        use std::vec::Vec;
+        use std::iter::IntoIterator;
+        use std::iter::Iterator;
+        use std::io::print;
+
+        fn main() {
+            let mut v: Vec<i32> = Vec::new();
+            v.push(100);
+            v.push(200);
+            for x in v {
+                print(*x);
+            };
+            v.drop();
+        }
+        "#
+    ));
+}
+
+#[test]
+fn test_for_loop_iterator() {
+    assert!(run_test(
+        "for_loop_iterator",
+        r#"
+        use std::iter::IntoIterator;
+        use std::iter::Iterator;
+        use std::io::print;
+
+        fn main() {
+            let a = [5, 10];
+            let mut it = a.iter();
+            for x in it {
+                print(*x);
+            }
+        }
+        "#
+    ));
+}
+
+#[test]
+fn test_for_loop_nested() {
+    assert!(run_test(
+        "for_loop_nested",
+        r#"
+        use std::iter::IntoIterator;
+        use std::iter::Iterator;
+        use std::io::print;
+
+        fn main() {
+            let a = [1, 2];
+            let b = [10, 20];
+            for x in a {
+                for y in b {
+                    print(*x + *y);
+                }
+            }
+        }
+        "#
+    ));
+}
+
+#[test]
+fn test_static_method_calls() {
+    assert!(run_test(
+        "static_method_calls",
+        r#"use std::option::Option;
+        
+        struct Point {
+            x: i32,
+            y: i32,
+        }
+        
+        impl Point {
+            fn area(&self) -> i32 {
+                self.x * self.y
+            }
+        }
+        
+        fn main() -> i32 {
+            let p = Point { x: 3, y: 4 };
+            let opt = Option::Some(42);
+            
+            let area = Point::area(&p);
+            let is_some = Option::is_some(&opt);
+            
+            if area == 12 && is_some {
+                return 0;
+            };
+            return 1;
+        }"#
+    ));
+}
+
+#[test]
+fn test_wildcard_let_integration() {
+    // 1. Basic wildcard let-binding
+    assert!(run_test(
+        "wildcard_basic",
+        "fn main() { let _ = 42; let _ = true; }"
+    ));
+
+    // 2. Typed wildcard let-binding
+    assert!(run_test(
+        "wildcard_typed",
+        "fn main() { let _ : i32 = 42; }"
+    ));
+
+    // 3. side effects inside wildcard let-binding
+    assert!(run_test(
+        "wildcard_side_effects",
+        r#"
+        fn mutate(x: *mut i32) -> i32 {
+            *x = 100;
+            0
+        }
+        fn main() -> i32 {
+            let mut val = 0;
+            let _ = mutate(&mut val);
+            if val == 100 {
+                return 0;
+            };
+            return 1;
+        }
+        "#
+    ));
+
+    // 4. Underscore is not accessible (must produce a compile/parse error)
+    assert!(run_test_expect_error(
+        "wildcard_inaccessible",
+        "fn main() { let _ = 42; let y = _; }"
+    ));
+}
+
+#[test]
+fn test_emit_ir_subcommand() {
+    let path = write_test("fn main() { let x = 42; }", "emit_ir_test");
+    let output = Command::new(ulang_binary())
+        .args(["emit-ir", &path.to_string_lossy()])
+        .output()
+        .expect("failed to execute ulang emit-ir");
+    assert!(output.status.success());
+    let ir = String::from_utf8_lossy(&output.stdout);
+    assert!(ir.contains("define i32 @main()"));
+    assert!(ir.contains("store i32 42, ptr %x"));
+}

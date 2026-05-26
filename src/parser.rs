@@ -71,8 +71,8 @@ impl<'a> Parser<'a> {
                     break;
                 }
                 Token::Use => {
-                    let decl = self.parse_use_decl(is_pub)?;
-                    uses.push(decl);
+                    let decls = self.parse_use_decl(is_pub)?;
+                    uses.extend(decls);
                 }
                 Token::Mod => {
                     let decl = self.parse_mod_decl(is_pub)?;
@@ -233,8 +233,8 @@ impl<'a> Parser<'a> {
             };
             match self.peek_token() {
                 Token::Use => {
-                    let decl = self.parse_use_decl(is_nested_pub)?;
-                    uses.push(decl);
+                    let decls = self.parse_use_decl(is_nested_pub)?;
+                    uses.extend(decls);
                 }
                 Token::Mod => {
                     let decl = self.parse_mod_decl(is_nested_pub)?;
@@ -393,50 +393,119 @@ impl<'a> Parser<'a> {
         Ok(attrs)
     }
 
-    fn parse_use_decl(&mut self, is_pub: bool) -> Result<Use, ParseError> {
+    fn parse_use_decl(&mut self, is_pub: bool) -> Result<Vec<Use>, ParseError> {
         let lo = self.current_span_lo();
         self.expect(&Token::Use)?;
-        let mut path = Vec::new();
-        loop {
-            match self.peek_token() {
-                Token::Ident(s) => {
-                    path.push(s.clone());
-                    self.advance();
-                }
-                _ => {
-                    let default = (Token::Eof, Span::empty(0));
-                    let (_, span) = self.current().unwrap_or(&default);
-                    return Err(ParseError {
-                        span: *span,
-                        msg: "expected identifier in use path".to_string(),
-                    });
-                }
-            }
-            if *self.peek_token() == Token::DoubleColon {
-                self.advance();
-            } else {
-                break;
-            }
-        }
-        if path.len() < 2 {
-            let default = (Token::Eof, Span::empty(0));
-            let (_, span) = self.current().unwrap_or(&default);
-            return Err(ParseError {
-                span: *span,
-                msg: format!(
-                    "use path must have at least 2 segments (e.g. 'std::io'), found {}",
-                    path.len()
-                ),
-            });
-        }
+
+        let mut uses = Vec::new();
+        self.parse_use_item(&[], &mut uses, is_pub)?;
+
         self.expect(&Token::Semicolon)?;
         let hi = self.last_span_end();
-        Ok(Use {
-            path,
-            is_pub,
-            module_path: Vec::new(),
-            span: Span::new(lo, hi),
-        })
+
+        // Validate each expanded use
+        for u in &uses {
+            if u.path.len() < 2 {
+                return Err(ParseError {
+                    span: u.span,
+                    msg: format!(
+                        "use path must have at least 2 segments (e.g. 'std::io'), found {}",
+                        u.path.len()
+                    ),
+                });
+            }
+        }
+
+        // Assign the full declaration span to each use
+        let span = Span::new(lo, hi);
+        for u in &mut uses {
+            u.span = span;
+        }
+
+        Ok(uses)
+    }
+
+    /// Parse a single use-path item, which may be:
+    /// - `ident` — a simple path segment
+    /// - `ident :: <rest>` — a path segment followed by a sub-path
+    /// - `{ list }` — a brace group of items
+    /// - `self` — refers to the current prefix
+    ///
+    /// Brace groups are expanded into multiple `Use` entries at parse time.
+    fn parse_use_item(
+        &mut self,
+        prefix: &[String],
+        uses: &mut Vec<Use>,
+        is_pub: bool,
+    ) -> Result<(), ParseError> {
+        match self.peek_token().clone() {
+            Token::Self_ => {
+                self.advance();
+                uses.push(Use {
+                    path: prefix.to_vec(),
+                    is_pub,
+                    module_path: Vec::new(),
+                    span: Span::empty(0),
+                });
+                Ok(())
+            }
+            Token::LBrace => {
+                self.advance();
+                self.parse_use_list(prefix, uses, is_pub)?;
+                self.expect(&Token::RBrace)
+            }
+            Token::Ident(s) => {
+                self.advance();
+                let mut path = prefix.to_vec();
+                path.push(s);
+
+                if *self.peek_token() == Token::DoubleColon {
+                    self.advance();
+                    self.parse_use_item(&path, uses, is_pub)
+                } else {
+                    uses.push(Use {
+                        path,
+                        is_pub,
+                        module_path: Vec::new(),
+                        span: Span::empty(0),
+                    });
+                    Ok(())
+                }
+            }
+            _ => {
+                let default = (Token::Eof, Span::empty(0));
+                let (_, span) = self.current().unwrap_or(&default);
+                Err(ParseError {
+                    span: *span,
+                    msg: "expected identifier, `self`, or `{` in use path".to_string(),
+                })
+            }
+        }
+    }
+
+    /// Parse a comma-separated list of use-path items inside braces:
+    /// `item1, item2, ...`
+    fn parse_use_list(
+        &mut self,
+        prefix: &[String],
+        uses: &mut Vec<Use>,
+        is_pub: bool,
+    ) -> Result<(), ParseError> {
+        loop {
+            if *self.peek_token() == Token::RBrace {
+                break;
+            }
+
+            self.parse_use_item(prefix, uses, is_pub)?;
+
+            match self.peek_token() {
+                Token::Comma => {
+                    self.advance();
+                }
+                _ => break,
+            }
+        }
+        Ok(())
     }
 
     fn parse_extern(&mut self, is_pub: bool, funcs: &mut Vec<Function>) -> Result<(), ParseError> {
@@ -3194,6 +3263,53 @@ mod tests {
                 e.msg
             );
         }
+    }
+
+    #[test]
+    fn test_use_brace_group_items() {
+        let prog = parse("use std::io::{print, println};\nfn main() {}").unwrap();
+        assert_eq!(prog.uses.len(), 2);
+        assert_eq!(prog.uses[0].path, vec!["std", "io", "print"]);
+        assert_eq!(prog.uses[1].path, vec!["std", "io", "println"]);
+    }
+
+    #[test]
+    fn test_use_brace_group_self() {
+        let prog = parse("use std::io::{self, println};\nfn main() {}").unwrap();
+        assert_eq!(prog.uses.len(), 2);
+        assert_eq!(prog.uses[0].path, vec!["std", "io"]);
+        assert_eq!(prog.uses[1].path, vec!["std", "io", "println"]);
+    }
+
+    #[test]
+    fn test_use_brace_nested() {
+        let prog = parse("use std::{io::{self, read}, fs};\nfn main() {}").unwrap();
+        assert_eq!(prog.uses.len(), 3);
+        assert_eq!(prog.uses[0].path, vec!["std", "io"]);
+        assert_eq!(prog.uses[1].path, vec!["std", "io", "read"]);
+        assert_eq!(prog.uses[2].path, vec!["std", "fs"]);
+    }
+
+    #[test]
+    fn test_use_brace_trailing_comma() {
+        let prog = parse("use std::io::{print, println,};\nfn main() {}").unwrap();
+        assert_eq!(prog.uses.len(), 2);
+        assert_eq!(prog.uses[0].path, vec!["std", "io", "print"]);
+        assert_eq!(prog.uses[1].path, vec!["std", "io", "println"]);
+    }
+
+    #[test]
+    fn test_use_brace_single_item() {
+        let prog = parse("use std::io::{print};\nfn main() {}").unwrap();
+        assert_eq!(prog.uses.len(), 1);
+        assert_eq!(prog.uses[0].path, vec!["std", "io", "print"]);
+    }
+
+    #[test]
+    fn test_use_brace_empty() {
+        // Empty braces are valid but produce no uses
+        let prog = parse("use std::io::{};\nfn main() {}").unwrap();
+        assert_eq!(prog.uses.len(), 0);
     }
 
     #[test]

@@ -3,6 +3,10 @@ use std::alloc::malloc;
 use std::alloc::realloc;
 use std::alloc::free;
 use std::alloc::memcpy;
+use std::iter::IntoIterator;
+use std::iter::IntoIteratorMut;
+use std::iter::Iter;
+use std::iter::IterMut;
 
 pub struct Vec<T> {
     pub ptr: *mut u8,
@@ -66,5 +70,23 @@ impl<T> Vec<T> {
             self.len = 0;
             self.cap = 0;
         };
+    }
+}
+
+impl<T> IntoIterator<T> for Vec<T> {
+    fn iter(&self) -> Iter<T> {
+        let elem_size = __builtin_size_of(*(0 as *const T));
+        let start = self.ptr;
+        let end = (start as usize + self.len * elem_size) as *mut u8;
+        Iter { ptr: start, end: end }
+    }
+}
+
+impl<T> IntoIteratorMut<T> for Vec<T> {
+    fn iter_mut(&mut self) -> IterMut<T> {
+        let elem_size = __builtin_size_of(*(0 as *const T));
+        let start = self.ptr;
+        let end = (start as usize + self.len * elem_size) as *mut u8;
+        IterMut { ptr: start, end: end }
     }
 }

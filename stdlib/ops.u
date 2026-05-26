@@ -13,3 +13,13 @@ pub trait Mul {
 pub trait Div {
     fn div(&self, other: &Self) -> Self;
 }
+
+/// Index<Idx, T> — access an element by index, returning a reference to T.
+pub trait Index<Idx, T> {
+    fn index(&self, idx: Idx) -> &T;
+}
+
+/// IndexMut<Idx, T> — mutable element access by index.
+pub trait IndexMut<Idx, T> {
+    fn index_mut(&mut self, idx: Idx) -> &mut T;
+}

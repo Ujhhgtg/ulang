@@ -117,6 +117,8 @@ pub enum Type {
     Ptr { inner: Box<Type>, is_mut: bool },
     Ref { inner: Box<Type>, is_mut: bool },
     Array { inner: Box<Type>, len: usize },
+    GenericArray { inner: Box<Type>, len_var: String },
+    Slice { inner: Box<Type> },
     Struct(String),
     GenericInstance(String, Vec<Type>),
     Alias(String, Vec<Type>),
@@ -299,7 +301,9 @@ pub struct EnumVariant {
 pub struct ImplDecl {
     pub impl_type: Type,
     pub trait_name: Option<String>,
+    pub trait_args: Vec<Type>,
     pub type_params: Vec<String>,
+    pub const_params: Vec<String>,
     pub methods: Vec<Function>,
 }
 

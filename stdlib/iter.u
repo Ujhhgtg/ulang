@@ -1,0 +1,50 @@
+use std::option::Option;
+use std::slice::IntoIterator;
+
+pub struct Iter<T> {
+    pub ptr: *mut u8,
+    pub end: *mut u8,
+}
+
+pub struct IterMut<T> {
+    pub ptr: *mut u8,
+    pub end: *mut u8,
+}
+
+pub trait Iterator<T> {
+    fn next(&mut self) -> Option<T>;
+}
+
+pub trait IntoIterator<T> {
+    fn iter(&self) -> Iter<T>;
+}
+
+pub trait IntoIteratorMut<T> {
+    fn iter_mut(&mut self) -> IterMut<T>;
+}
+
+impl<T> Iterator<&T> for Iter<T> {
+    fn next(&mut self) -> Option<&T> {
+        if self.ptr as usize == self.end as usize {
+            Option::None
+        } else {
+            let elem_size = __builtin_size_of(*(0 as *const T));
+            let current = self.ptr as *const T;
+            self.ptr = (self.ptr as usize + elem_size) as *mut u8;
+            Option::Some(&*current)
+        }
+    }
+}
+
+impl<T> Iterator<&mut T> for IterMut<T> {
+    fn next(&mut self) -> Option<&mut T> {
+        if self.ptr as usize == self.end as usize {
+            Option::None
+        } else {
+            let elem_size = __builtin_size_of(*(0 as *const T));
+            let current = self.ptr as *mut T;
+            self.ptr = (self.ptr as usize + elem_size) as *mut u8;
+            Option::Some(&mut *current)
+        }
+    }
+}

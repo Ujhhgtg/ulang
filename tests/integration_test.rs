@@ -888,3 +888,153 @@ fn test_pub_extern_functions() {
         "#
     ));
 }
+
+#[test]
+fn test_array_iter() {
+    assert!(run_test(
+        "array_iter",
+        r#"
+        use std::iter::IntoIterator;
+        use std::iter::Iterator;
+        use std::option::Option;
+        use std::io::print;
+
+        fn main() {
+            let a = [10, 20, 30];
+            let mut it = a.iter();
+            
+            match it.next() {
+                Option::Some(x) => { print(*x); }
+                Option::None => {}
+            };
+            match it.next() {
+                Option::Some(x) => { print(*x); }
+                Option::None => {}
+            };
+            match it.next() {
+                Option::Some(x) => { print(*x); }
+                Option::None => {}
+            };
+            match it.next() {
+                Option::Some(x) => { print(*x); }
+                Option::None => { print(999); }
+            };
+        }
+        "#
+    ));
+}
+
+#[test]
+fn test_array_iter_mut() {
+    assert!(run_test(
+        "array_iter_mut",
+        r#"
+        use std::iter::IntoIteratorMut;
+        use std::iter::Iterator;
+        use std::option::Option;
+        use std::io::print;
+
+        fn main() {
+            let mut a = [10, 20, 30];
+            
+            // Increment each element
+            let mut it = a.iter_mut();
+            match it.next() {
+                Option::Some(x) => { *x = *x + 1; }
+                Option::None => {}
+            };
+            match it.next() {
+                Option::Some(x) => { *x = *x + 1; }
+                Option::None => {}
+            };
+            match it.next() {
+                Option::Some(x) => { *x = *x + 1; }
+                Option::None => {}
+            };
+
+            // Print them to check they were mutated in-place
+            print(a[0]);
+            print(a[1]);
+            print(a[2]);
+        }
+        "#
+    ));
+}
+
+#[test]
+fn test_vec_iter() {
+    assert!(run_test(
+        "vec_iter",
+        r#"
+        use std::vec::Vec;
+        use std::iter::IntoIterator;
+        use std::iter::Iterator;
+        use std::option::Option;
+        use std::io::print;
+
+        fn main() {
+            let mut v: Vec<i32> = Vec::new();
+            v.push(100);
+            v.push(200);
+            
+            let mut it = v.iter();
+            match it.next() {
+                Option::Some(x) => { print(*x); }
+                Option::None => {}
+            };
+            match it.next() {
+                Option::Some(x) => { print(*x); }
+                Option::None => {}
+            };
+            match it.next() {
+                Option::Some(x) => {}
+                Option::None => { print(999); }
+            };
+            
+            v.drop();
+        }
+        "#
+    ));
+}
+
+#[test]
+fn test_vec_iter_mut() {
+    assert!(run_test(
+        "vec_iter_mut",
+        r#"
+        use std::vec::Vec;
+        use std::iter::IntoIteratorMut;
+        use std::iter::Iterator;
+        use std::option::Option;
+        use std::io::print;
+
+        fn main() {
+            let mut v: Vec<i32> = Vec::new();
+            v.push(100);
+            v.push(200);
+            
+            let mut it = v.iter_mut();
+            match it.next() {
+                Option::Some(x) => { *x = *x + 5; }
+                Option::None => {}
+            };
+            match it.next() {
+                Option::Some(x) => { *x = *x + 5; }
+                Option::None => {}
+            };
+
+            // Pop them to verify they mutated
+            match v.pop() {
+                Option::Some(val) => { print(val); }
+                Option::None => {}
+            };
+            match v.pop() {
+                Option::Some(val) => { print(val); }
+                Option::None => {}
+            };
+
+            v.drop();
+        }
+        "#
+    ));
+}

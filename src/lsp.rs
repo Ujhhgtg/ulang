@@ -157,6 +157,12 @@ fn type_to_string(ty: &crate::ast::Type) -> String {
             }
         }
         crate::ast::Type::SelfType => "Self".to_string(),
+        crate::ast::Type::Slice { inner } => {
+            format!("[{}]", type_to_string(inner))
+        }
+        crate::ast::Type::GenericArray { inner, len_var } => {
+            format!("[{}; {}]", type_to_string(inner), len_var)
+        }
     }
 }
 

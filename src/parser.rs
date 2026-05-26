@@ -836,28 +836,77 @@ impl<'a> Parser<'a> {
         } else {
             Vec::new()
         };
-        // Check for `impl Trait for Type` or `impl Type`
-        let trait_name = if self.pos + 2 < self.tokens.len() {
-            let is_ident_for = matches!(&self.tokens[self.pos].0, Token::Ident(_))
-                && self.tokens[self.pos + 1].0 == Token::For;
-            if is_ident_for {
-                let name = match self.peek_token() {
-                    Token::Ident(s) => {
-                        let s = s.clone();
-                        self.advance();
-                        s
+        // Check for `impl Trait<Args> for Type` or `impl Trait for Type` or `impl Type`
+        // Use lookahead to determine if this is a trait impl without consuming tokens
+        let (trait_name, trait_args) = {
+            let mut lookahead = self.pos;
+            // Check if current token is an Ident
+            if lookahead < self.tokens.len() && matches!(&self.tokens[lookahead].0, Token::Ident(_))
+            {
+                lookahead += 1; // skip ident
+                // Optionally skip <Args>
+                if lookahead < self.tokens.len() && self.tokens[lookahead].0 == Token::Lt {
+                    lookahead += 1; // skip <
+                    // Skip until matching > (handle nested <>)
+                    let mut depth = 1;
+                    while lookahead < self.tokens.len() && depth > 0 {
+                        match &self.tokens[lookahead].0 {
+                            Token::Lt => depth += 1,
+                            Token::Gt => depth -= 1,
+                            _ => {}
+                        }
+                        lookahead += 1;
                     }
-                    _ => unreachable!(),
-                };
-                self.expect(&Token::For)?;
-                Some(name)
+                }
+                // Check if next is `for`
+                if lookahead < self.tokens.len() && self.tokens[lookahead].0 == Token::For {
+                    // It's a trait impl; consume the tokens
+                    let name = match self.peek_token() {
+                        Token::Ident(s) => {
+                            let s = s.clone();
+                            self.advance();
+                            s
+                        }
+                        _ => unreachable!(),
+                    };
+                    // Parse optional generic args: Trait<Args>
+                    let args = if *self.peek_token() == Token::Lt {
+                        self.advance(); // consume <
+                        let mut args = Vec::new();
+                        loop {
+                            args.push(self.parse_type()?);
+                            if *self.peek_token() == Token::Comma {
+                                self.advance();
+                            } else {
+                                break;
+                            }
+                        }
+                        self.expect(&Token::Gt)?;
+                        args
+                    } else {
+                        Vec::new()
+                    };
+                    self.expect(&Token::For)?;
+                    (Some(name), args)
+                } else {
+                    (None, Vec::new())
+                }
             } else {
-                None
+                (None, Vec::new())
             }
-        } else {
-            None
         };
         let impl_type = self.parse_type()?;
+        // Determine const generic params (those that appear as array length identifiers)
+        let const_params = match &impl_type {
+            Type::GenericArray { len_var, .. } => vec![len_var.clone()],
+            _ => Vec::new(),
+        };
+        // Filter type_params to exclude const params
+        let type_params: Vec<String> = type_params
+            .into_iter()
+            .filter(|p| !const_params.contains(p))
+            .collect();
+
         self.expect(&Token::LBrace)?;
         let mut methods = Vec::new();
         while *self.peek_token() != Token::RBrace && *self.peek_token() != Token::Eof {
@@ -876,7 +925,9 @@ impl<'a> Parser<'a> {
         Ok(ImplDecl {
             impl_type,
             trait_name,
+            trait_args,
             type_params,
+            const_params,
             methods,
         })
     }
@@ -1569,31 +1620,49 @@ impl<'a> Parser<'a> {
         if *self.peek_token() == Token::LParen {
             return self.parse_tuple_type();
         }
-        // Handle array type: [Type; IntLit]
+        // Handle array/slice types: [Type; IntLit] or [Type]
         if *self.peek_token() == Token::LBracket {
             self.advance(); // consume [
             let inner = self.parse_type()?;
-            self.expect(&Token::Semicolon)?;
-            let len = match self.peek_token() {
-                Token::IntLit(n) => {
-                    let n = *n;
-                    self.advance();
-                    n as usize
+            if *self.peek_token() == Token::Semicolon {
+                // [Type; IntLit] — fixed-size array, or [Type; Ident] — const generic array
+                self.advance(); // consume ;
+                match self.peek_token() {
+                    Token::IntLit(n) => {
+                        let n = *n;
+                        self.advance();
+                        self.expect(&Token::RBracket)?;
+                        return Ok(Type::Array {
+                            inner: Box::new(inner),
+                            len: n as usize,
+                        });
+                    }
+                    Token::Ident(s) => {
+                        let s = s.clone();
+                        self.advance();
+                        self.expect(&Token::RBracket)?;
+                        return Ok(Type::GenericArray {
+                            inner: Box::new(inner),
+                            len_var: s,
+                        });
+                    }
+                    _ => {
+                        let default = (Token::Eof, Span::empty(0));
+                        let (_, span) = self.current().unwrap_or(&default);
+                        return Err(ParseError {
+                            span: *span,
+                            msg: "expected integer literal or identifier for array length"
+                                .to_string(),
+                        });
+                    }
                 }
-                _ => {
-                    let default = (Token::Eof, Span::empty(0));
-                    let (_, span) = self.current().unwrap_or(&default);
-                    return Err(ParseError {
-                        span: *span,
-                        msg: "expected integer literal for array length".to_string(),
-                    });
-                }
-            };
-            self.expect(&Token::RBracket)?;
-            return Ok(Type::Array {
-                inner: Box::new(inner),
-                len,
-            });
+            } else {
+                // [Type] — unsized slice
+                self.expect(&Token::RBracket)?;
+                return Ok(Type::Slice {
+                    inner: Box::new(inner),
+                });
+            }
         }
         let token = self.peek_token().clone();
         self.advance();
@@ -4219,6 +4288,84 @@ mod tests {
                 _ => panic!("expected nested Index expression"),
             },
             _ => panic!("expected Expr stmt"),
+        }
+    }
+
+    #[test]
+    fn test_slice_type_parsing() {
+        // [i32] should parse as Type::Slice
+        let prog = parse("fn main() { let a: [i32] = loop {}; }").unwrap();
+        match &prog.funcs[0].body.stmts[0] {
+            Stmt::Let {
+                type_ann: Some(ty), ..
+            } => {
+                assert_eq!(
+                    *ty,
+                    Type::Slice {
+                        inner: Box::new(Type::I32)
+                    }
+                );
+            }
+            _ => panic!("expected Let with slice type annotation"),
+        }
+    }
+
+    #[test]
+    fn test_slice_impl_parsing() {
+        // impl<T> [T] { fn len(&self) -> usize { 0 } }
+        let prog = parse("impl<T> [T] { fn len(&self) -> usize { 0 } }").unwrap();
+        assert_eq!(prog.impls.len(), 1);
+        let imp = &prog.impls[0];
+        assert_eq!(imp.type_params, vec!["T".to_string()]);
+        assert!(imp.trait_name.is_none());
+        match &imp.impl_type {
+            Type::Slice { inner } => {
+                assert_eq!(**inner, Type::Struct("T".to_string()));
+            }
+            _ => panic!("expected Slice impl type, got {:?}", imp.impl_type),
+        }
+        assert_eq!(imp.methods.len(), 1);
+        assert_eq!(imp.methods[0].name, "len");
+    }
+
+    #[test]
+    fn test_slice_trait_impl_parsing() {
+        // impl<T> Index<T, usize> for [T] { fn index(&self, idx: usize) -> &T { loop {} } }
+        let prog = parse(
+            "impl<T> Index<T, usize> for [T] { fn index(&self, idx: usize) -> &T { loop {} } }",
+        )
+        .unwrap();
+        assert_eq!(prog.impls.len(), 1);
+        let imp = &prog.impls[0];
+        assert_eq!(imp.type_params, vec!["T".to_string()]);
+        assert_eq!(imp.trait_name, Some("Index".to_string()));
+        match &imp.impl_type {
+            Type::Slice { inner } => {
+                assert_eq!(**inner, Type::Struct("T".to_string()));
+            }
+            _ => panic!("expected Slice impl type, got {:?}", imp.impl_type),
+        }
+        assert_eq!(imp.methods.len(), 1);
+        assert_eq!(imp.methods[0].name, "index");
+    }
+
+    #[test]
+    fn test_slice_type_not_breaking_array_type() {
+        // [i32; 5] should still parse as Type::Array
+        let prog = parse("fn main() { let a: [i32; 5] = [1, 2, 3, 4, 5]; }").unwrap();
+        match &prog.funcs[0].body.stmts[0] {
+            Stmt::Let {
+                type_ann: Some(ty), ..
+            } => {
+                assert_eq!(
+                    *ty,
+                    Type::Array {
+                        inner: Box::new(Type::I32),
+                        len: 5
+                    }
+                );
+            }
+            _ => panic!("expected Let with array type annotation"),
         }
     }
 

@@ -3431,7 +3431,7 @@ impl<'ctx> CodeGen<'ctx> {
     fn compile_stmt(&mut self, stmt: &Stmt) -> Result<(), String> {
         match stmt {
             Stmt::Let {
-                name,
+                pattern,
                 is_mut,
                 type_ann,
                 init,
@@ -3440,31 +3440,46 @@ impl<'ctx> CodeGen<'ctx> {
                 if let Some(ann_ty) = type_ann {
                     self.check_visibility_of_type(&self.current_module_path, ann_ty)?;
                 }
-                let ty = type_ann.clone().unwrap_or_else(|| self.expr_type(init));
-                let llvm_ty = self.type_to_llvm(&ty);
-                let alloca = self
-                    .builder
-                    .build_alloca(llvm_ty, name)
-                    .map_err(|e| format!("failed to build alloca: {}", e))?;
-                let mut value = if let Some(ann_ty) = type_ann {
-                    self.with_expected_type(ann_ty, |this| this.compile_expr(init))?
-                } else {
-                    self.compile_expr(init)?
-                };
-                // Only attempt type coercion when the LLVM types differ,
-                // to handle cases like StructLit vs GenericInstance types
-                if value.get_type() != llvm_ty
-                    && let Some(ann_ty) = type_ann
-                {
-                    let inferred = self.expr_type(init);
-                    if ann_ty != &inferred {
-                        value = self.emit_cast(value, ann_ty)?;
+                // Only create a binding for irrefutable patterns that bind a name
+                match pattern {
+                    Pattern::Binding(name) => {
+                        let ty = type_ann.clone().unwrap_or_else(|| self.expr_type(init));
+                        let llvm_ty = self.type_to_llvm(&ty);
+                        let alloca = self
+                            .builder
+                            .build_alloca(llvm_ty, name)
+                            .map_err(|e| format!("failed to build alloca: {}", e))?;
+                        let mut value = if let Some(ann_ty) = type_ann {
+                            self.with_expected_type(ann_ty, |this| this.compile_expr(init))?
+                        } else {
+                            self.compile_expr(init)?
+                        };
+                        // Only attempt type coercion when the LLVM types differ,
+                        // to handle cases like StructLit vs GenericInstance types
+                        if value.get_type() != llvm_ty
+                            && let Some(ann_ty) = type_ann
+                        {
+                            let inferred = self.expr_type(init);
+                            if ann_ty != &inferred {
+                                value = self.emit_cast(value, ann_ty)?;
+                            }
+                        }
+                        self.builder
+                            .build_store(alloca, value)
+                            .map_err(|e| format!("failed to build store: {}", e))?;
+                        self.symbols
+                            .insert(name.clone(), (alloca, *is_mut, ty));
+                    }
+                    Pattern::Wildcard => {
+                        // Evaluate the init expression for side effects, discard result
+                        self.compile_expr(init)?;
+                    }
+                    _ => {
+                        // Refutable patterns (EnumVariant, IntLit, BoolLit) are rejected
+                        // by the parser's exhaustiveness check and should never reach codegen
+                        return Err("internal error: refutable pattern reached codegen".to_string());
                     }
                 }
-                self.builder
-                    .build_store(alloca, value)
-                    .map_err(|e| format!("failed to build store: {}", e))?;
-                self.symbols.insert(name.clone(), (alloca, *is_mut, ty));
                 Ok(())
             }
             Stmt::Const { name, init, .. } => {

@@ -1207,3 +1207,27 @@ fn test_emit_ir_subcommand() {
     assert!(ir.contains("define i32 @main()"));
     assert!(ir.contains("store i32 42, ptr %x"));
 }
+
+#[test]
+fn test_non_exhaustive_let_pattern() {
+    assert!(run_test_expect_error(
+        "non_exhaustive_pattern",
+        "fn main() { let opt = Option::Some(0); let Some(val) = opt; }"
+    ));
+}
+
+#[test]
+fn test_irrefutable_let_pattern_binding() {
+    assert!(run_test(
+        "irrefutable_binding",
+        "fn main() { let x = 42; }"
+    ));
+}
+
+#[test]
+fn test_irrefutable_let_pattern_wildcard() {
+    assert!(run_test(
+        "irrefutable_wildcard",
+        "fn main() { let _ = 42; }"
+    ));
+}

@@ -1283,24 +1283,16 @@ impl<'a> Parser<'a> {
                 } else {
                     false
                 };
-                let name = match self.peek_token() {
-                    Token::Ident(s) => {
-                        let s = s.clone();
-                        self.advance();
-                        s
-                    }
-                    Token::Underscore => {
-                        self.advance();
-                        "_".to_string()
-                    }
-                    _ => {
-                        let (_, span) = self.current().unwrap();
-                        return Err(ParseError {
-                            span: *span,
-                            msg: "expected variable name after 'let'".to_string(),
-                        });
-                    }
-                };
+                let pattern_lo = self.current_span_lo();
+                let pattern = self.parse_pattern()?;
+                let pattern_hi = self.last_span_end();
+                // Check for refutable (non-exhaustive) pattern in let binding
+                if Self::is_refutable_pattern(&pattern) {
+                    return Err(ParseError {
+                        span: Span::new(pattern_lo, pattern_hi),
+                        msg: "non-exhaustive pattern".to_string(),
+                    });
+                }
                 // Optional type annotation
                 let type_ann = if *self.peek_token() == Token::Colon {
                     self.advance();
@@ -1313,7 +1305,7 @@ impl<'a> Parser<'a> {
                 self.expect(&Token::Semicolon)?;
                 let hi = self.last_span_end();
                 Ok(Stmt::Let {
-                    name,
+                    pattern,
                     is_mut,
                     type_ann,
                     init,
@@ -2530,6 +2522,13 @@ impl<'a> Parser<'a> {
         Ok(Pattern::Binding(name))
     }
 
+    fn is_refutable_pattern(pattern: &Pattern) -> bool {
+        match pattern {
+            Pattern::Binding(_) | Pattern::Wildcard => false,
+            Pattern::EnumVariant { .. } | Pattern::IntLit(_) | Pattern::BoolLit(_) => true,
+        }
+    }
+
     fn peek_token(&self) -> &Token {
         let idx = self.pos.min(self.tokens.len().saturating_sub(1));
         &self.tokens[idx].0
@@ -2831,12 +2830,12 @@ mod tests {
         let prog = parse("fn main() { let mut x = 42; }").unwrap();
         match &prog.funcs[0].body.stmts[0] {
             Stmt::Let {
-                name,
+                pattern,
                 is_mut: true,
                 init,
                 ..
             } => {
-                assert_eq!(name, "x");
+                assert_eq!(pattern, &Pattern::Binding("x".to_string()));
                 assert!(matches!(init, Expr::IntLit(42)));
             }
             _ => panic!("expected Let with is_mut=true"),
@@ -3036,8 +3035,8 @@ mod tests {
         assert_eq!(prog.funcs[0].name, "main");
         assert_eq!(prog.funcs[0].body.stmts.len(), 1);
         match &prog.funcs[0].body.stmts[0] {
-            Stmt::Let { name, init, .. } => {
-                assert_eq!(name, "x");
+            Stmt::Let { pattern, init, .. } => {
+                assert_eq!(pattern, &Pattern::Binding("x".to_string()));
                 assert!(matches!(init, Expr::IntLit(42)));
             }
             _ => panic!("expected Let stmt"),
@@ -3505,12 +3504,12 @@ mod tests {
         let prog = parse("fn main() { let x: i32 = 42; }").unwrap();
         match &prog.funcs[0].body.stmts[0] {
             Stmt::Let {
-                name,
+                pattern,
                 type_ann: Some(ty),
                 init,
                 ..
             } => {
-                assert_eq!(name, "x");
+                assert_eq!(pattern, &Pattern::Binding("x".to_string()));
                 assert_eq!(*ty, Type::I32);
                 assert!(matches!(init, Expr::IntLit(42)));
             }
@@ -3523,12 +3522,12 @@ mod tests {
         let prog = parse("fn main() { let x: f64 = 3.14; }").unwrap();
         match &prog.funcs[0].body.stmts[0] {
             Stmt::Let {
-                name,
+                pattern,
                 type_ann: Some(ty),
                 init,
                 ..
             } => {
-                assert_eq!(name, "x");
+                assert_eq!(pattern, &Pattern::Binding("x".to_string()));
                 assert_eq!(*ty, Type::F64);
                 assert!(matches!(init, Expr::FloatLit(v) if (*v - 3.14).abs() < 1e-10));
             }
@@ -3577,12 +3576,12 @@ mod tests {
         let prog = parse("fn main() { let x: bool = true; }").unwrap();
         match &prog.funcs[0].body.stmts[0] {
             Stmt::Let {
-                name,
+                pattern,
                 type_ann: Some(ty),
                 init,
                 ..
             } => {
-                assert_eq!(name, "x");
+                assert_eq!(pattern, &Pattern::Binding("x".to_string()));
                 assert_eq!(*ty, Type::Bool);
                 assert!(matches!(init, Expr::BoolLit(true)));
             }

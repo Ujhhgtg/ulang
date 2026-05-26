@@ -72,7 +72,7 @@ pub struct Block {
 #[derive(Debug, Clone)]
 pub enum Stmt {
     Let {
-        name: String,
+        pattern: Pattern,
         is_mut: bool,
         type_ann: Option<Type>,
         init: Expr,
@@ -314,7 +314,7 @@ pub struct ImplDecl {
 
 /// A pattern for destructuring in `if let` and `match`.
 #[allow(dead_code)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Pattern {
     /// `_` — matches anything, binds nothing
     Wildcard,

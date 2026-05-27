@@ -230,6 +230,7 @@ pub enum Expr {
         scrutinee: Box<Expr>,
         arms: Vec<MatchArm>,
     },
+    Block(Block),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

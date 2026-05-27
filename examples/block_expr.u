@@ -1,0 +1,36 @@
+// Test: block expressions with scoping
+fn main() -> i32 {
+    // Basic block returning a value
+    let result = {
+        let x = 10;
+        let y = 20;
+        x + y
+    };
+    // result is 30
+
+    // Block with no tail expression (unit)
+    let empty = {};
+    // empty is ()
+
+    // Scoping: inner let does not clash with outer
+    let x = 1;
+    let value = {
+        let x = 2; // shadows outer x
+        let y = 3;
+        x + y     // 5
+    };
+    // value is 5, x is still 1
+
+    // Nested blocks
+    let n = {
+        let a = {
+            let b = 4;
+            b * 2  // 8
+        };
+        a + 3       // 11
+    };
+    // n is 11
+
+    // Final result = result + value + n
+    result + value + n  // 30 + 5 + 11 = 46
+}

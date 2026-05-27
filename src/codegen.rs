@@ -1653,6 +1653,9 @@ impl<'ctx> CodeGen<'ctx> {
                     Self::m_substitute_block(&mut arm.body, params, args);
                 }
             }
+            Expr::Block(block) => {
+                Self::m_substitute_block(block, params, args);
+            }
             Expr::Assign { target, value } => {
                 Self::m_substitute_types_in_expr(target, params, args);
                 Self::m_substitute_types_in_expr(value, params, args);
@@ -1871,6 +1874,9 @@ impl<'ctx> CodeGen<'ctx> {
                     }
                     Self::m_substitute_const_block(&mut arm.body, const_params, values);
                 }
+            }
+            Expr::Block(block) => {
+                Self::m_substitute_const_block(block, const_params, values);
             }
             // Tuple, StructLit, EnumLit, BoolLit, IntLit, FloatLit, StrLit, Unit — no substitution needed
             _ => {}
@@ -2498,6 +2504,9 @@ impl<'ctx> CodeGen<'ctx> {
             } => {
                 Self::collect_enum_lits_from_expr(container, instances, seen, one_param_enums);
                 Self::collect_enum_lits_from_block(body, instances, seen, one_param_enums);
+            }
+            Expr::Block(block) => {
+                Self::collect_enum_lits_from_block(block, instances, seen, one_param_enums);
             }
             _ => {}
         }
@@ -3163,15 +3172,14 @@ impl<'ctx> CodeGen<'ctx> {
                 candidate = Some(ty);
             }
         }
-        if let Some(block) = else_block {
-            if let Some(ref e) = block.tail_expr {
+        if let Some(block) = else_block
+            && let Some(ref e) = block.tail_expr {
                 let ty = self.expr_type(e);
                 if ty != Type::Never {
                     return ty;
                 }
                 candidate = Some(ty);
             }
-        }
         candidate.unwrap_or(Type::I32)
     }
 
@@ -3184,15 +3192,14 @@ impl<'ctx> CodeGen<'ctx> {
             }
             candidate = Some(ty);
         }
-        if let Some(block) = else_block {
-            if let Some(ref e) = block.tail_expr {
+        if let Some(block) = else_block
+            && let Some(ref e) = block.tail_expr {
                 let ty = self.expr_type(e);
                 if ty != Type::Never {
                     return ty;
                 }
                 candidate = Some(ty);
             }
-        }
         candidate.unwrap_or(Type::Unit)
     }
 
@@ -3525,6 +3532,13 @@ impl<'ctx> CodeGen<'ctx> {
                 ..
             } => self.resolve_if_let_result_type(then_block, else_block),
             Expr::For { .. } => Type::Unit,
+            Expr::Block(block) => {
+                if let Some(ref tail) = block.tail_expr {
+                    self.expr_type(tail)
+                } else {
+                    Type::Unit
+                }
+            }
             Expr::Match {
                 scrutinee, arms, ..
             } => self.resolve_match_result_type(scrutinee, arms),
@@ -3810,6 +3824,13 @@ impl<'ctx> CodeGen<'ctx> {
                 }
             }
             Expr::Loop { .. } | Expr::While { .. } | Expr::For { .. } => Type::Unit,
+            Expr::Block(block) => {
+                if let Some(ref tail) = block.tail_expr {
+                    Self::literal_type(tail)
+                } else {
+                    Type::Unit
+                }
+            }
             _ => Type::I32,
         }
     }
@@ -6467,6 +6488,18 @@ impl<'ctx> CodeGen<'ctx> {
                 else_block,
             } => self.compile_if_let(pattern, scrutinee, then_block, else_block),
             Expr::Match { scrutinee, arms } => self.compile_match(scrutinee, arms),
+            Expr::Block(block) => {
+                let saved_symbols = self.symbols.clone();
+                let result = self.compile_block_get_value(block)?;
+                self.symbols = saved_symbols;
+                match result {
+                    Some(val) => Ok(val),
+                    None => {
+                        let unit_ty = self.context.struct_type(&[], false);
+                        Ok(unit_ty.get_undef().into())
+                    }
+                }
+            }
         }
     }
 
@@ -9067,6 +9100,59 @@ mod tests {
         assert_eq!(
             jit("fn sum3(s: [i32]) -> i32 { s[0] + s[1] + s[2] } fn main() -> i32 { sum3([1, 10, 100]) }").unwrap(),
             111
+        );
+    }
+
+    #[test]
+    fn test_jit_block_expr_basic() {
+        // Block expression returning value via tail expression
+        assert_eq!(
+            jit("fn main() -> i32 { let x = { let a = 10; let b = 20; a + b }; x }").unwrap(),
+            30
+        );
+    }
+
+    #[test]
+    fn test_jit_block_expr_scope_shadowing() {
+        // Inner block shadowing does not affect outer scope
+        assert_eq!(
+            jit("fn main() -> i32 { let x = 1; let value = { let x = 2; let y = 3; x + y }; x }")
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_jit_block_expr_nested() {
+        // Nested block expressions
+        assert_eq!(
+            jit("fn main() -> i32 { let n = { let a = { let b = 4; b * 2 }; a + 3 }; n }").unwrap(),
+            11
+        );
+    }
+
+    #[test]
+    fn test_jit_block_expr_in_let_init() {
+        // Block expression as let initializer
+        assert_eq!(jit("fn main() -> i32 { let x = { 42 }; x }").unwrap(), 42);
+    }
+
+    #[test]
+    fn test_jit_block_expr_with_multi_stmts() {
+        // Block with multiple let bindings and final expression
+        assert_eq!(
+            jit("fn main() -> i32 { let r = { let a = 5; let b = 10; let c = 15; a + b + c }; r }")
+                .unwrap(),
+            30
+        );
+    }
+
+    #[test]
+    fn test_jit_block_expr_result_used_in_arithmetic() {
+        // Block expression result used in arithmetic
+        assert_eq!(
+            jit("fn main() -> i32 { let x = 1; let y = { x + 2 } + 3; y }").unwrap(),
+            6
         );
     }
 }

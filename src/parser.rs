@@ -2256,6 +2256,10 @@ impl<'a> Parser<'a> {
             Token::While => self.parse_while_expr(),
             Token::For => self.parse_for_expr(),
             Token::Match => self.parse_match_expr(),
+            Token::LBrace => {
+                let block = self.parse_block()?;
+                Ok(Expr::Block(block))
+            }
             _ => {
                 let default = (Token::Eof, Span::empty(0));
                 let (_, span) = self.current().unwrap_or(&default);

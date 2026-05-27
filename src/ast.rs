@@ -45,6 +45,7 @@ pub struct Function {
     pub name: String,
     pub params: Vec<Param>,
     pub return_type: Option<Type>,
+    pub type_params: Vec<GenericParam>,
     pub body: Block,
     pub is_extern: bool,
     pub is_method: bool,
@@ -123,6 +124,19 @@ pub enum Type {
     GenericInstance(String, Vec<Type>),
     Alias(String, Vec<Type>),
     SelfType,
+    ImplTrait(Vec<TraitBound>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TraitBound {
+    pub trait_name: String,
+    pub generic_args: Vec<Type>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GenericParam {
+    pub name: String,
+    pub bounds: Vec<TraitBound>,
 }
 
 #[derive(Debug, Clone)]
@@ -239,7 +253,7 @@ pub enum BinOp {
 pub struct StructDecl {
     pub name: String,
     pub fields: Vec<StructField>,
-    pub type_params: Vec<String>,
+    pub type_params: Vec<GenericParam>,
     pub is_pub: bool,
     pub attribs: Vec<Attribute>,
     pub span: Span,
@@ -258,7 +272,7 @@ pub struct StructField {
 #[derive(Debug, Clone)]
 pub struct TraitDecl {
     pub name: String,
-    pub type_params: Vec<String>,
+    pub type_params: Vec<GenericParam>,
     pub methods: Vec<TraitMethodDef>,
     pub is_pub: bool,
     pub span: Span,
@@ -276,7 +290,7 @@ pub struct TraitMethodDef {
 #[derive(Debug, Clone)]
 pub struct TypeAliasDecl {
     pub name: String,
-    pub type_params: Vec<String>,
+    pub type_params: Vec<GenericParam>,
     pub aliased_type: Type,
     pub is_pub: bool,
     pub span: Span,
@@ -287,7 +301,7 @@ pub struct TypeAliasDecl {
 pub struct EnumDecl {
     pub name: String,
     pub variants: Vec<EnumVariant>,
-    pub type_params: Vec<String>,
+    pub type_params: Vec<GenericParam>,
     pub is_pub: bool,
     pub attribs: Vec<Attribute>,
     pub span: Span,
@@ -307,7 +321,7 @@ pub struct ImplDecl {
     pub impl_type: Type,
     pub trait_name: Option<String>,
     pub trait_args: Vec<Type>,
-    pub type_params: Vec<String>,
+    pub type_params: Vec<GenericParam>,
     pub const_params: Vec<String>,
     pub methods: Vec<Function>,
 }

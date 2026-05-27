@@ -255,21 +255,34 @@ fn find_project_root() -> Option<std::path::PathBuf> {
 }
 
 fn find_stdlib_dir() -> std::path::PathBuf {
-    if let Ok(val) = std::env::var("ULANG_STDLIB") {
-        return std::path::PathBuf::from(val);
+    if let Ok(val) = std::env::var("ULANG_ROOT") {
+        let root_path = std::path::PathBuf::from(val);
+        let candidate1 = root_path.join("stdlib").join("std");
+        if candidate1.is_dir() {
+            return candidate1;
+        }
+        let candidate2 = root_path.join("root").join("stdlib").join("std");
+        if candidate2.is_dir() {
+            return candidate2;
+        }
+        return candidate1;
     }
     if let Ok(mut dir) = std::env::current_dir() {
         loop {
-            let candidate = dir.join("stdlib");
-            if candidate.is_dir() {
-                return candidate;
+            let candidate1 = dir.join("root").join("stdlib").join("std");
+            if candidate1.is_dir() {
+                return candidate1;
+            }
+            let candidate2 = dir.join("stdlib").join("std");
+            if candidate2.is_dir() {
+                return candidate2;
             }
             if !dir.pop() {
                 break;
             }
         }
     }
-    std::path::PathBuf::from("stdlib")
+    std::path::PathBuf::from("root/stdlib/std")
 }
 
 fn do_new_project(name: &str) {
@@ -670,8 +683,16 @@ fn collect_struct_deps(ty: &Type) -> Vec<String> {
             deps
         }
         Type::Tuple(elems) => elems.iter().flat_map(collect_struct_deps).collect(),
-        Type::Ref { inner, .. } | Type::Ptr { inner, .. } => collect_struct_deps(inner),
+        Type::Ref { inner, .. }
+        | Type::Ptr { inner, .. }
+        | Type::Array { inner, .. }
+        | Type::Slice { inner }
+        | Type::GenericArray { inner, .. } => collect_struct_deps(inner),
         Type::Alias(_, args) => args.iter().flat_map(collect_struct_deps).collect(),
+        Type::ImplTrait(bounds) => bounds
+            .iter()
+            .flat_map(|b| b.generic_args.iter().flat_map(collect_struct_deps))
+            .collect(),
         _ => Vec::new(),
     }
 }
@@ -1781,13 +1802,11 @@ fn qualify_type(ty: &mut Type, local_types: &HashSet<String>, prefix: &str) {
                 qualify_type(elem, local_types, prefix);
             }
         }
-        Type::Ptr { inner, .. } => {
-            qualify_type(inner, local_types, prefix);
-        }
-        Type::Ref { inner, .. } => {
-            qualify_type(inner, local_types, prefix);
-        }
-        Type::Array { inner, .. } => {
+        Type::Ptr { inner, .. }
+        | Type::Ref { inner, .. }
+        | Type::Array { inner, .. }
+        | Type::Slice { inner }
+        | Type::GenericArray { inner, .. } => {
             qualify_type(inner, local_types, prefix);
         }
         Type::Struct(name) => {
@@ -1809,6 +1828,16 @@ fn qualify_type(ty: &mut Type, local_types: &HashSet<String>, prefix: &str) {
             }
             for arg in args {
                 qualify_type(arg, local_types, prefix);
+            }
+        }
+        Type::ImplTrait(bounds) => {
+            for bound in bounds {
+                if local_types.contains(&bound.trait_name) {
+                    bound.trait_name = format!("{}::{}", prefix, bound.trait_name);
+                }
+                for arg in &mut bound.generic_args {
+                    qualify_type(arg, local_types, prefix);
+                }
             }
         }
         _ => {}

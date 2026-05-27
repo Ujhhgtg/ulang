@@ -1218,10 +1218,7 @@ fn test_non_exhaustive_let_pattern() {
 
 #[test]
 fn test_irrefutable_let_pattern_binding() {
-    assert!(run_test(
-        "irrefutable_binding",
-        "fn main() { let x = 42; }"
-    ));
+    assert!(run_test("irrefutable_binding", "fn main() { let x = 42; }"));
 }
 
 #[test]
@@ -1229,5 +1226,105 @@ fn test_irrefutable_let_pattern_wildcard() {
     assert!(run_test(
         "irrefutable_wildcard",
         "fn main() { let _ = 42; }"
+    ));
+}
+
+#[test]
+fn test_generic_bounds_functions_and_structs() {
+    assert!(run_test(
+        "generic_bounds",
+        r#"
+        trait Driver {
+            fn drive(&self) -> i32;
+        }
+
+        trait Pilot {
+            fn fly(&self) -> i32;
+        }
+
+        struct Vehicle {
+            speed: i32,
+        }
+
+        impl Driver for Vehicle {
+            fn drive(&self) -> i32 { self.speed }
+        }
+
+        impl Pilot for Vehicle {
+            fn fly(&self) -> i32 { self.speed * 2 }
+        }
+
+        // Test generic function with constraints
+        fn operate_vehicle<T: Driver + Pilot>(vehicle: T) -> i32 {
+            vehicle.drive() + vehicle.fly()
+        }
+
+        // Test impl Trait parameter with constraints
+        fn operate_vehicle_impl(vehicle: impl Driver + Pilot) -> i32 {
+            vehicle.drive() + vehicle.fly()
+        }
+
+        struct Wrapper<T: Driver + Pilot> {
+            val: T,
+        }
+
+        fn main() -> i32 {
+            let v = Vehicle { speed: 10 };
+            let r1 = operate_vehicle(v);
+            let r2 = operate_vehicle_impl(v);
+            let w: Wrapper<Vehicle> = Wrapper { val: v };
+            let r3 = w.val.drive() + w.val.fly();
+            if r1 == 30 && r2 == 30 && r3 == 30 {
+                return 0;
+            };
+            return 1;
+        }
+        "#
+    ));
+}
+
+#[test]
+fn test_impl_into_iterator_args() {
+    assert!(run_test(
+        "impl_into_iterator",
+        r#"
+        use std::vec::Vec;
+        use std::iter::IntoIterator;
+
+        struct ArgCollector {
+            count: i32,
+        }
+
+        impl ArgCollector {
+            fn arg(&mut self, s: &str) {
+                self.count = self.count + 1;
+            }
+
+            fn args(&mut self, args: impl IntoIterator<&str>) -> &mut ArgCollector {
+                for arg in args {
+                    self.arg(arg);
+                };
+                self
+            }
+        }
+
+        fn main() -> i32 {
+            let mut collector = ArgCollector { count: 0 };
+            
+            // Test with a Vec
+            let mut v: Vec<&str> = Vec::new();
+            v.push("hello");
+            v.push("world");
+            collector.args(v);
+
+            // Test with an array
+            collector.args(["a", "b"]);
+
+            if collector.count == 4 {
+                return 0;
+            };
+            return 1;
+        }
+        "#
     ));
 }

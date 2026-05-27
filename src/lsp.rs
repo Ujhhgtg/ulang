@@ -110,6 +110,35 @@ fn position_to_offset(source: &str, position: Position) -> usize {
     current_offset
 }
 
+fn trait_bound_to_string(bound: &crate::ast::TraitBound) -> String {
+    if bound.generic_args.is_empty() {
+        bound.trait_name.clone()
+    } else {
+        let parts: Vec<String> = bound.generic_args.iter().map(type_to_string).collect();
+        format!("{}<{}>", bound.trait_name, parts.join(", "))
+    }
+}
+
+fn format_generic_params(params: &[crate::ast::GenericParam]) -> String {
+    if params.is_empty() {
+        "".to_string()
+    } else {
+        let formatted: Vec<String> = params
+            .iter()
+            .map(|p| {
+                if p.bounds.is_empty() {
+                    p.name.clone()
+                } else {
+                    let bounds_str: Vec<String> =
+                        p.bounds.iter().map(trait_bound_to_string).collect();
+                    format!("{}: {}", p.name, bounds_str.join(" + "))
+                }
+            })
+            .collect();
+        format!("<{}>", formatted.join(", "))
+    }
+}
+
 fn type_to_string(ty: &crate::ast::Type) -> String {
     match ty {
         crate::ast::Type::I8 => "i8".to_string(),
@@ -163,6 +192,10 @@ fn type_to_string(ty: &crate::ast::Type) -> String {
         crate::ast::Type::GenericArray { inner, len_var } => {
             format!("[{}; {}]", type_to_string(inner), len_var)
         }
+        crate::ast::Type::ImplTrait(bounds) => {
+            let parts: Vec<String> = bounds.iter().map(trait_bound_to_string).collect();
+            format!("impl {}", parts.join(" + "))
+        }
     }
 }
 
@@ -184,11 +217,13 @@ fn get_hover_text_recursive(program: &Program, name: &str) -> Option<String> {
         };
         let pub_str = if func.is_pub { "pub " } else { "" };
         let is_ext = if func.is_extern { "extern \"C\" " } else { "" };
+        let type_params = format_generic_params(&func.type_params);
         return Some(format!(
-            "```rust\n{}{}fn {}({}){}\n```",
+            "```rust\n{}{}fn {}{}({}){}\n```",
             pub_str,
             is_ext,
             name,
+            type_params,
             params.join(", "),
             ret
         ));
@@ -205,11 +240,7 @@ fn get_hover_text_recursive(program: &Program, name: &str) -> Option<String> {
             })
             .collect();
         let pub_str = if st.is_pub { "pub " } else { "" };
-        let type_params = if st.type_params.is_empty() {
-            "".to_string()
-        } else {
-            format!("<{}>", st.type_params.join(", "))
-        };
+        let type_params = format_generic_params(&st.type_params);
         return Some(format!(
             "```rust\n{}struct {}{} {{\n{}\n}}\n```",
             pub_str,
@@ -230,11 +261,7 @@ fn get_hover_text_recursive(program: &Program, name: &str) -> Option<String> {
             })
             .collect();
         let pub_str = if en.is_pub { "pub " } else { "" };
-        let type_params = if en.type_params.is_empty() {
-            "".to_string()
-        } else {
-            format!("<{}>", en.type_params.join(", "))
-        };
+        let type_params = format_generic_params(&en.type_params);
         return Some(format!(
             "```rust\n{}enum {}{} {{\n{}\n}}\n```",
             pub_str,
@@ -263,11 +290,7 @@ fn get_hover_text_recursive(program: &Program, name: &str) -> Option<String> {
             })
             .collect();
         let pub_str = if tr.is_pub { "pub " } else { "" };
-        let type_params = if tr.type_params.is_empty() {
-            "".to_string()
-        } else {
-            format!("<{}>", tr.type_params.join(", "))
-        };
+        let type_params = format_generic_params(&tr.type_params);
         return Some(format!(
             "```rust\n{}trait {}{} {{\n{}\n}}\n```",
             pub_str,
@@ -280,11 +303,7 @@ fn get_hover_text_recursive(program: &Program, name: &str) -> Option<String> {
     // 5. Search type aliases
     if let Some(ta) = program.type_aliases.iter().find(|t| t.name == name) {
         let pub_str = if ta.is_pub { "pub " } else { "" };
-        let type_params = if ta.type_params.is_empty() {
-            "".to_string()
-        } else {
-            format!("<{}>", ta.type_params.join(", "))
-        };
+        let type_params = format_generic_params(&ta.type_params);
         return Some(format!(
             "```rust\n{}type {}{} = {};\n```",
             pub_str,
@@ -312,11 +331,13 @@ fn get_hover_text_recursive(program: &Program, name: &str) -> Option<String> {
                 None => "".to_string(),
             };
             let pub_str = if method.is_pub { "pub " } else { "" };
+            let type_params = format_generic_params(&method.type_params);
             return Some(format!(
-                "```rust\nimpl {} {{\n    {}fn {}({}){}\n}}\n```",
+                "```rust\nimpl {} {{\n    {}fn {}{}({}){}\n}}\n```",
                 format!("{}{}", trait_str, type_name),
                 pub_str,
                 name,
+                type_params,
                 params.join(", "),
                 ret
             ));
@@ -593,21 +614,34 @@ fn handle_hover(
 }
 
 fn find_stdlib_dir() -> std::path::PathBuf {
-    if let Ok(val) = std::env::var("ULANG_STDLIB") {
-        return std::path::PathBuf::from(val);
+    if let Ok(val) = std::env::var("ULANG_ROOT") {
+        let root_path = std::path::PathBuf::from(val);
+        let candidate1 = root_path.join("stdlib").join("std");
+        if candidate1.is_dir() {
+            return candidate1;
+        }
+        let candidate2 = root_path.join("root").join("stdlib").join("std");
+        if candidate2.is_dir() {
+            return candidate2;
+        }
+        return candidate1;
     }
     if let Ok(mut dir) = std::env::current_dir() {
         loop {
-            let candidate = dir.join("stdlib");
-            if candidate.is_dir() {
-                return candidate;
+            let candidate1 = dir.join("root").join("stdlib").join("std");
+            if candidate1.is_dir() {
+                return candidate1;
+            }
+            let candidate2 = dir.join("stdlib").join("std");
+            if candidate2.is_dir() {
+                return candidate2;
             }
             if !dir.pop() {
                 break;
             }
         }
     }
-    std::path::PathBuf::from("stdlib")
+    std::path::PathBuf::from("root/stdlib/std")
 }
 
 /// Search for a definition in the stdlib cache.

@@ -1,9 +1,9 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::{
-    Attribute, BinOp, Block, EnumDecl, EnumVariant, Expr, Function, ImplDecl, MatchArm, ModuleDecl,
-    Param, Pattern, Program, Stmt, StructDecl, StructField, TraitDecl, TraitMethodDef, Type,
-    TypeAliasDecl, Use,
+    Attribute, BinOp, Block, EnumDecl, EnumVariant, Expr, Function, GenericParam, ImplDecl,
+    MatchArm, ModuleDecl, Param, Pattern, Program, Stmt, StructDecl, StructField, TraitBound,
+    TraitDecl, TraitMethodDef, Type, TypeAliasDecl, Use,
 };
 use crate::token::{Span, Token};
 
@@ -17,7 +17,7 @@ pub struct Parser<'a> {
     tokens: &'a [(Token, Span)],
     pos: usize,
     struct_defs: HashMap<String, Vec<StructField>>,
-    type_aliases: HashMap<String, (Vec<String>, Type)>,
+    type_aliases: HashMap<String, (Vec<GenericParam>, Type)>,
     struct_names: HashSet<String>,
     enum_names: HashSet<String>,
     /// When true, `Ident { ... }` is NOT parsed as a struct literal.
@@ -603,12 +603,92 @@ impl<'a> Parser<'a> {
             name,
             params,
             return_type,
+            type_params: Vec::new(),
             body,
             is_extern: true,
             is_method: false,
             is_pub: false,
             attribs: Vec::new(),
         })
+    }
+
+    fn parse_generic_params(&mut self) -> Result<Vec<GenericParam>, ParseError> {
+        let mut params = Vec::new();
+        self.expect(&Token::Lt)?;
+        loop {
+            let param_name = match self.peek_token() {
+                Token::Ident(s) => {
+                    let s = s.clone();
+                    self.advance();
+                    s
+                }
+                _ => {
+                    let (_, span) = self.current().unwrap();
+                    return Err(ParseError {
+                        span: *span,
+                        msg: "expected type parameter name".to_string(),
+                    });
+                }
+            };
+
+            // Optional bounds: `: Trait1 + Trait2`
+            let mut bounds = Vec::new();
+            if *self.peek_token() == Token::Colon {
+                self.advance(); // consume ':'
+                loop {
+                    let trait_name = match self.peek_token() {
+                        Token::Ident(s) => {
+                            let s = s.clone();
+                            self.advance();
+                            s
+                        }
+                        _ => {
+                            let default = (Token::Eof, Span::empty(0));
+                            let (_, span) = self.current().unwrap_or(&default);
+                            return Err(ParseError {
+                                span: *span,
+                                msg: "expected trait name in bound".to_string(),
+                            });
+                        }
+                    };
+                    let mut trait_args = Vec::new();
+                    if *self.peek_token() == Token::Lt {
+                        self.advance();
+                        loop {
+                            trait_args.push(self.parse_type()?);
+                            if *self.peek_token() == Token::Comma {
+                                self.advance();
+                            } else {
+                                break;
+                            }
+                        }
+                        self.expect(&Token::Gt)?;
+                    }
+                    bounds.push(TraitBound {
+                        trait_name,
+                        generic_args: trait_args,
+                    });
+                    if *self.peek_token() == Token::Plus {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+            }
+
+            params.push(GenericParam {
+                name: param_name,
+                bounds,
+            });
+
+            if *self.peek_token() == Token::Comma {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        self.expect(&Token::Gt)?;
+        Ok(params)
     }
 
     fn parse_struct_decl(&mut self, attribs: Vec<Attribute>) -> Result<StructDecl, ParseError> {
@@ -628,32 +708,9 @@ impl<'a> Parser<'a> {
                 });
             }
         };
-        // Parse optional generic type parameters: <T, U, ...>
+        // Parse optional generic type parameters: <T: Trait1 + Trait2, U, ...>
         let type_params = if *self.peek_token() == Token::Lt {
-            self.advance(); // consume <
-            let mut params = Vec::new();
-            loop {
-                match self.peek_token() {
-                    Token::Ident(s) => {
-                        params.push(s.clone());
-                        self.advance();
-                    }
-                    _ => {
-                        let (_, span) = self.current().unwrap();
-                        return Err(ParseError {
-                            span: *span,
-                            msg: "expected type parameter name".to_string(),
-                        });
-                    }
-                }
-                if *self.peek_token() == Token::Comma {
-                    self.advance();
-                } else {
-                    break;
-                }
-            }
-            self.expect(&Token::Gt)?;
-            params
+            self.parse_generic_params()?
         } else {
             Vec::new()
         };
@@ -737,32 +794,9 @@ impl<'a> Parser<'a> {
                 });
             }
         };
-        // Parse optional generic type parameters: <T, U, ...>
+        // Parse optional generic type parameters: <T: Trait1 + Trait2, U, ...>
         let type_params = if *self.peek_token() == Token::Lt {
-            self.advance(); // consume <
-            let mut params = Vec::new();
-            loop {
-                match self.peek_token() {
-                    Token::Ident(s) => {
-                        params.push(s.clone());
-                        self.advance();
-                    }
-                    _ => {
-                        let (_, span) = self.current().unwrap();
-                        return Err(ParseError {
-                            span: *span,
-                            msg: "expected type parameter name".to_string(),
-                        });
-                    }
-                }
-                if *self.peek_token() == Token::Comma {
-                    self.advance();
-                } else {
-                    break;
-                }
-            }
-            self.expect(&Token::Gt)?;
-            params
+            self.parse_generic_params()?
         } else {
             Vec::new()
         };
@@ -832,32 +866,9 @@ impl<'a> Parser<'a> {
                 });
             }
         };
-        // Parse optional generic type parameters: <T, U, ...>
+        // Parse optional generic type parameters: <T: Trait1 + Trait2, U, ...>
         let type_params = if *self.peek_token() == Token::Lt {
-            self.advance(); // consume <
-            let mut params = Vec::new();
-            loop {
-                match self.peek_token() {
-                    Token::Ident(s) => {
-                        params.push(s.clone());
-                        self.advance();
-                    }
-                    _ => {
-                        let (_, span) = self.current().unwrap();
-                        return Err(ParseError {
-                            span: *span,
-                            msg: "expected type parameter name".to_string(),
-                        });
-                    }
-                }
-                if *self.peek_token() == Token::Comma {
-                    self.advance();
-                } else {
-                    break;
-                }
-            }
-            self.expect(&Token::Gt)?;
-            params
+            self.parse_generic_params()?
         } else {
             Vec::new()
         };
@@ -877,31 +888,9 @@ impl<'a> Parser<'a> {
     fn parse_impl_decl(&mut self) -> Result<ImplDecl, ParseError> {
         self.expect(&Token::Impl)?;
         // Parse optional generic type parameters: <T, U, ...>
+        // Parse optional generic type parameters: <T: Trait1 + Trait2, U, ...>
         let type_params = if *self.peek_token() == Token::Lt {
-            self.advance(); // consume <
-            let mut params = Vec::new();
-            loop {
-                match self.peek_token() {
-                    Token::Ident(s) => {
-                        params.push(s.clone());
-                        self.advance();
-                    }
-                    _ => {
-                        let (_, span) = self.current().unwrap();
-                        return Err(ParseError {
-                            span: *span,
-                            msg: "expected type parameter name".to_string(),
-                        });
-                    }
-                }
-                if *self.peek_token() == Token::Comma {
-                    self.advance();
-                } else {
-                    break;
-                }
-            }
-            self.expect(&Token::Gt)?;
-            params
+            self.parse_generic_params()?
         } else {
             Vec::new()
         };
@@ -971,9 +960,9 @@ impl<'a> Parser<'a> {
             _ => Vec::new(),
         };
         // Filter type_params to exclude const params
-        let type_params: Vec<String> = type_params
+        let type_params: Vec<GenericParam> = type_params
             .into_iter()
-            .filter(|p| !const_params.contains(p))
+            .filter(|p| !const_params.contains(&p.name))
             .collect();
 
         self.expect(&Token::LBrace)?;
@@ -1018,32 +1007,9 @@ impl<'a> Parser<'a> {
                 });
             }
         };
-        // Parse optional generic type parameters: <T, U, ...>
+        // Parse optional generic type parameters: <T: Trait1 + Trait2, U, ...>
         let type_params = if *self.peek_token() == Token::Lt {
-            self.advance(); // consume <
-            let mut params = Vec::new();
-            loop {
-                match self.peek_token() {
-                    Token::Ident(s) => {
-                        params.push(s.clone());
-                        self.advance();
-                    }
-                    _ => {
-                        let (_, span) = self.current().unwrap();
-                        return Err(ParseError {
-                            span: *span,
-                            msg: "expected type parameter name".to_string(),
-                        });
-                    }
-                }
-                if *self.peek_token() == Token::Comma {
-                    self.advance();
-                } else {
-                    break;
-                }
-            }
-            self.expect(&Token::Gt)?;
-            params
+            self.parse_generic_params()?
         } else {
             Vec::new()
         };
@@ -1108,6 +1074,12 @@ impl<'a> Parser<'a> {
                 });
             }
         };
+        // Parse optional generic type parameters: <T: Trait1 + Trait2, U, ...>
+        let type_params = if *self.peek_token() == Token::Lt {
+            self.parse_generic_params()?
+        } else {
+            Vec::new()
+        };
         self.expect(&Token::LParen)?;
         let params = self.parse_fn_params(false)?;
         self.expect(&Token::RParen)?;
@@ -1123,6 +1095,7 @@ impl<'a> Parser<'a> {
             name,
             params,
             return_type,
+            type_params,
             body,
             is_extern: false,
             is_method: false,
@@ -1643,6 +1616,50 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_type(&mut self) -> Result<Type, ParseError> {
+        if *self.peek_token() == Token::Impl {
+            self.advance();
+            let mut bounds = Vec::new();
+            loop {
+                let trait_name = match self.peek_token() {
+                    Token::Ident(s) => {
+                        let s = s.clone();
+                        self.advance();
+                        s
+                    }
+                    _ => {
+                        let default = (Token::Eof, Span::empty(0));
+                        let (_, span) = self.current().unwrap_or(&default);
+                        return Err(ParseError {
+                            span: *span,
+                            msg: "expected trait name after 'impl'".to_string(),
+                        });
+                    }
+                };
+                let mut args = Vec::new();
+                if *self.peek_token() == Token::Lt {
+                    self.advance();
+                    loop {
+                        args.push(self.parse_type()?);
+                        if *self.peek_token() == Token::Comma {
+                            self.advance();
+                        } else {
+                            break;
+                        }
+                    }
+                    self.expect(&Token::Gt)?;
+                }
+                bounds.push(TraitBound {
+                    trait_name,
+                    generic_args: args,
+                });
+                if *self.peek_token() == Token::Plus {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+            return Ok(Type::ImplTrait(bounds));
+        }
         // Handle reference types: &Type, &mut Type
         if *self.peek_token() == Token::Ampersand {
             self.advance();
@@ -2685,7 +2702,9 @@ impl<'a> Parser<'a> {
                     // Build substitution map: param_name -> concrete type arg
                     // Substitute type params in the aliased type with concrete args
                     let mut substituted = alias.aliased_type.clone();
-                    Self::substitute_type_params(&mut substituted, &alias.type_params, args);
+                    let param_names: Vec<String> =
+                        alias.type_params.iter().map(|p| p.name.clone()).collect();
+                    Self::substitute_type_params(&mut substituted, &param_names, args);
                     // Check for cycles
                     if !visiting.insert(name.clone()) {
                         return Err(ParseError {
@@ -2716,6 +2735,14 @@ impl<'a> Parser<'a> {
                 }
                 Ok(())
             }
+            Type::ImplTrait(bounds) => {
+                for bound in bounds {
+                    for arg in &mut bound.generic_args {
+                        self.resolve_type_in_place_owned(arg, aliases, visiting)?;
+                    }
+                }
+                Ok(())
+            }
             _ => Ok(()),
         }
     }
@@ -2742,6 +2769,13 @@ impl<'a> Parser<'a> {
             Type::Tuple(types) => {
                 for t in types.iter_mut() {
                     Self::substitute_type_params(t, params, args);
+                }
+            }
+            Type::ImplTrait(bounds) => {
+                for bound in bounds {
+                    for arg in &mut bound.generic_args {
+                        Self::substitute_type_params(arg, params, args);
+                    }
                 }
             }
             _ => {}
@@ -4270,7 +4304,13 @@ mod tests {
         assert_eq!(prog.type_aliases.len(), 1);
         let alias = &prog.type_aliases[0];
         assert_eq!(alias.name, "Pair");
-        assert_eq!(alias.type_params, vec!["T".to_string()]);
+        assert_eq!(
+            alias.type_params,
+            vec![GenericParam {
+                name: "T".to_string(),
+                bounds: vec![]
+            }]
+        );
         assert_eq!(
             alias.aliased_type,
             Type::Tuple(vec![Type::Struct("T".into()), Type::Struct("T".into())])
@@ -4469,7 +4509,13 @@ mod tests {
         let prog = parse("impl<T> [T] { fn len(&self) -> usize { 0 } }").unwrap();
         assert_eq!(prog.impls.len(), 1);
         let imp = &prog.impls[0];
-        assert_eq!(imp.type_params, vec!["T".to_string()]);
+        assert_eq!(
+            imp.type_params,
+            vec![GenericParam {
+                name: "T".to_string(),
+                bounds: vec![]
+            }]
+        );
         assert!(imp.trait_name.is_none());
         match &imp.impl_type {
             Type::Slice { inner } => {
@@ -4490,7 +4536,13 @@ mod tests {
         .unwrap();
         assert_eq!(prog.impls.len(), 1);
         let imp = &prog.impls[0];
-        assert_eq!(imp.type_params, vec!["T".to_string()]);
+        assert_eq!(
+            imp.type_params,
+            vec![GenericParam {
+                name: "T".to_string(),
+                bounds: vec![]
+            }]
+        );
         assert_eq!(imp.trait_name, Some("Index".to_string()));
         match &imp.impl_type {
             Type::Slice { inner } => {
@@ -4528,7 +4580,19 @@ mod tests {
         assert_eq!(prog.traits.len(), 1);
         let t = &prog.traits[0];
         assert_eq!(t.name, "Index");
-        assert_eq!(t.type_params, vec!["Idx".to_string(), "T".to_string()]);
+        assert_eq!(
+            t.type_params,
+            vec![
+                GenericParam {
+                    name: "Idx".to_string(),
+                    bounds: vec![]
+                },
+                GenericParam {
+                    name: "T".to_string(),
+                    bounds: vec![]
+                }
+            ]
+        );
         assert_eq!(t.methods.len(), 1);
         assert_eq!(t.methods[0].name, "index");
     }

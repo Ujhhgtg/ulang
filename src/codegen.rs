@@ -16,8 +16,8 @@ use inkwell::values::{AnyValue, BasicMetadataValueEnum, BasicValueEnum, PointerV
 use inkwell::attributes::Attribute;
 
 use crate::ast::{
-    BinOp, Block, EnumDecl, Expr, Function, ImplDecl, MatchArm, Pattern, Program, Stmt, StructDecl,
-    StructField, Type,
+    BinOp, Block, EnumDecl, Expr, Function, GenericParam, ImplDecl, MatchArm, Pattern, Program,
+    Stmt, StructDecl, StructField, Type,
 };
 
 use crate::token::Span;
@@ -61,7 +61,7 @@ pub struct CodeGen<'ctx> {
     // Enum definitions: name -> EnumDecl
     enum_defs: HashMap<String, EnumDecl>,
     // Generic impl blocks: base name -> Vec<(type_params, ImplDecl)>
-    generic_impls: HashMap<String, Vec<(Vec<String>, ImplDecl)>>,
+    generic_impls: HashMap<String, Vec<(Vec<GenericParam>, ImplDecl)>>,
     // Set of already-monomorphized concrete instance names
     monomorphized: HashSet<String>,
     // Current monomorphization context: (base_name, mangled_name)
@@ -73,6 +73,8 @@ pub struct CodeGen<'ctx> {
     pub visibility_map: HashMap<String, bool>,
     pub field_visibility_map: HashMap<String, HashMap<String, bool>>,
     pub current_module_path: Vec<String>,
+    generic_methods: HashMap<String, Vec<Function>>,
+    generic_funcs: HashMap<String, Function>,
 }
 
 impl<'ctx> CodeGen<'ctx> {
@@ -116,6 +118,8 @@ impl<'ctx> CodeGen<'ctx> {
             visibility_map: HashMap::new(),
             field_visibility_map: HashMap::new(),
             current_module_path: Vec::new(),
+            generic_methods: HashMap::new(),
+            generic_funcs: HashMap::new(),
             opt_level: opt,
         })
     }
@@ -157,6 +161,8 @@ impl<'ctx> CodeGen<'ctx> {
             visibility_map: HashMap::new(),
             field_visibility_map: HashMap::new(),
             current_module_path: Vec::new(),
+            generic_methods: HashMap::new(),
+            generic_funcs: HashMap::new(),
             opt_level: opt,
         }
     }
@@ -840,12 +846,18 @@ impl<'ctx> CodeGen<'ctx> {
         Ok(())
     }
 
-    /// Convert a type to its string name for trait method naming.
     fn type_to_mangled_name(ty: &Type) -> String {
         if let Some(name) = Self::primitive_type_name(ty) {
             return name.to_string();
         }
         match ty {
+            Type::Str => "str".to_string(),
+            Type::Slice { inner } => format!("slice_{}", Self::type_to_mangled_name(inner)),
+            Type::Ptr { inner, is_mut } => format!(
+                "ptr_{}_{}",
+                if *is_mut { "mut" } else { "const" },
+                Self::type_to_mangled_name(inner)
+            ),
             Type::Struct(name) => name.clone(),
             Type::GenericInstance(name, _) => name.clone(),
             Type::Ref { inner, .. } => Self::type_to_mangled_name(inner),
@@ -897,12 +909,15 @@ impl<'ctx> CodeGen<'ctx> {
                 let key = Self::array_type_key(inner, *len);
                 trait_name == "Index"
                     || trait_name == "IndexMut"
+                    || trait_name == "IntoIterator"
+                    || trait_name == "IntoIteratorMut"
                     || self
                         .trait_impls
                         .get(&key)
                         .map(|traits| traits.contains(trait_name))
                         .unwrap_or(false)
             }
+            Type::ImplTrait(bounds) => bounds.iter().any(|b| b.trait_name == trait_name),
             // Tuple/unit types are not derivable (no plan for these)
             _ => false,
         }
@@ -1916,8 +1931,303 @@ impl<'ctx> CodeGen<'ctx> {
                     Self::substitute_type_params(arg, params, args);
                 }
             }
+            Type::ImplTrait(bounds) => {
+                for bound in bounds {
+                    for arg in &mut bound.generic_args {
+                        Self::substitute_type_params(arg, params, args);
+                    }
+                }
+            }
             _ => {}
         }
+    }
+
+    fn has_impl_trait_param(func: &Function) -> bool {
+        !func.type_params.is_empty()
+            || func
+                .params
+                .iter()
+                .any(|p| matches!(p.ty, Type::ImplTrait(..)))
+    }
+
+    fn infer_type_mappings(
+        &self,
+        param_ty: &Type,
+        arg_ty: &Type,
+        type_params: &[String],
+        mappings: &mut HashMap<String, Type>,
+    ) {
+        match (param_ty, arg_ty) {
+            (Type::Struct(name), _) if type_params.contains(name) => {
+                mappings.insert(name.clone(), arg_ty.clone());
+            }
+            (
+                Type::Ref {
+                    inner: p_inner,
+                    is_mut: p_mut,
+                },
+                Type::Ref {
+                    inner: a_inner,
+                    is_mut: a_mut,
+                },
+            ) => {
+                if *p_mut == *a_mut {
+                    self.infer_type_mappings(p_inner, a_inner, type_params, mappings);
+                }
+            }
+            (
+                Type::Ptr {
+                    inner: p_inner,
+                    is_mut: p_mut,
+                },
+                Type::Ptr {
+                    inner: a_inner,
+                    is_mut: a_mut,
+                },
+            ) => {
+                if *p_mut == *a_mut {
+                    self.infer_type_mappings(p_inner, a_inner, type_params, mappings);
+                }
+            }
+            (Type::Array { inner: p_inner, .. }, Type::Array { inner: a_inner, .. }) => {
+                self.infer_type_mappings(p_inner, a_inner, type_params, mappings);
+            }
+            (Type::GenericInstance(p_name, p_args), Type::GenericInstance(a_name, a_args)) => {
+                if p_name == a_name && p_args.len() == a_args.len() {
+                    for (p_arg, a_arg) in p_args.iter().zip(a_args) {
+                        self.infer_type_mappings(p_arg, a_arg, type_params, mappings);
+                    }
+                }
+            }
+            (Type::Tuple(p_tys), Type::Tuple(a_tys)) if p_tys.len() == a_tys.len() => {
+                for (p_ty, a_ty) in p_tys.iter().zip(a_tys) {
+                    self.infer_type_mappings(p_ty, a_ty, type_params, mappings);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn monomorphize_generic_method(
+        &mut self,
+        type_name: &str,
+        gen_method: &Function,
+        args: &[Expr],
+    ) -> Result<String, String> {
+        let mut cloned = gen_method.clone();
+        let param_names: Vec<String> = gen_method
+            .type_params
+            .iter()
+            .map(|p| p.name.clone())
+            .collect();
+        let mut mappings: HashMap<String, Type> = HashMap::new();
+
+        let caller_arg_types: Vec<Type> = args.iter().map(|a| self.expr_type(a)).collect();
+
+        // Match parameter types against argument types to infer mapping
+        for (param, arg_ty) in gen_method.params.iter().zip(&caller_arg_types) {
+            self.infer_type_mappings(&param.ty, arg_ty, &param_names, &mut mappings);
+        }
+
+        // Verify type params are inferred
+        for name in &param_names {
+            if !mappings.contains_key(name) {
+                return Err(format!(
+                    "Could not infer generic parameter '{}' in method '{}' of type '{}'",
+                    name, gen_method.name, type_name
+                ));
+            }
+        }
+
+        // Verify generic bounds
+        for p in &gen_method.type_params {
+            let concrete_ty = mappings.get(&p.name).unwrap();
+            for bound in &p.bounds {
+                if !self.check_type_implements_trait(concrete_ty, &bound.trait_name) {
+                    return Err(format!(
+                        "Generic parameter '{}' (concrete type {:?}) does not implement trait '{}' in method '{}'",
+                        p.name, concrete_ty, bound.trait_name, gen_method.name
+                    ));
+                }
+            }
+        }
+
+        // Verify and replace impl Trait bounds on parameters
+        for (i, param) in cloned.params.iter_mut().enumerate() {
+            if let Type::ImplTrait(bounds) = &param.ty {
+                let concrete_ty = caller_arg_types
+                    .get(i)
+                    .ok_or_else(|| "Mismatch in argument count".to_string())?
+                    .clone();
+                for bound in bounds {
+                    if !self.check_type_implements_trait(&concrete_ty, &bound.trait_name) {
+                        return Err(format!(
+                            "Argument type {:?} does not implement trait '{}' required by impl Trait",
+                            concrete_ty, bound.trait_name
+                        ));
+                    }
+                }
+                param.ty = concrete_ty;
+            }
+        }
+
+        // Substitute type parameters
+        let type_args: Vec<Type> = param_names
+            .iter()
+            .map(|name| mappings.get(name).unwrap().clone())
+            .collect();
+        Self::substitute_type_params_in_func(&mut cloned, &param_names, &type_args);
+        Self::m_substitute_block(&mut cloned.body, &param_names, &type_args);
+        Self::resolve_self_type(&mut cloned, &Type::Struct(type_name.to_string()));
+
+        let mut impl_trait_concrete_types = Vec::new();
+        for (original_param, cloned_param) in gen_method.params.iter().zip(&cloned.params) {
+            if let Type::ImplTrait(_) = &original_param.ty {
+                impl_trait_concrete_types.push(cloned_param.ty.clone());
+            }
+        }
+
+        // Generate mangled name
+        let mut mono_suffix: Vec<String> =
+            type_args.iter().map(Self::type_to_mangled_name).collect();
+        for ty in &impl_trait_concrete_types {
+            mono_suffix.push(Self::type_to_mangled_name(ty));
+        }
+        let mono_suffix_str = if mono_suffix.is_empty() {
+            String::new()
+        } else {
+            format!("_mono_{}", mono_suffix.join("_"))
+        };
+
+        let mangled_name = format!(
+            "{}::{}/{}{}",
+            type_name,
+            gen_method.name,
+            gen_method.params.len(),
+            mono_suffix_str
+        );
+        cloned.name = mangled_name.clone();
+
+        // Clear type params so it compiles as a normal function
+        cloned.type_params = Vec::new();
+
+        // Compile if not already compiled
+        if self.module.get_function(&mangled_name).is_none() {
+            self.declare_function(&cloned)?;
+            self.compile_function_body(&cloned)?;
+        }
+
+        // Register in impl_methods
+        self.impl_methods
+            .entry(type_name.to_string())
+            .or_default()
+            .push((gen_method.name.clone(), mangled_name.clone()));
+
+        Ok(mangled_name)
+    }
+
+    fn monomorphize_generic_function(
+        &mut self,
+        gen_func: &Function,
+        args: &[Expr],
+    ) -> Result<String, String> {
+        let mut cloned = gen_func.clone();
+        let param_names: Vec<String> = gen_func
+            .type_params
+            .iter()
+            .map(|p| p.name.clone())
+            .collect();
+        let mut mappings: HashMap<String, Type> = HashMap::new();
+
+        let caller_arg_types: Vec<Type> = args.iter().map(|a| self.expr_type(a)).collect();
+
+        // Match parameter types against argument types to infer mapping
+        for (param, arg_ty) in gen_func.params.iter().zip(&caller_arg_types) {
+            self.infer_type_mappings(&param.ty, arg_ty, &param_names, &mut mappings);
+        }
+
+        // Verify type params are inferred
+        for name in &param_names {
+            if !mappings.contains_key(name) {
+                return Err(format!(
+                    "Could not infer generic parameter '{}' in function '{}'",
+                    name, gen_func.name
+                ));
+            }
+        }
+
+        // Verify generic bounds
+        for p in &gen_func.type_params {
+            let concrete_ty = mappings.get(&p.name).unwrap();
+            for bound in &p.bounds {
+                if !self.check_type_implements_trait(concrete_ty, &bound.trait_name) {
+                    return Err(format!(
+                        "Generic parameter '{}' (concrete type {:?}) does not implement trait '{}' in function '{}'",
+                        p.name, concrete_ty, bound.trait_name, gen_func.name
+                    ));
+                }
+            }
+        }
+
+        // Verify and replace impl Trait bounds on parameters
+        for (i, param) in cloned.params.iter_mut().enumerate() {
+            if let Type::ImplTrait(bounds) = &param.ty {
+                let concrete_ty = caller_arg_types
+                    .get(i)
+                    .ok_or_else(|| "Mismatch in argument count".to_string())?
+                    .clone();
+                for bound in bounds {
+                    if !self.check_type_implements_trait(&concrete_ty, &bound.trait_name) {
+                        return Err(format!(
+                            "Argument type {:?} does not implement trait '{}' required by impl Trait",
+                            concrete_ty, bound.trait_name
+                        ));
+                    }
+                }
+                param.ty = concrete_ty;
+            }
+        }
+
+        // Substitute type parameters
+        let type_args: Vec<Type> = param_names
+            .iter()
+            .map(|name| mappings.get(name).unwrap().clone())
+            .collect();
+        Self::substitute_type_params_in_func(&mut cloned, &param_names, &type_args);
+        Self::m_substitute_block(&mut cloned.body, &param_names, &type_args);
+
+        let mut impl_trait_concrete_types = Vec::new();
+        for (original_param, cloned_param) in gen_func.params.iter().zip(&cloned.params) {
+            if let Type::ImplTrait(_) = &original_param.ty {
+                impl_trait_concrete_types.push(cloned_param.ty.clone());
+            }
+        }
+
+        // Generate mangled name
+        let mut mono_suffix: Vec<String> =
+            type_args.iter().map(Self::type_to_mangled_name).collect();
+        for ty in &impl_trait_concrete_types {
+            mono_suffix.push(Self::type_to_mangled_name(ty));
+        }
+        let mono_suffix_str = if mono_suffix.is_empty() {
+            String::new()
+        } else {
+            format!("_mono_{}", mono_suffix.join("_"))
+        };
+
+        let mangled_name = format!("{}{}", gen_func.name, mono_suffix_str);
+        cloned.name = mangled_name.clone();
+
+        // Clear type params so it compiles as a normal function
+        cloned.type_params = Vec::new();
+
+        // Compile if not already compiled
+        if self.module.get_function(&mangled_name).is_none() {
+            self.declare_function(&cloned)?;
+            self.compile_function_body(&cloned)?;
+        }
+
+        Ok(mangled_name)
     }
 
     /// Collect GenericInstance from a method's params, return type, and body.
@@ -2226,7 +2536,18 @@ impl<'ctx> CodeGen<'ctx> {
 
         // 1a. Create concrete LLVM struct type (generic struct)
         if let Some(decl) = self.generic_struct_defs.get(base_name) {
-            let param_names: Vec<String> = decl.type_params.clone();
+            for (p, arg) in decl.type_params.iter().zip(args) {
+                for bound in &p.bounds {
+                    if !self.check_type_implements_trait(arg, &bound.trait_name) {
+                        return Err(format!(
+                            "Type arg {:?} does not implement trait '{}' required by struct '{}' parameter '{}'",
+                            arg, bound.trait_name, base_name, p.name
+                        ));
+                    }
+                }
+            }
+            let param_names: Vec<String> =
+                decl.type_params.iter().map(|p| p.name.clone()).collect();
             let substituted_fields: Vec<StructField> = decl
                 .fields
                 .iter()
@@ -2266,7 +2587,18 @@ impl<'ctx> CodeGen<'ctx> {
 
         // 1b. Create concrete LLVM struct type (generic enum)
         if let Some(decl) = self.generic_enum_defs.get(base_name) {
-            let param_names: Vec<String> = decl.type_params.clone();
+            for (p, arg) in decl.type_params.iter().zip(args) {
+                for bound in &p.bounds {
+                    if !self.check_type_implements_trait(arg, &bound.trait_name) {
+                        return Err(format!(
+                            "Type arg {:?} does not implement trait '{}' required by enum '{}' parameter '{}'",
+                            arg, bound.trait_name, base_name, p.name
+                        ));
+                    }
+                }
+            }
+            let param_names: Vec<String> =
+                decl.type_params.iter().map(|p| p.name.clone()).collect();
             let mut substituted_fields: Vec<StructField> = vec![StructField {
                 name: "__tag".to_string(),
                 ty: Type::I8,
@@ -2313,7 +2645,7 @@ impl<'ctx> CodeGen<'ctx> {
         }
 
         // 2. Compile generic impl methods for this concrete instance
-        let impl_blocks: Vec<(Vec<String>, ImplDecl)> = self
+        let impl_blocks: Vec<(Vec<GenericParam>, ImplDecl)> = self
             .generic_impls
             .get(base_name)
             .cloned()
@@ -2323,6 +2655,7 @@ impl<'ctx> CodeGen<'ctx> {
         self.current_monomorphization = Some((base_name.to_string(), mangled.clone()));
 
         for (impl_params, impl_decl) in &impl_blocks {
+            let param_names: Vec<String> = impl_params.iter().map(|p| p.name.clone()).collect();
             if let Some(ref tname) = impl_decl.trait_name {
                 self.trait_impls
                     .entry(mangled.clone())
@@ -2333,7 +2666,7 @@ impl<'ctx> CodeGen<'ctx> {
                 let mut method_func = method.clone();
 
                 // Substitute type params in the method
-                Self::monomorphize_method(&mut method_func, impl_params, args, &self_type);
+                Self::monomorphize_method(&mut method_func, &param_names, args, &self_type);
 
                 // Compute mangled name
                 let mangled_method = format!(
@@ -2493,6 +2826,13 @@ impl<'ctx> CodeGen<'ctx> {
                 continue;
             }
             for method in &decl.methods {
+                if Self::has_impl_trait_param(method) {
+                    self.generic_methods
+                        .entry(type_name.clone())
+                        .or_default()
+                        .push(method.clone());
+                    continue;
+                }
                 let mangled_name = if let Some(ref trait_name) = decl.trait_name {
                     format!("__trait_{}_{}_{}", trait_name, method.name, type_name)
                 } else {
@@ -2511,6 +2851,10 @@ impl<'ctx> CodeGen<'ctx> {
         }
         // Phase 1: Declare all functions
         for func in &program.funcs {
+            if Self::has_impl_trait_param(func) {
+                self.generic_funcs.insert(func.name.clone(), func.clone());
+                continue;
+            }
             self.declare_function(func)?;
         }
         // Phase 0.6: Discover and monomorphize all needed generic instances
@@ -2573,6 +2917,9 @@ impl<'ctx> CodeGen<'ctx> {
         }
         // Phase 2: Compile bodies for non-extern functions
         for func in &program.funcs {
+            if Self::has_impl_trait_param(func) {
+                continue;
+            }
             if !func.is_extern {
                 self.compile_function_body(func)?;
             }
@@ -2589,6 +2936,9 @@ impl<'ctx> CodeGen<'ctx> {
             };
             let self_type = Type::Struct(type_name.clone());
             for method in &decl.methods {
+                if Self::has_impl_trait_param(method) {
+                    continue;
+                }
                 let mangled_name = if let Some(ref trait_name) = decl.trait_name {
                     format!("__trait_{}_{}_{}", trait_name, method.name, type_name)
                 } else {
@@ -2672,6 +3022,11 @@ impl<'ctx> CodeGen<'ctx> {
 
     fn type_to_llvm(&self, ty: &Type) -> BasicTypeEnum<'ctx> {
         match ty {
+            Type::ImplTrait(_) => {
+                panic!(
+                    "ImplTrait type cannot be converted to LLVM type directly; it should have been monomorphized"
+                );
+            }
             Type::Bool => self.bool_type.into(),
             Type::I8 => self.i8_type.into(),
             Type::I16 => self.i16_type.into(),
@@ -2685,9 +3040,7 @@ impl<'ctx> CodeGen<'ctx> {
             Type::Usize => self.ptr_int_type.into(),
             Type::F32 => self.f32_type.into(),
             Type::F64 => self.f64_type.into(),
-            Type::Never => {
-                panic!("Never type cannot be used as a value type");
-            }
+            Type::Never => self.context.struct_type(&[], false).into(),
             Type::Tuple(elems) => {
                 let llvm_elems: Vec<BasicTypeEnum<'ctx>> =
                     elems.iter().map(|t| self.type_to_llvm(t)).collect();
@@ -2775,6 +3128,158 @@ impl<'ctx> CodeGen<'ctx> {
         }
     }
 
+    fn get_undef_value(&self, ty: &BasicTypeEnum<'ctx>) -> BasicValueEnum<'ctx> {
+        match ty {
+            BasicTypeEnum::IntType(it) => it.get_undef().into(),
+            BasicTypeEnum::FloatType(ft) => ft.get_undef().into(),
+            BasicTypeEnum::PointerType(pt) => pt.get_undef().into(),
+            BasicTypeEnum::StructType(st) => st.get_undef().into(),
+            BasicTypeEnum::ArrayType(at) => at.get_undef().into(),
+            BasicTypeEnum::VectorType(vt) => vt.get_undef().into(),
+            BasicTypeEnum::ScalableVectorType(svt) => svt.get_undef().into(),
+        }
+    }
+
+    fn resolve_if_result_type(
+        &self,
+        then_block: &Block,
+        else_ifs: &[(Expr, Block)],
+        else_block: &Option<Block>,
+    ) -> Type {
+        let mut candidate = None;
+        if let Some(ref e) = then_block.tail_expr {
+            let ty = self.expr_type(e);
+            if ty != Type::Never {
+                return ty;
+            }
+            candidate = Some(ty);
+        }
+        for (_, block) in else_ifs {
+            if let Some(ref e) = block.tail_expr {
+                let ty = self.expr_type(e);
+                if ty != Type::Never {
+                    return ty;
+                }
+                candidate = Some(ty);
+            }
+        }
+        if let Some(block) = else_block {
+            if let Some(ref e) = block.tail_expr {
+                let ty = self.expr_type(e);
+                if ty != Type::Never {
+                    return ty;
+                }
+                candidate = Some(ty);
+            }
+        }
+        candidate.unwrap_or(Type::I32)
+    }
+
+    fn resolve_if_let_result_type(&self, then_block: &Block, else_block: &Option<Block>) -> Type {
+        let mut candidate = None;
+        if let Some(ref e) = then_block.tail_expr {
+            let ty = self.expr_type(e);
+            if ty != Type::Never {
+                return ty;
+            }
+            candidate = Some(ty);
+        }
+        if let Some(block) = else_block {
+            if let Some(ref e) = block.tail_expr {
+                let ty = self.expr_type(e);
+                if ty != Type::Never {
+                    return ty;
+                }
+                candidate = Some(ty);
+            }
+        }
+        candidate.unwrap_or(Type::Unit)
+    }
+
+    fn resolve_pattern_var_type(
+        &self,
+        pattern: &Pattern,
+        scrutinee_ty: &Type,
+        var_name: &str,
+    ) -> Option<Type> {
+        match pattern {
+            Pattern::Binding(name) if name == var_name => Some(scrutinee_ty.clone()),
+            Pattern::EnumVariant {
+                enum_name: _,
+                variant,
+                payload,
+            } => {
+                if let Some(inner_pattern) = payload {
+                    let enum_type_name = match scrutinee_ty {
+                        Type::Struct(name) => self
+                            .monomorphized_names
+                            .get(name.as_str())
+                            .cloned()
+                            .unwrap_or_else(|| name.clone()),
+                        Type::GenericInstance(name, args) => {
+                            Self::mangle_generic_instance(name, args)
+                        }
+                        Type::Ref { inner, .. } => match inner.as_ref() {
+                            Type::Struct(name) => self
+                                .monomorphized_names
+                                .get(name.as_str())
+                                .cloned()
+                                .unwrap_or_else(|| name.clone()),
+                            Type::GenericInstance(name, args) => {
+                                Self::mangle_generic_instance(name, args)
+                            }
+                            _ => return None,
+                        },
+                        _ => return None,
+                    };
+
+                    let fields = self.struct_fields.get(&enum_type_name)?;
+                    let payload_field_name = format!("__{}", variant);
+                    let payload_ty = fields
+                        .iter()
+                        .find(|f| f.name == payload_field_name)?
+                        .ty
+                        .clone();
+
+                    self.resolve_pattern_var_type(inner_pattern, &payload_ty, var_name)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn resolve_match_result_type(&self, scrutinee_expr: &Expr, arms: &[MatchArm]) -> Type {
+        let scrutinee_ty = self.expr_type(scrutinee_expr);
+        let mut candidate = None;
+        for arm in arms {
+            if let Some(ref e) = arm.body.tail_expr {
+                let ty = if let Expr::Ident(name) = e.as_ref() {
+                    if self.consts.contains_key(name.as_str())
+                        || self.symbols.contains_key(name.as_str())
+                    {
+                        self.expr_type(e)
+                    } else {
+                        self.resolve_pattern_var_type(&arm.pattern, &scrutinee_ty, name)
+                            .unwrap_or(Type::I32)
+                    }
+                } else {
+                    self.expr_type(e)
+                };
+                eprintln!(
+                    "DEBUG resolve_match_result_type: arm tail_expr={:?}, type={:?}",
+                    e, ty
+                );
+                if ty != Type::Never {
+                    return ty;
+                }
+                candidate = Some(ty);
+            }
+        }
+        candidate.unwrap_or(Type::Unit)
+    }
+
     fn type_to_metadata_type(&self, ty: &Type) -> BasicMetadataTypeEnum<'ctx> {
         match ty {
             Type::Ref { .. } => self.type_to_llvm(ty).into(),
@@ -2806,7 +3311,7 @@ impl<'ctx> CodeGen<'ctx> {
             Expr::MethodCall {
                 expr: receiver,
                 method,
-                ..
+                args,
             } => {
                 // Try to determine return type from method definition
                 let receiver_type = self.expr_type(receiver);
@@ -2826,13 +3331,13 @@ impl<'ctx> CodeGen<'ctx> {
                 }
                 // .as_ptr() on &[T] returns *const T
                 if method == "as_ptr" {
-                    if let Type::Ref { inner, .. } = &receiver_type {
-                        if let Type::Slice { inner: elem_ty } = inner.as_ref() {
-                            return Type::Ptr {
-                                inner: elem_ty.clone(),
-                                is_mut: false,
-                            };
-                        }
+                    if let Type::Ref { inner, .. } = &receiver_type
+                        && let Type::Slice { inner: elem_ty } = inner.as_ref()
+                    {
+                        return Type::Ptr {
+                            inner: elem_ty.clone(),
+                            is_mut: false,
+                        };
                     }
                     if let Type::Slice { inner: elem_ty } = &receiver_type {
                         return Type::Ptr {
@@ -2861,10 +3366,42 @@ impl<'ctx> CodeGen<'ctx> {
                     },
                     _ => Self::primitive_type_name(&receiver_type).map(|s| s.to_string()),
                 };
-                if let Some(type_name) = type_name
-                    && let Some(methods) = self.impl_methods.get(&type_name)
-                {
-                    if let Some((_, mangled)) = methods.iter().find(|(name, _)| name == method)
+                if let Some(type_name) = type_name {
+                    if let Some(generic_methods) = self.generic_methods.get(&type_name)
+                        && let Some(gen_method) = generic_methods.iter().find(|m| m.name == *method)
+                    {
+                        let param_names: Vec<String> = gen_method
+                            .type_params
+                            .iter()
+                            .map(|p| p.name.clone())
+                            .collect();
+                        let mut mappings = HashMap::new();
+                        let mut all_arg_types = vec![receiver_type.clone()];
+                        all_arg_types.extend(args.iter().map(|a| self.expr_type(a)));
+                        for (param, arg_ty) in gen_method.params.iter().zip(&all_arg_types) {
+                            self.infer_type_mappings(
+                                &param.ty,
+                                arg_ty,
+                                &param_names,
+                                &mut mappings,
+                            );
+                        }
+                        if let Some(mut ret_ty) = gen_method.return_type.clone() {
+                            Self::substitute_type_params(
+                                &mut ret_ty,
+                                &param_names,
+                                &param_names
+                                    .iter()
+                                    .map(|n| mappings.get(n).cloned().unwrap_or(Type::I32))
+                                    .collect::<Vec<_>>(),
+                            );
+                            return ret_ty;
+                        } else {
+                            return Type::Unit;
+                        }
+                    }
+                    if let Some(methods) = self.impl_methods.get(&type_name)
+                        && let Some((_, mangled)) = methods.iter().find(|(name, _)| name == method)
                         && let Some(ret_ty) = self.fn_return_types.get(mangled)
                     {
                         return ret_ty.clone();
@@ -2876,7 +3413,9 @@ impl<'ctx> CodeGen<'ctx> {
                     if method == "eq" || method == "ne" {
                         return Type::Bool;
                     }
-                    if methods.iter().any(|(name, _)| name == method) {
+                    if let Some(methods) = self.impl_methods.get(&type_name)
+                        && methods.iter().any(|(name, _)| name == method)
+                    {
                         return Type::I32;
                     }
                 }
@@ -2979,49 +3518,16 @@ impl<'ctx> CodeGen<'ctx> {
                 else_block,
                 else_ifs,
                 ..
-            } => {
-                // Determine result type from then/else blocks
-                then_block
-                    .tail_expr
-                    .as_ref()
-                    .map(|e| self.expr_type(e))
-                    .or_else(|| {
-                        else_block
-                            .as_ref()
-                            .and_then(|b| b.tail_expr.as_ref().map(|e| self.expr_type(e)))
-                    })
-                    .or_else(|| {
-                        else_ifs
-                            .first()
-                            .and_then(|(_, b)| b.tail_expr.as_ref().map(|e| self.expr_type(e)))
-                    })
-                    .unwrap_or(Type::I32)
-            }
+            } => self.resolve_if_result_type(then_block, else_ifs, else_block),
             Expr::IfLet {
                 then_block,
                 else_block,
                 ..
-            } => {
-                // Result type from then/else blocks
-                then_block
-                    .tail_expr
-                    .as_ref()
-                    .map(|e| self.expr_type(e))
-                    .or_else(|| {
-                        else_block
-                            .as_ref()
-                            .and_then(|b| b.tail_expr.as_ref().map(|e| self.expr_type(e)))
-                    })
-                    .unwrap_or(Type::Unit)
-            }
+            } => self.resolve_if_let_result_type(then_block, else_block),
             Expr::For { .. } => Type::Unit,
-            Expr::Match { arms, .. } => {
-                // Result type from first arm (all arms must have same type)
-                arms.first()
-                    .and_then(|arm| arm.body.tail_expr.as_ref())
-                    .map(|e| self.expr_type(e))
-                    .unwrap_or(Type::Unit)
-            }
+            Expr::Match {
+                scrutinee, arms, ..
+            } => self.resolve_match_result_type(scrutinee, arms),
             Expr::Call { callee, args } => {
                 // Handle builtin slice intrinsics
                 if let Some(ret_ty) = self.slice_intrinsic_return_type(callee, args) {
@@ -3032,7 +3538,7 @@ impl<'ctx> CodeGen<'ctx> {
                     return Type::Usize;
                 }
                 let arg_types: Vec<Type> = args.iter().map(|a| self.expr_type(a)).collect();
-                // Try direct lookup, then overloaded
+                // Try direct lookup, then overloaded, then generic
                 let name = if self.module.get_function(callee).is_some() {
                     callee.clone()
                 } else if let Some(mangled) = self.overloads.get(callee).and_then(|overloads| {
@@ -3042,6 +3548,29 @@ impl<'ctx> CodeGen<'ctx> {
                         .map(|(mangled, _)| mangled.clone())
                 }) {
                     mangled
+                } else if let Some(gen_func) = self.generic_funcs.get(callee) {
+                    let param_names: Vec<String> = gen_func
+                        .type_params
+                        .iter()
+                        .map(|p| p.name.clone())
+                        .collect();
+                    let mut mappings = HashMap::new();
+                    for (param, arg_ty) in gen_func.params.iter().zip(&arg_types) {
+                        self.infer_type_mappings(&param.ty, arg_ty, &param_names, &mut mappings);
+                    }
+                    if let Some(mut ret_ty) = gen_func.return_type.clone() {
+                        Self::substitute_type_params(
+                            &mut ret_ty,
+                            &param_names,
+                            &param_names
+                                .iter()
+                                .map(|n| mappings.get(n).cloned().unwrap_or(Type::I32))
+                                .collect::<Vec<_>>(),
+                        );
+                        return ret_ty;
+                    } else {
+                        return Type::Unit;
+                    }
                 } else {
                     callee.clone()
                 };
@@ -3346,6 +3875,7 @@ impl<'ctx> CodeGen<'ctx> {
     }
 
     fn compile_function_body_inner(&mut self, func: &Function) -> Result<(), String> {
+        eprintln!("DEBUG compile_function_body_inner: {}", func.name);
         self.current_module_path = self.get_module_path_for_item_name(&func.name);
 
         // Validate visibility of parameter and return types
@@ -3391,7 +3921,8 @@ impl<'ctx> CodeGen<'ctx> {
 
         if !already_terminated {
             if let Some(tail_expr) = &func.body.tail_expr {
-                let val = self.compile_expr(tail_expr)?;
+                let ret_ty = func.return_type.clone().unwrap_or(Type::I32);
+                let val = self.with_expected_type(&ret_ty, |this| this.compile_expr(tail_expr))?;
                 self.builder
                     .build_return(Some(&val))
                     .map_err(|e| format!("failed to build return for tail expr: {}", e))?;
@@ -3461,14 +3992,13 @@ impl<'ctx> CodeGen<'ctx> {
                         {
                             let inferred = self.expr_type(init);
                             if ann_ty != &inferred {
-                                value = self.emit_cast(value, ann_ty)?;
+                                value = self.emit_cast(value, &inferred, ann_ty)?;
                             }
                         }
                         self.builder
                             .build_store(alloca, value)
                             .map_err(|e| format!("failed to build store: {}", e))?;
-                        self.symbols
-                            .insert(name.clone(), (alloca, *is_mut, ty));
+                        self.symbols.insert(name.clone(), (alloca, *is_mut, ty));
                     }
                     Pattern::Wildcard => {
                         // Evaluate the init expression for side effects, discard result
@@ -3494,7 +4024,20 @@ impl<'ctx> CodeGen<'ctx> {
             Stmt::Return { value, .. } => {
                 match value {
                     Some(expr) => {
-                        let val = self.compile_expr(expr)?;
+                        let func_val = self
+                            .builder
+                            .get_insert_block()
+                            .unwrap()
+                            .get_parent()
+                            .unwrap();
+                        let func_name = func_val.get_name().to_string_lossy().to_string();
+                        let ret_ty = self
+                            .fn_return_types
+                            .get(&func_name)
+                            .cloned()
+                            .unwrap_or(Type::I32);
+                        let val =
+                            self.with_expected_type(&ret_ty, |this| this.compile_expr(expr))?;
                         self.builder
                             .build_return(Some(&val))
                             .map_err(|e| format!("failed to build return: {}", e))?;
@@ -3756,8 +4299,9 @@ impl<'ctx> CodeGen<'ctx> {
         parent_fn: inkwell::values::FunctionValue<'ctx>,
         merge_bb: inkwell::basic_block::BasicBlock<'ctx>,
         result_alloca: inkwell::values::PointerValue<'ctx>,
-        _result_type: &Type,
+        result_type: &Type,
     ) -> Result<(), String> {
+        let result_llvm_ty = self.type_to_llvm(result_type);
         if let Some((elif_cond, elif_body)) = else_ifs.first() {
             let cond_val = self.compile_expr(elif_cond)?;
             let cond_i1 = match cond_val {
@@ -3785,7 +4329,15 @@ impl<'ctx> CodeGen<'ctx> {
             // Compile the elif body
             self.builder.position_at_end(then_bb);
             let saved_symbols = self.symbols.clone();
-            if let Some(val) = self.compile_block_get_value(elif_body)? {
+            if let Some(mut val) = self.compile_block_get_value(elif_body)? {
+                let elif_ty = elif_body
+                    .tail_expr
+                    .as_ref()
+                    .map(|e| self.expr_type(e))
+                    .unwrap_or(Type::I32);
+                if val.get_type() != result_llvm_ty {
+                    val = self.emit_cast(val, &elif_ty, result_type)?;
+                }
                 self.builder
                     .build_store(result_alloca, val)
                     .map_err(|e| format!("failed to store elif result: {}", e))?;
@@ -3811,11 +4363,19 @@ impl<'ctx> CodeGen<'ctx> {
                 parent_fn,
                 merge_bb,
                 result_alloca,
-                _result_type,
+                result_type,
             )?;
         } else if let Some(el_block) = else_block {
             let saved_symbols = self.symbols.clone();
-            if let Some(val) = self.compile_block_get_value(el_block)? {
+            if let Some(mut val) = self.compile_block_get_value(el_block)? {
+                let else_ty = el_block
+                    .tail_expr
+                    .as_ref()
+                    .map(|e| self.expr_type(e))
+                    .unwrap_or(Type::I32);
+                if val.get_type() != result_llvm_ty {
+                    val = self.emit_cast(val, &else_ty, result_type)?;
+                }
                 self.builder
                     .build_store(result_alloca, val)
                     .map_err(|e| format!("failed to store else result: {}", e))?;
@@ -3891,10 +4451,11 @@ impl<'ctx> CodeGen<'ctx> {
                 },
                 _ => String::new(),
             };
+            let param_names: Vec<String> = type_params.iter().map(|p| p.name.clone()).collect();
             let type_args: Vec<Type> = type_params
                 .iter()
                 .map(|p| {
-                    if p == &inner_type_name {
+                    if p.name == inner_type_name {
                         elem_ty.clone()
                     } else {
                         Type::I32
@@ -3905,11 +4466,11 @@ impl<'ctx> CodeGen<'ctx> {
 
             for method in &impl_decl.methods {
                 let mut method_func = method.clone();
-                Self::substitute_type_params_in_func(&mut method_func, type_params, &type_args);
+                Self::substitute_type_params_in_func(&mut method_func, &param_names, &type_args);
                 let self_type = self_array_type.clone();
                 Self::resolve_self_type(&mut method_func, &self_type);
                 Self::m_substitute_const_block(&mut method_func.body, const_params, &const_values);
-                Self::m_substitute_block(&mut method_func.body, type_params, &type_args);
+                Self::m_substitute_block(&mut method_func.body, &param_names, &type_args);
 
                 let body_instances = Self::collect_generic_instances_from_method(&method_func);
                 for (sub_base, sub_args) in &body_instances {
@@ -4325,8 +4886,9 @@ impl<'ctx> CodeGen<'ctx> {
                         && let Some(field_def) = fields.get(field_idx as usize)
                     {
                         let field_llvm_ty = self.type_to_llvm(&field_def.ty);
+                        let value_ty = self.expr_type(value);
                         if val.get_type() != field_llvm_ty {
-                            val = self.emit_cast(val, &field_def.ty)?;
+                            val = self.emit_cast(val, &value_ty, &field_def.ty)?;
                         }
                     }
                     self.builder
@@ -4530,9 +5092,20 @@ impl<'ctx> CodeGen<'ctx> {
                     return Ok(result);
                 }
                 let arg_types: Vec<Type> = args.iter().map(|a| self.expr_type(a)).collect();
-                let fn_val = self
-                    .resolve_function(callee, &arg_types)
-                    .ok_or_else(|| format!("unknown function '{}'", callee))?;
+                let fn_val = if let Some(val) = self.resolve_function(callee, &arg_types) {
+                    val
+                } else if let Some(gen_func) = self.generic_funcs.get(callee).cloned() {
+                    let mangled_name = self.monomorphize_generic_function(&gen_func, args)?;
+                    self.resolve_function(&mangled_name, &arg_types)
+                        .ok_or_else(|| {
+                            format!(
+                                "failed to resolve monomorphized function '{}'",
+                                mangled_name
+                            )
+                        })?
+                } else {
+                    return Err(format!("unknown function '{}'", callee));
+                };
                 let mut arg_values = self.compile_args_vec(args)?;
                 // Coerce arguments to match declared parameter types
                 let resolved_name = fn_val.get_name().to_string_lossy().to_string();
@@ -5128,18 +5701,24 @@ impl<'ctx> CodeGen<'ctx> {
                 };
 
                 // Look up method
-                let methods = self.impl_methods.get(&type_name).ok_or_else(|| {
-                    format!("type '{}' has no methods (no impl block found)", type_name)
-                })?;
+                let gen_method_opt =
+                    if let Some(generic_methods) = self.generic_methods.get(&type_name) {
+                        generic_methods.iter().find(|m| m.name == *method).cloned()
+                    } else {
+                        None
+                    };
 
-                let mangled = methods
-                    .iter()
-                    .find(|(name, _)| name == method)
-                    .map(|(_, mangled)| mangled.clone())
-                    .ok_or_else(|| {
-                        eprintln!("DEBUG methods for {}: {:?}", type_name, methods);
-                        format!("type '{}' has no method '{}'", type_name, method)
-                    })?;
+                let mangled = if let Some(gen_method) = gen_method_opt {
+                    let mut all_exprs = vec![receiver.as_ref().clone()];
+                    all_exprs.extend(args.clone());
+                    self.monomorphize_generic_method(&type_name, &gen_method, &all_exprs)?
+                } else if let Some(methods) = self.impl_methods.get(&type_name)
+                    && let Some((_, mangled_name)) = methods.iter().find(|(name, _)| name == method)
+                {
+                    mangled_name.clone()
+                } else {
+                    return Err(format!("type '{}' has no method '{}'", type_name, method));
+                };
 
                 self.check_visibility_of_path(&self.current_module_path, &mangled)?;
 
@@ -5337,7 +5916,8 @@ impl<'ctx> CodeGen<'ctx> {
                     if let Some(field_ty) = struct_def_fields.get(i) {
                         let field_llvm_ty = self.type_to_llvm(field_ty);
                         if field_val.get_type() != field_llvm_ty {
-                            field_val = self.emit_cast(field_val, field_ty)?;
+                            let expr_ty = self.expr_type(field_expr);
+                            field_val = self.emit_cast(field_val, &expr_ty, field_ty)?;
                         }
                     }
                     result = self
@@ -5547,7 +6127,8 @@ impl<'ctx> CodeGen<'ctx> {
             Expr::Cast { expr, to_type } => {
                 self.check_visibility_of_type(&self.current_module_path, to_type)?;
                 let val = self.compile_expr(expr)?;
-                self.emit_cast(val, to_type)
+                let expr_ty = self.expr_type(expr);
+                self.emit_cast(val, &expr_ty, to_type)
             }
             Expr::If {
                 cond,
@@ -5575,21 +6156,7 @@ impl<'ctx> CodeGen<'ctx> {
                 };
 
                 // Determine result type from then/else blocks
-                let result_type = then_block
-                    .tail_expr
-                    .as_ref()
-                    .map(|e| self.expr_type(e))
-                    .or_else(|| {
-                        else_block
-                            .as_ref()
-                            .and_then(|b| b.tail_expr.as_ref().map(|e| self.expr_type(e)))
-                    })
-                    .or_else(|| {
-                        else_ifs
-                            .first()
-                            .and_then(|(_, b)| b.tail_expr.as_ref().map(|e| self.expr_type(e)))
-                    })
-                    .unwrap_or(Type::I32);
+                let result_type = self.resolve_if_result_type(then_block, else_ifs, else_block);
                 let result_llvm_ty = self.type_to_llvm(&result_type);
 
                 // Allocate a stack slot for the if result
@@ -5609,7 +6176,15 @@ impl<'ctx> CodeGen<'ctx> {
                 // Compile then block
                 self.builder.position_at_end(then_bb);
                 let saved_symbols = self.symbols.clone();
-                if let Some(then_val) = self.compile_block_get_value(then_block)? {
+                if let Some(mut then_val) = self.compile_block_get_value(then_block)? {
+                    let then_ty = then_block
+                        .tail_expr
+                        .as_ref()
+                        .map(|e| self.expr_type(e))
+                        .unwrap_or(Type::I32);
+                    if then_val.get_type() != result_llvm_ty {
+                        then_val = self.emit_cast(then_val, &then_ty, &result_type)?;
+                    }
                     self.builder
                         .build_store(result_alloca, then_val)
                         .map_err(|e| format!("failed to store then result: {}", e))?;
@@ -5905,16 +6480,7 @@ impl<'ctx> CodeGen<'ctx> {
     ) -> Result<BasicValueEnum<'ctx>, String> {
         let scrutinee_val = self.compile_expr(scrutinee)?;
         let scrutinee_ty = self.expr_type(scrutinee);
-        let result_type = then_block
-            .tail_expr
-            .as_ref()
-            .map(|e| self.expr_type(e))
-            .or_else(|| {
-                else_block
-                    .as_ref()
-                    .and_then(|b| b.tail_expr.as_ref().map(|e| self.expr_type(e)))
-            })
-            .unwrap_or(Type::Unit);
+        let result_type = self.resolve_if_let_result_type(then_block, else_block);
         let result_llvm_ty = self.type_to_llvm(&result_type);
 
         let parent_fn = self
@@ -5948,7 +6514,15 @@ impl<'ctx> CodeGen<'ctx> {
         for (name, ptr, ty) in &bindings {
             self.symbols.insert(name.clone(), (*ptr, false, ty.clone()));
         }
-        if let Some(val) = self.compile_block_get_value(then_block)? {
+        if let Some(mut val) = self.compile_block_get_value(then_block)? {
+            let then_ty = then_block
+                .tail_expr
+                .as_ref()
+                .map(|e| self.expr_type(e))
+                .unwrap_or(Type::Unit);
+            if val.get_type() != result_llvm_ty {
+                val = self.emit_cast(val, &then_ty, &result_type)?;
+            }
             self.builder
                 .build_store(result_alloca, val)
                 .map_err(|e| format!("failed to store if_let then result: {}", e))?;
@@ -5970,8 +6544,16 @@ impl<'ctx> CodeGen<'ctx> {
         self.builder.position_at_end(else_bb);
         let saved = self.symbols.clone();
         if let Some(el_block) = else_block
-            && let Some(val) = self.compile_block_get_value(el_block)?
+            && let Some(mut val) = self.compile_block_get_value(el_block)?
         {
+            let else_ty = el_block
+                .tail_expr
+                .as_ref()
+                .map(|e| self.expr_type(e))
+                .unwrap_or(Type::Unit);
+            if val.get_type() != result_llvm_ty {
+                val = self.emit_cast(val, &else_ty, &result_type)?;
+            }
             self.builder
                 .build_store(result_alloca, val)
                 .map_err(|e| format!("failed to store if_let else result: {}", e))?;
@@ -6064,7 +6646,7 @@ impl<'ctx> CodeGen<'ctx> {
             }
         };
         // Ensure Option<elem_ty> is monomorphized so that pattern matching tag layouts are available
-        self.ensure_monomorphized("Option", &[elem_ty.clone()])?;
+        self.ensure_monomorphized("Option", std::slice::from_ref(&elem_ty))?;
         // Compile iterator value and store in alloca `__for_loop_iter`
         let iter_llvm_ty = self.type_to_llvm(&iter_ty);
         let iter_alloca = self
@@ -6139,11 +6721,7 @@ impl<'ctx> CodeGen<'ctx> {
     ) -> Result<BasicValueEnum<'ctx>, String> {
         let scrutinee_val = self.compile_expr(scrutinee)?;
         let scrutinee_ty = self.expr_type(scrutinee);
-        let result_type = arms
-            .first()
-            .and_then(|arm| arm.body.tail_expr.as_ref())
-            .map(|e| self.expr_type(e))
-            .unwrap_or(Type::Unit);
+        let result_type = self.resolve_match_result_type(scrutinee, arms);
         let result_llvm_ty = self.type_to_llvm(&result_type);
 
         let parent_fn = self
@@ -6242,7 +6820,16 @@ impl<'ctx> CodeGen<'ctx> {
             for (name, ptr, ty) in &bindings {
                 self.symbols.insert(name.clone(), (*ptr, false, ty.clone()));
             }
-            if let Some(val) = self.compile_block_get_value(&arm.body)? {
+            if let Some(mut val) = self.compile_block_get_value(&arm.body)? {
+                let arm_ty = arm
+                    .body
+                    .tail_expr
+                    .as_ref()
+                    .map(|e| self.expr_type(e))
+                    .unwrap_or(Type::Unit);
+                if val.get_type() != result_llvm_ty {
+                    val = self.emit_cast(val, &arm_ty, &result_type)?;
+                }
                 self.builder
                     .build_store(result_alloca, val)
                     .map_err(|e| format!("failed to store match arm result: {}", e))?;
@@ -6757,6 +7344,26 @@ impl<'ctx> CodeGen<'ctx> {
         arg_ty: &Type,
         param_ty: &Type,
     ) -> Result<BasicValueEnum<'ctx>, String> {
+        let mut arg_val = arg_val;
+        let mut arg_ty = arg_ty.clone();
+
+        // Recursively dereference references if the inner type matches the target parameter type,
+        // or if the inner type is itself a reference that needs to be loaded.
+        while let Type::Ref { inner, .. } = &arg_ty {
+            let inner_is_ref = matches!(inner.as_ref(), Type::Ref { .. });
+            if inner.as_ref() == param_ty || inner_is_ref {
+                let pointee_llvm_ty = self.type_to_llvm(inner.as_ref());
+                let ptr = arg_val.into_pointer_value();
+                arg_val = self
+                    .builder
+                    .build_load(pointee_llvm_ty, ptr, "deref_coerce")
+                    .map_err(|e| format!("failed to build deref load for coercion: {}", e))?;
+                arg_ty = inner.as_ref().clone();
+            } else {
+                break;
+            }
+        }
+
         // Check if the parameter expects a slice fat pointer
         let param_is_slice = matches!(param_ty, Type::Slice { .. })
             || matches!(
@@ -6768,22 +7375,22 @@ impl<'ctx> CodeGen<'ctx> {
             );
 
         if !param_is_slice {
-            return self.emit_cast(arg_val, param_ty);
+            return self.emit_cast(arg_val, &arg_ty, param_ty);
         }
 
         // Extract the length and indirection kind from the argument type
-        let (arg_len, is_ref) = match arg_ty {
+        let (arg_len, is_ref) = match &arg_ty {
             Type::Array { len, .. } => (*len, false),
             Type::Ref { inner, .. } => match inner.as_ref() {
                 Type::Array { len, .. } => (*len, true),
                 _ => {
                     // Not an array argument — use regular cast
-                    return self.emit_cast(arg_val, param_ty);
+                    return self.emit_cast(arg_val, &arg_ty, param_ty);
                 }
             },
             _ => {
                 // Not an array argument — use regular cast
-                return self.emit_cast(arg_val, param_ty);
+                return self.emit_cast(arg_val, &arg_ty, param_ty);
             }
         };
 
@@ -6830,8 +7437,21 @@ impl<'ctx> CodeGen<'ctx> {
     fn emit_cast(
         &self,
         val: BasicValueEnum<'ctx>,
+        from_type: &Type,
         to_type: &Type,
     ) -> Result<BasicValueEnum<'ctx>, String> {
+        if *from_type == Type::Never {
+            let dst_llvm = self.type_to_llvm(to_type);
+            return Ok(self.get_undef_value(&dst_llvm));
+        }
+
+        if !matches!(to_type, Type::Never | Type::ImplTrait(_)) {
+            let dst_llvm = self.type_to_llvm(to_type);
+            if val.get_type() == dst_llvm {
+                return Ok(val);
+            }
+        }
+
         // Handle bool destination: truncate int to i1, compare float != 0.0
         if *to_type == Type::Bool {
             match val {
@@ -6991,6 +7611,9 @@ impl<'ctx> CodeGen<'ctx> {
                 }
 
                 let dst_width = match to_type {
+                    Type::ImplTrait(_) => {
+                        return Err("cannot cast to impl Trait type".to_string());
+                    }
                     Type::I8 | Type::U8 => 8,
                     Type::I16 | Type::U16 => 16,
                     Type::I32 | Type::U32 => 32,
@@ -7095,7 +7718,16 @@ impl<'ctx> CodeGen<'ctx> {
                     }
                 }
             }
-            _ => Err(format!("unsupported value type for cast: val={:?}", val)),
+            _ => {
+                eprintln!(
+                    "DEBUG emit_cast: from_type={:?}, to_type={:?}, val={:?}\nBacktrace:\n{:?}",
+                    from_type,
+                    to_type,
+                    val,
+                    std::backtrace::Backtrace::force_capture()
+                );
+                Err(format!("unsupported value type for cast: val={:?}", val))
+            }
         }
     }
 }
@@ -7125,9 +7757,74 @@ mod tests {
         cg.jit_run(&program)
     }
 
+    fn compile_only(src: &str) -> Result<(), String> {
+        let mut lexer = Lexer::new(src);
+        let mut tokens = Vec::new();
+        loop {
+            let (token, span) = lexer.next_token().expect("lexer error");
+            tokens.push((token, span));
+            if matches!(tokens.last().unwrap().0, Token::Eof) {
+                break;
+            }
+        }
+        let mut parser = Parser::new(&tokens);
+        let program = parser.parse_program().map_err(|e| e.msg)?;
+
+        let context = Context::create();
+        let mut cg = CodeGen::new_jit(&context, OptimizationLevel::None)?;
+        cg.compile_module(&program)?;
+        Ok(())
+    }
+
     #[test]
     fn test_jit_empty_function() {
         assert_eq!(jit("fn main() {}").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_jit_never_type_coercion() {
+        let src = "
+            fn my_panic() -> ! {
+                loop {}
+            }
+            fn main() -> i32 {
+                let x: i32 = my_panic();
+                x
+            }
+        ";
+        assert!(compile_only(src).is_ok());
+    }
+
+    #[test]
+    fn test_jit_never_type_coercion_in_if() {
+        let src = "
+            fn my_panic() -> ! {
+                loop {}
+            }
+            fn main() -> i32 {
+                let x = if true {
+                    42
+                } else {
+                    my_panic()
+                };
+                x
+            }
+        ";
+        assert_eq!(jit(src).unwrap(), 42);
+    }
+
+    #[test]
+    fn test_jit_never_type_coercion_to_struct() {
+        let src = "
+            struct Point { x: i32, y: i32 }
+            fn my_panic() -> ! {
+                loop {}
+            }
+            fn main() {
+                let p: Point = my_panic();
+            }
+        ";
+        assert!(compile_only(src).is_ok());
     }
 
     #[test]

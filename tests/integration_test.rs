@@ -219,6 +219,30 @@ fn test_impl_for_trait() {
 }
 
 #[test]
+fn test_trait_default_method() {
+    assert!(run_test(
+        "trait_default",
+        "use std::panic::panic;\nstruct Point { x: i32, y: i32, }\ntrait Greeter { fn greet(&self) -> i32 { 42 } }\nimpl Greeter for Point { }\nfn main() {\n    let p = Point { x: 1, y: 2 };\n    let val = p.greet();\n    if val != 42 { panic(\"expected 42\"); }\n}\n"
+    ));
+}
+
+#[test]
+fn test_trait_default_method_override() {
+    assert!(run_test(
+        "trait_default_override",
+        "use std::panic::panic;\nstruct Point { x: i32, y: i32, }\ntrait Greeter { fn greet(&self) -> i32 { 42 } }\nimpl Greeter for Point { fn greet(&self) -> i32 { 99 } }\nfn main() {\n    let p = Point { x: 1, y: 2 };\n    let val = p.greet();\n    if val != 99 { panic(\"expected 99\"); }\n}\n"
+    ));
+}
+
+#[test]
+fn test_trait_default_method_mixed() {
+    assert!(run_test(
+        "trait_default_mixed",
+        "use std::panic::panic;\ntrait Animal { fn noise(&self) -> i32 { 42 } fn legs(&self) -> i32; }\nstruct Dog {}\nimpl Animal for Dog { fn legs(&self) -> i32 { 4 } }\nfn main() {\n    let d = Dog {};\n    let n = d.noise();\n    let l = d.legs();\n    if n != 42 { panic(\"expected 42\"); }\n    if l != 4 { panic(\"expected 4\"); }\n}\n"
+    ));
+}
+
+#[test]
 fn test_if_expression() {
     assert!(run_test("if_expr", "fn main() { if true { }; }\n"));
 }
@@ -1269,10 +1293,12 @@ fn test_generic_bounds_functions_and_structs() {
         }
 
         fn main() -> i32 {
-            let v = Vehicle { speed: 10 };
-            let r1 = operate_vehicle(v);
-            let r2 = operate_vehicle_impl(v);
-            let w: Wrapper<Vehicle> = Wrapper { val: v };
+            let v1 = Vehicle { speed: 10 };
+            let r1 = operate_vehicle(v1);
+            let v2 = Vehicle { speed: 10 };
+            let r2 = operate_vehicle_impl(v2);
+            let v3 = Vehicle { speed: 10 };
+            let w: Wrapper<Vehicle> = Wrapper { val: v3 };
             let r3 = w.val.drive() + w.val.fly();
             if r1 == 30 && r2 == 30 && r3 == 30 {
                 return 0;
@@ -1324,6 +1350,211 @@ fn test_impl_into_iterator_args() {
                 return 0;
             };
             return 1;
+        }
+        "#
+    ));
+}
+
+#[test]
+fn test_move_non_copy_struct() {
+    assert!(run_test_expect_error(
+        "move_non_copy",
+        r#"
+        struct NonCopy {
+            x: i32,
+        }
+
+        fn main() -> i32 {
+            let a = NonCopy { x: 42 };
+            let b = a;
+            let c = a;
+            return 0;
+        }
+        "#
+    ));
+}
+
+#[test]
+fn test_copy_primitive() {
+    assert!(run_test(
+        "copy_prim",
+        r#"
+        fn main() -> i32 {
+            let a = 42;
+            let b = a;
+            let c = a;
+            return a + b + c;
+        }
+        "#
+    ));
+}
+
+#[test]
+fn test_bool_copy() {
+    assert!(run_test(
+        "bool_copy",
+        r#"
+        fn main() -> i32 {
+            let a = true;
+            let b = a;
+            let c = a;
+            if b && c { return 0; };
+            return 1;
+        }
+        "#
+    ));
+}
+
+#[test]
+fn test_move_into_fn_by_value() {
+    assert!(run_test_expect_error(
+        "move_into_fn",
+        r#"
+        struct NonCopy { x: i32 }
+
+        fn consume(_val: NonCopy) -> i32 {
+            return 0;
+        }
+
+        fn main() -> i32 {
+            let a = NonCopy { x: 42 };
+            let r1 = consume(a);
+            let r2 = consume(a);
+            return 0;
+        }
+        "#
+    ));
+}
+
+#[test]
+fn test_copy_to_fn_by_value() {
+    assert!(run_test(
+        "copy_to_fn",
+        r#"
+        fn double(x: i32) -> i32 {
+            return x * 2;
+        }
+
+        fn main() -> i32 {
+            let a = 21;
+            let r1 = double(a);
+            let r2 = double(a);
+            return r1 + r2;
+        }
+        "#
+    ));
+}
+
+#[test]
+fn test_derive_copy_struct() {
+    assert!(run_test(
+        "derive_copy",
+        r#"
+        #[derive(Clone, Copy)]
+        struct Point {
+            x: i32,
+            y: i32,
+        }
+
+        fn main() -> i32 {
+            let p = Point { x: 10, y: 20 };
+            let q = p;
+            let r = p;
+            return p.x + q.y + r.x;
+        }
+        "#
+    ));
+}
+
+#[test]
+fn test_std_mem_drop() {
+    assert!(run_test(
+        "std_mem_drop",
+        r#"
+        use std::mem::drop;
+
+        struct NonCopy { x: i32 }
+
+        fn main() -> i32 {
+            let a = NonCopy { x: 42 };
+            drop(a);
+            return 0;
+        }
+        "#
+    ));
+}
+
+#[test]
+fn test_use_after_move_expr() {
+    assert!(run_test_expect_error(
+        "use_after_move_expr",
+        r#"
+        struct NonCopy { x: i32 }
+
+        fn main() -> i32 {
+            let a = NonCopy { x: 42 };
+            let b = a;
+            let c = a.x;
+            return 0;
+        }
+        "#
+    ));
+}
+
+#[test]
+fn test_no_direct_drop_call() {
+    assert!(run_test_expect_error(
+        "no_direct_drop",
+        r#"
+        use std::mem::drop;
+
+        struct MyType { x: i32 }
+
+        impl Drop for MyType {
+            fn drop(&mut self) {
+                // nothing
+            }
+        }
+
+        fn main() -> i32 {
+            let a = MyType { x: 42 };
+            a.drop();
+            return 0;
+        }
+        "#
+    ));
+}
+
+#[test]
+fn test_derive_copy_without_clone_error() {
+    assert!(run_test_expect_error(
+        "derive_copy_no_clone",
+        r#"
+        #[derive(Copy)]
+        struct Bad { x: i32 }
+
+        fn main() -> i32 {
+            return 0;
+        }
+        "#
+    ));
+}
+
+#[test]
+fn test_continue_break_loop() {
+    assert!(run_test(
+        "continue_break_loop",
+        r#"
+        fn main() -> i32 {
+            let mut i = 0;
+            let mut sum = 0;
+            loop {
+                i = i + 1;
+                if i == 10 { break; };
+                if i == 5 { continue; };
+                sum = sum + i;
+            };
+            sum
         }
         "#
     ));

@@ -213,6 +213,8 @@ impl<'a> Lexer<'a> {
                     "while" => Token::While,
                     "match" => Token::Match,
                     "return" => Token::Return,
+                    "continue" => Token::Continue,
+                    "break" => Token::Break,
                     "enum" => Token::Enum,
                     "pub" => Token::Pub,
                     "struct" => Token::Struct,

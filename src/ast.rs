@@ -93,6 +93,14 @@ pub enum Stmt {
         #[allow(dead_code)]
         span: Span,
     },
+    Continue {
+        #[allow(dead_code)]
+        span: Span,
+    },
+    Break {
+        #[allow(dead_code)]
+        span: Span,
+    },
 }
 
 #[allow(clippy::enum_variant_names)]
@@ -285,6 +293,7 @@ pub struct TraitMethodDef {
     pub name: String,
     pub params: Vec<Param>,
     pub return_type: Option<Type>,
+    pub body: Option<Block>,
 }
 
 #[allow(dead_code)]

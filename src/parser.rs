@@ -1040,11 +1040,17 @@ impl<'a> Parser<'a> {
             } else {
                 None
             };
-            self.expect(&Token::Semicolon)?;
+            let body = if *self.peek_token() == Token::LBrace {
+                Some(self.parse_block()?)
+            } else {
+                self.expect(&Token::Semicolon)?;
+                None
+            };
             methods.push(TraitMethodDef {
                 name: method_name,
                 params,
                 return_type,
+                body,
             });
         }
         self.expect(&Token::RBrace)?;
@@ -1218,7 +1224,10 @@ impl<'a> Parser<'a> {
                 break;
             }
             // let / const statements are always statements terminated by ;
-            if matches!(self.peek_token(), Token::Let | Token::Const | Token::Return) {
+            if matches!(
+                self.peek_token(),
+                Token::Let | Token::Const | Token::Return | Token::Continue | Token::Break
+            ) {
                 stmts.push(self.parse_stmt()?);
                 continue;
             }
@@ -1226,6 +1235,10 @@ impl<'a> Parser<'a> {
             let expr = self.parse_expr()?;
             if *self.peek_token() == Token::Semicolon {
                 self.advance();
+                stmts.push(Stmt::Expr(expr));
+            } else if Self::expr_is_block_like(&expr) && *self.peek_token() != Token::RBrace {
+                // Block-like expression (if, while, loop, for, match, {}) without semicolon
+                // but more statements follow → treat as expression statement, not tail expression
                 stmts.push(Stmt::Expr(expr));
             } else {
                 // No semicolon — tail expression
@@ -1243,6 +1256,21 @@ impl<'a> Parser<'a> {
             tail_expr,
             span: Span::new(lo, hi),
         })
+    }
+
+    /// Returns true if the expression is a block-like construct (ends with }),
+    /// so it can be used as an expression statement without a trailing semicolon.
+    fn expr_is_block_like(expr: &Expr) -> bool {
+        matches!(
+            expr,
+            Expr::If { .. }
+                | Expr::While { .. }
+                | Expr::Loop { .. }
+                | Expr::For { .. }
+                | Expr::IfLet { .. }
+                | Expr::Match { .. }
+                | Expr::Block(..)
+        )
     }
 
     fn parse_stmt(&mut self) -> Result<Stmt, ParseError> {
@@ -1332,6 +1360,24 @@ impl<'a> Parser<'a> {
                     name,
                     type_ann,
                     init,
+                    span: Span::new(lo, hi),
+                })
+            }
+            Token::Continue => {
+                let lo = self.current_span_lo();
+                self.advance();
+                self.expect(&Token::Semicolon)?;
+                let hi = self.last_span_end();
+                Ok(Stmt::Continue {
+                    span: Span::new(lo, hi),
+                })
+            }
+            Token::Break => {
+                let lo = self.current_span_lo();
+                self.advance();
+                self.expect(&Token::Semicolon)?;
+                let hi = self.last_span_end();
+                Ok(Stmt::Break {
                     span: Span::new(lo, hi),
                 })
             }
@@ -4220,6 +4266,69 @@ mod tests {
     }
 
     #[test]
+    fn test_continue_stmt() {
+        let prog = parse("fn main() { loop { continue; } }").unwrap();
+        match &prog.funcs[0].body.tail_expr.as_ref().unwrap().as_ref() {
+            Expr::Loop { body } => match &body.stmts[0] {
+                Stmt::Continue { .. } => {}
+                _ => panic!("expected Continue stmt"),
+            },
+            _ => panic!("expected Loop expr"),
+        }
+    }
+
+    #[test]
+    fn test_break_stmt() {
+        let prog = parse("fn main() { loop { break; } }").unwrap();
+        match &prog.funcs[0].body.tail_expr.as_ref().unwrap().as_ref() {
+            Expr::Loop { body } => match &body.stmts[0] {
+                Stmt::Break { .. } => {}
+                _ => panic!("expected Break stmt"),
+            },
+            _ => panic!("expected Loop expr"),
+        }
+    }
+
+    #[test]
+    fn test_continue_in_while() {
+        let prog = parse("fn main() { while true { continue; } }").unwrap();
+        match &prog.funcs[0].body.tail_expr.as_ref().unwrap().as_ref() {
+            Expr::While { body, .. } => match &body.stmts[0] {
+                Stmt::Continue { .. } => {}
+                _ => panic!("expected Continue stmt"),
+            },
+            _ => panic!("expected While expr"),
+        }
+    }
+
+    #[test]
+    fn test_break_in_while() {
+        let prog = parse("fn main() { while true { break; } }").unwrap();
+        match &prog.funcs[0].body.tail_expr.as_ref().unwrap().as_ref() {
+            Expr::While { body, .. } => match &body.stmts[0] {
+                Stmt::Break { .. } => {}
+                _ => panic!("expected Break stmt"),
+            },
+            _ => panic!("expected While expr"),
+        }
+    }
+
+    #[test]
+    fn test_nested_loop_break() {
+        let prog = parse("fn main() { loop { loop { break; } } }").unwrap();
+        match &prog.funcs[0].body.tail_expr.as_ref().unwrap().as_ref() {
+            Expr::Loop { body } => match &body.tail_expr.as_ref().unwrap().as_ref() {
+                Expr::Loop { body: inner_body } => match &inner_body.stmts[0] {
+                    Stmt::Break { .. } => {}
+                    _ => panic!("expected Break stmt"),
+                },
+                _ => panic!("expected inner Loop expr"),
+            },
+            _ => panic!("expected outer Loop expr"),
+        }
+    }
+
+    #[test]
     fn test_implicit_return_tail_expr() {
         let prog = parse("fn main() -> i32 { 42 }").unwrap();
         assert!(prog.funcs[0].body.tail_expr.is_some());
@@ -4599,5 +4708,35 @@ mod tests {
         );
         assert_eq!(t.methods.len(), 1);
         assert_eq!(t.methods[0].name, "index");
+    }
+
+    #[test]
+    fn test_trait_with_default_method() {
+        let prog = parse(
+            "trait Greeter { fn greet(&self) -> i32 { 42 } fn name(&self) -> &str; } fn main() {}",
+        )
+        .unwrap();
+        assert_eq!(prog.traits.len(), 1);
+        let t = &prog.traits[0];
+        assert_eq!(t.name, "Greeter");
+        assert_eq!(t.methods.len(), 2);
+
+        // greet has a default body
+        assert_eq!(t.methods[0].name, "greet");
+        assert!(t.methods[0].body.is_some());
+        assert_eq!(t.methods[0].params.len(), 1);
+        assert_eq!(t.methods[0].params[0].name, "self");
+        assert_eq!(t.methods[0].return_type, Some(Type::I32));
+
+        // name has no default body
+        assert_eq!(t.methods[1].name, "name");
+        assert!(t.methods[1].body.is_none());
+        assert_eq!(
+            t.methods[1].return_type,
+            Some(Type::Ref {
+                inner: Box::new(Type::Str),
+                is_mut: false
+            })
+        );
     }
 }

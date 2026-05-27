@@ -17,7 +17,7 @@ use inkwell::attributes::Attribute;
 
 use crate::ast::{
     BinOp, Block, EnumDecl, Expr, Function, GenericParam, ImplDecl, MatchArm, Pattern, Program,
-    Stmt, StructDecl, StructField, Type,
+    Stmt, StructDecl, StructField, TraitDecl, TraitMethodDef, Type,
 };
 
 use crate::token::Span;
@@ -75,6 +75,23 @@ pub struct CodeGen<'ctx> {
     pub current_module_path: Vec<String>,
     generic_methods: HashMap<String, Vec<Function>>,
     generic_funcs: HashMap<String, Function>,
+    // Variable moved out tracking (save/restore at scope boundaries)
+    moved_vars: HashSet<String>,
+    // Declaration-order tracking per scope for correct drop order
+    scope_stack: Vec<Vec<(String, Type, PointerValue<'ctx>)>>,
+    // Types known to be Copy
+    copy_types: HashSet<String>,
+    // Types that need drop glue (direct impl Drop or transitively through fields)
+    drop_types: HashSet<String>,
+    /// Tracks active loops for `continue`/`break` compilation.
+    loop_stack: Vec<LoopContext<'ctx>>,
+}
+
+/// Context for a single loop level
+/// `continue` and `break`.
+struct LoopContext<'ctx> {
+    continue_bb: inkwell::basic_block::BasicBlock<'ctx>,
+    break_bb: inkwell::basic_block::BasicBlock<'ctx>,
 }
 
 impl<'ctx> CodeGen<'ctx> {
@@ -120,6 +137,11 @@ impl<'ctx> CodeGen<'ctx> {
             current_module_path: Vec::new(),
             generic_methods: HashMap::new(),
             generic_funcs: HashMap::new(),
+            moved_vars: HashSet::new(),
+            scope_stack: Vec::new(),
+            copy_types: HashSet::new(),
+            drop_types: HashSet::new(),
+            loop_stack: Vec::new(),
             opt_level: opt,
         })
     }
@@ -163,6 +185,11 @@ impl<'ctx> CodeGen<'ctx> {
             current_module_path: Vec::new(),
             generic_methods: HashMap::new(),
             generic_funcs: HashMap::new(),
+            moved_vars: HashSet::new(),
+            scope_stack: Vec::new(),
+            copy_types: HashSet::new(),
+            drop_types: HashSet::new(),
+            loop_stack: Vec::new(),
             opt_level: opt,
         }
     }
@@ -842,6 +869,8 @@ impl<'ctx> CodeGen<'ctx> {
                 traits.insert("Div".to_string());
             }
             self.trait_impls.insert(ty_name.to_string(), traits);
+            // Primitives are Copy
+            self.copy_types.insert(ty_name.to_string());
         }
         Ok(())
     }
@@ -923,6 +952,177 @@ impl<'ctx> CodeGen<'ctx> {
         }
     }
 
+    /// Check if a type is Copy (primitives, unit, never, refs, raw pointers,
+    /// tuples of Copy types, or explicitly marked as Copy via derive).
+    fn is_copy_type(&self, ty: &Type) -> bool {
+        match ty {
+            Type::Bool
+            | Type::I8
+            | Type::I16
+            | Type::I32
+            | Type::I64
+            | Type::U8
+            | Type::U16
+            | Type::U32
+            | Type::U64
+            | Type::Usize
+            | Type::Isize
+            | Type::F32
+            | Type::F64
+            | Type::Unit
+            | Type::Never => true,
+            Type::Ref { .. } | Type::Ptr { .. } => true,
+            Type::Tuple(elems) => elems.iter().all(|e| self.is_copy_type(e)),
+            Type::Struct(name) => self.copy_types.contains(name),
+            Type::GenericInstance(name, args) => {
+                let mangled = Self::mangle_generic_instance(name, args);
+                self.copy_types.contains(&mangled)
+            }
+            Type::Array { inner, .. } => self.is_copy_type(inner),
+            // Str, Slice, etc. are not Copy
+            _ => false,
+        }
+    }
+
+    /// Check if a type needs drop glue (has a direct `impl Drop` or has
+    /// fields whose types need drop glue). Uses a visited set for cycle
+    /// detection (returns false if cycle is detected).
+    fn has_drop_glue(&self, ty: &Type) -> bool {
+        let mut visited = HashSet::new();
+        self.has_drop_glue_inner(ty, &mut visited)
+    }
+
+    fn has_drop_glue_inner(&self, ty: &Type, visited: &mut HashSet<String>) -> bool {
+        match ty {
+            Type::Struct(name) => {
+                // Check if directly in drop_types
+                if self.drop_types.contains(name) {
+                    return true;
+                }
+                // Check if struct fields have drop glue (transitive)
+                if visited.contains(name) {
+                    return false; // cycle detected
+                }
+                visited.insert(name.clone());
+                if let Some(fields) = self.struct_fields.get(name) {
+                    for field in fields {
+                        if self.has_drop_glue_inner(&field.ty, visited) {
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
+            Type::GenericInstance(name, args) => {
+                let mangled = Self::mangle_generic_instance(name, args);
+                if self.drop_types.contains(&mangled) {
+                    return true;
+                }
+                if visited.contains(&mangled) {
+                    return false;
+                }
+                visited.insert(mangled.clone());
+                if let Some(fields) = self.struct_fields.get(&mangled) {
+                    for field in fields {
+                        if self.has_drop_glue_inner(&field.ty, visited) {
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
+            Type::Tuple(elems) => elems.iter().any(|e| self.has_drop_glue_inner(e, visited)),
+            Type::Array { inner, .. } => self.has_drop_glue_inner(inner, visited),
+            // References and pointers never own data -> no drop glue
+            Type::Ref { .. } | Type::Ptr { .. } => false,
+            _ => false,
+        }
+    }
+
+    /// Generate drop code for a single variable. If the type directly implements
+    /// Drop, calls the `__trait_Drop_drop_<Type>` function. Then recurses into
+    /// fields in declaration order to drop them.
+    fn drop_variable(
+        &mut self,
+        name: &str,
+        ty: &Type,
+        ptr: PointerValue<'ctx>,
+    ) -> Result<(), String> {
+        // 1. Direct Drop impl: call __trait_Drop_drop_<Type>(ptr)
+        if self.check_type_implements_trait(ty, "Drop") {
+            let type_name = Self::type_to_mangled_name(ty);
+            let fn_name = format!("__trait_Drop_drop_{}", type_name);
+            if let Some(fn_val) = self.module.get_function(&fn_name) {
+                self.builder
+                    .build_call(fn_val, &[ptr.into()], &format!("drop_{}", name))
+                    .map_err(|e| format!("failed to call drop for '{}': {}", name, e))?;
+            }
+        }
+
+        // 2. Field drops (for structs with non-Drop-direct fields that still need dropping)
+        let struct_name = match ty {
+            Type::Struct(name) => Some(name.clone()),
+            Type::GenericInstance(name, args) => Some(Self::mangle_generic_instance(name, args)),
+            _ => None,
+        };
+
+        if let Some(ref sname) = struct_name {
+            // Collect field data before the loop to avoid borrow conflicts with recursive drop_variable
+            let struct_ty = self.struct_types.get(sname).copied();
+            let fields: Vec<(u32, Type, String)> = self
+                .struct_fields
+                .get(sname)
+                .map(|fields| {
+                    fields
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, f)| self.has_drop_glue(&f.ty))
+                        .map(|(i, f)| (i as u32, f.ty.clone(), f.name.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if let Some(struct_type) = struct_ty {
+                for (i, field_ty, field_name) in &fields {
+                    let field_ptr = self
+                        .builder
+                        .build_struct_gep(struct_type, ptr, *i, &format!("{}.{}", name, field_name))
+                        .map_err(|e| {
+                            format!("failed to GEP for field '{}' drop: {}", field_name, e)
+                        })?;
+                    self.drop_variable(&format!("{}.{}", name, field_name), field_ty, field_ptr)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Enter a new scope (push onto scope_stack).
+    fn enter_scope(&mut self) {
+        self.scope_stack.push(Vec::new());
+    }
+
+    /// Exit the current scope: drop non-moved variables in reverse declaration
+    /// order, then pop the scope.
+    fn exit_scope(&mut self) -> Result<(), String> {
+        // Clone scope data to avoid borrow conflicts with drop_variable
+        let scope_data: Vec<(String, Type, inkwell::values::PointerValue)> =
+            self.scope_stack.last().cloned().unwrap_or_default();
+        if !scope_data.is_empty() {
+            // Iterate in reverse declaration order
+            for (name, ty, ptr) in scope_data.iter().rev() {
+                if self.moved_vars.contains(name.as_str()) {
+                    continue;
+                }
+                if self.has_drop_glue(ty) {
+                    self.drop_variable(name, ty, *ptr)?;
+                }
+            }
+        }
+        self.scope_stack.pop();
+        Ok(())
+    }
+
     /// Process all #[derive(...)] attributes on a struct.
     fn process_struct_derives(
         &mut self,
@@ -942,7 +1142,44 @@ impl<'ctx> CodeGen<'ctx> {
 
     /// Process a single derived trait for a struct.
     fn process_derive_trait(&mut self, decl: &StructDecl, trait_name: &str) -> Result<(), String> {
-        // Validate all fields implement the trait
+        // Special handling for Copy and Drop
+        match trait_name {
+            "Drop" => {
+                return Err(format!(
+                    "cannot derive Drop for struct '{}', use impl Drop",
+                    decl.name
+                ));
+            }
+            "Copy" => {
+                // Validate all fields are Copy
+                for field in &decl.fields {
+                    if !self.is_copy_type(&field.ty) {
+                        return Err(format!(
+                            "cannot derive Copy for struct '{}': field '{}' of type {:?} is not Copy",
+                            decl.name, field.name, field.ty
+                        ));
+                    }
+                }
+                // Validate Clone is implemented or derived
+                if !self.check_type_implements_trait(&Type::Struct(decl.name.clone()), "Clone") {
+                    return Err(format!(
+                        "cannot derive Copy for struct '{}': Copy requires Clone to be implemented or derived",
+                        decl.name
+                    ));
+                }
+                // Mark as Copy (no code generation needed)
+                self.copy_types.insert(decl.name.clone());
+                // Register in trait_impls
+                self.trait_impls
+                    .entry(decl.name.clone())
+                    .or_default()
+                    .insert(trait_name.to_string());
+                return Ok(());
+            }
+            _ => {}
+        }
+
+        // For non-Copy/Drop traits, validate all fields implement the trait
         for field in &decl.fields {
             if !self.check_type_implements_trait(&field.ty, trait_name) {
                 return Err(format!(
@@ -1758,6 +1995,7 @@ impl<'ctx> CodeGen<'ctx> {
                         **inner = *expr_box;
                     }
                 }
+                Stmt::Continue { .. } | Stmt::Break { .. } => {}
             }
         }
         if let Some(tail) = &mut block.tail_expr {
@@ -1898,6 +2136,7 @@ impl<'ctx> CodeGen<'ctx> {
                         Self::m_substitute_const_in_expr(inner, const_params, values);
                     }
                 }
+                Stmt::Continue { .. } | Stmt::Break { .. } => {}
             }
         }
         if let Some(tail) = &mut block.tail_expr {
@@ -2421,6 +2660,7 @@ impl<'ctx> CodeGen<'ctx> {
                         Self::collect_enum_lits_from_expr(expr, instances, seen, one_param_enums);
                     }
                 }
+                Stmt::Continue { .. } | Stmt::Break { .. } => {}
             }
         }
         if let Some(ref tail) = block.tail_expr {
@@ -2723,6 +2963,19 @@ impl<'ctx> CodeGen<'ctx> {
         self.module.print_to_string().to_string()
     }
 
+    /// Collect trait methods that have default bodies but are not overridden in the impl.
+    fn generate_default_trait_methods<'a>(
+        trait_def: &'a TraitDecl,
+        impl_decl: &'a ImplDecl,
+    ) -> Vec<&'a TraitMethodDef> {
+        trait_def
+            .methods
+            .iter()
+            .filter(|m| m.body.is_some())
+            .filter(|m| !impl_decl.methods.iter().any(|im| im.name == m.name))
+            .collect()
+    }
+
     pub fn compile_module(&mut self, program: &Program) -> Result<(), String> {
         // Populate visibility map
         for func in &program.funcs {
@@ -2753,6 +3006,17 @@ impl<'ctx> CodeGen<'ctx> {
                 _ => continue,
             };
             if let Some(ref tname) = decl.trait_name {
+                // Reject impl Copy (Copy must be derived)
+                if tname == "Copy" {
+                    return Err(format!(
+                        "cannot implement Copy for type '{}', use #[derive(Clone, Copy)] instead",
+                        type_name
+                    ));
+                }
+                // Track direct impl Drop
+                if tname == "Drop" {
+                    self.drop_types.insert(type_name.clone());
+                }
                 self.trait_impls
                     .entry(type_name.clone())
                     .or_default()
@@ -2857,6 +3121,41 @@ impl<'ctx> CodeGen<'ctx> {
                     .or_default()
                     .push((method.name.clone(), mangled_name));
             }
+            // Synthesize default trait methods not overridden by this impl
+            if let Some(ref tname) = decl.trait_name
+                && let Some(trait_def) = program.traits.iter().find(|t| t.name == *tname)
+            {
+                for trait_method in Self::generate_default_trait_methods(trait_def, decl) {
+                    let mangled_name =
+                        format!("__trait_{}_{}_{}", tname, trait_method.name, type_name);
+                    let mut method_func = Function {
+                        name: mangled_name.clone(),
+                        params: trait_method.params.clone(),
+                        return_type: trait_method.return_type.clone(),
+                        type_params: vec![],
+                        body: trait_method.body.clone().unwrap(),
+                        is_extern: false,
+                        is_method: !trait_method.params.is_empty()
+                            && trait_method.params[0].name == "self",
+                        is_pub: false,
+                        attribs: vec![],
+                    };
+                    if Self::has_impl_trait_param(&method_func) {
+                        self.generic_methods
+                            .entry(type_name.clone())
+                            .or_default()
+                            .push(method_func);
+                        continue;
+                    }
+                    let self_type = Type::Struct(type_name.clone());
+                    Self::resolve_self_type(&mut method_func, &self_type);
+                    self.declare_function(&method_func)?;
+                    self.impl_methods
+                        .entry(type_name.clone())
+                        .or_default()
+                        .push((trait_method.name.clone(), mangled_name));
+                }
+            }
         }
         // Phase 1: Declare all functions
         for func in &program.funcs {
@@ -2924,6 +3223,34 @@ impl<'ctx> CodeGen<'ctx> {
                 self.process_struct_derives(&sd, program)?;
             }
         }
+        // Phase 0.8: Compute transitive drop closure
+        // Iterate struct fields and propagate drop_types to structs containing Drop fields
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for (name, fields) in self.struct_fields.iter() {
+                if self.drop_types.contains(name) {
+                    continue; // already directly implements Drop
+                }
+                for field in fields {
+                    let field_ty = &field.ty;
+                    // Check if field type has drop glue (directly in drop_types or via its own fields)
+                    if self.has_drop_glue(field_ty) {
+                        self.drop_types.insert(name.clone());
+                        changed = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Phase 0.9: Check Copy + Drop mutual exclusion
+        for ty_name in self.copy_types.clone() {
+            if self.drop_types.contains(&ty_name) {
+                return Err(format!("type '{}' cannot be both Copy and Drop", ty_name));
+            }
+        }
+
         // Phase 2: Compile bodies for non-extern functions
         for func in &program.funcs {
             if Self::has_impl_trait_param(func) {
@@ -2957,6 +3284,33 @@ impl<'ctx> CodeGen<'ctx> {
                 method_func.name = mangled_name;
                 Self::resolve_self_type(&mut method_func, &self_type);
                 self.compile_function_body(&method_func)?;
+            }
+            // Compile default trait methods not overridden by this impl
+            if let Some(ref tname) = decl.trait_name
+                && let Some(trait_def) = program.traits.iter().find(|t| t.name == *tname)
+            {
+                for trait_method in Self::generate_default_trait_methods(trait_def, decl) {
+                    let mangled_name =
+                        format!("__trait_{}_{}_{}", tname, trait_method.name, type_name);
+                    let mut method_func = Function {
+                        name: mangled_name,
+                        params: trait_method.params.clone(),
+                        return_type: trait_method.return_type.clone(),
+                        type_params: vec![],
+                        body: trait_method.body.clone().unwrap(),
+                        is_extern: false,
+                        is_method: !trait_method.params.is_empty()
+                            && trait_method.params[0].name == "self",
+                        is_pub: false,
+                        attribs: vec![],
+                    };
+                    if Self::has_impl_trait_param(&method_func) {
+                        continue;
+                    }
+                    let self_type = Type::Struct(type_name.clone());
+                    Self::resolve_self_type(&mut method_func, &self_type);
+                    self.compile_function_body(&method_func)?;
+                }
             }
         }
         Ok(())
@@ -3173,13 +3527,14 @@ impl<'ctx> CodeGen<'ctx> {
             }
         }
         if let Some(block) = else_block
-            && let Some(ref e) = block.tail_expr {
-                let ty = self.expr_type(e);
-                if ty != Type::Never {
-                    return ty;
-                }
-                candidate = Some(ty);
+            && let Some(ref e) = block.tail_expr
+        {
+            let ty = self.expr_type(e);
+            if ty != Type::Never {
+                return ty;
             }
+            candidate = Some(ty);
+        }
         candidate.unwrap_or(Type::I32)
     }
 
@@ -3193,13 +3548,14 @@ impl<'ctx> CodeGen<'ctx> {
             candidate = Some(ty);
         }
         if let Some(block) = else_block
-            && let Some(ref e) = block.tail_expr {
-                let ty = self.expr_type(e);
-                if ty != Type::Never {
-                    return ty;
-                }
-                candidate = Some(ty);
+            && let Some(ref e) = block.tail_expr
+        {
+            let ty = self.expr_type(e);
+            if ty != Type::Never {
+                return ty;
             }
+            candidate = Some(ty);
+        }
         candidate.unwrap_or(Type::Unit)
     }
 
@@ -3882,14 +4238,23 @@ impl<'ctx> CodeGen<'ctx> {
     fn compile_function_body(&mut self, func: &Function) -> Result<(), String> {
         let saved_bb = self.builder.get_insert_block();
         let saved_symbols = self.symbols.clone();
+        let saved_moved_vars = self.moved_vars.clone();
+        let saved_scope_stack = self.scope_stack.clone();
         let saved_module_path = self.current_module_path.clone();
 
+        self.enter_scope();
         let result = self.compile_function_body_inner(func);
+
+        if result.is_ok() {
+            let _ = self.exit_scope();
+        }
 
         if let Some(bb) = saved_bb {
             self.builder.position_at_end(bb);
         }
         self.symbols = saved_symbols;
+        self.moved_vars = saved_moved_vars;
+        self.scope_stack = saved_scope_stack;
         self.current_module_path = saved_module_path;
 
         result
@@ -3928,6 +4293,10 @@ impl<'ctx> CodeGen<'ctx> {
                 .map_err(|e| format!("failed to store param '{}': {}", param.name, e))?;
             self.symbols
                 .insert(param.name.clone(), (alloca, false, param.ty.clone()));
+            // Track in scope_stack for drop order
+            if let Some(scope) = self.scope_stack.last_mut() {
+                scope.push((param.name.clone(), param.ty.clone(), alloca));
+            }
         }
 
         for stmt in &func.body.stmts {
@@ -3995,6 +4364,17 @@ impl<'ctx> CodeGen<'ctx> {
                 // Only create a binding for irrefutable patterns that bind a name
                 match pattern {
                     Pattern::Binding(name) => {
+                        // Shadowing: if the variable already exists, drop the previous binding
+                        if let Some((old_ptr, _, old_ty)) = self.symbols.get(name).cloned() {
+                            if self.has_drop_glue(&old_ty) {
+                                self.drop_variable(name, &old_ty, old_ptr)?;
+                            }
+                            // Remove from scope_stack if present
+                            if let Some(scope) = self.scope_stack.last_mut() {
+                                scope.retain(|(n, _, _)| n != name);
+                            }
+                        }
+
                         let ty = type_ann.clone().unwrap_or_else(|| self.expr_type(init));
                         let llvm_ty = self.type_to_llvm(&ty);
                         let alloca = self
@@ -4020,6 +4400,20 @@ impl<'ctx> CodeGen<'ctx> {
                             .build_store(alloca, value)
                             .map_err(|e| format!("failed to build store: {}", e))?;
                         self.symbols.insert(name.clone(), (alloca, *is_mut, ty));
+
+                        // Track in scope_stack for drop order
+                        let ty_for_scope = type_ann.clone().unwrap_or_else(|| self.expr_type(init));
+                        if let Some(scope) = self.scope_stack.last_mut() {
+                            scope.push((name.clone(), ty_for_scope, alloca));
+                        }
+
+                        // Move detection: if init is a simple ident and source is not Copy
+                        if let Expr::Ident(src_name) = init {
+                            let src_ty = self.expr_type(init);
+                            if !self.is_copy_type(&src_ty) {
+                                self.moved_vars.insert(src_name.clone());
+                            }
+                        }
                     }
                     Pattern::Wildcard => {
                         // Evaluate the init expression for side effects, discard result
@@ -4075,10 +4469,32 @@ impl<'ctx> CodeGen<'ctx> {
                     .map_err(|e| format!("failed to build unreachable after return: {}", e))?;
                 Ok(())
             }
+            Stmt::Continue { .. } => {
+                let ctx = self
+                    .loop_stack
+                    .last()
+                    .ok_or_else(|| "cannot use `continue` outside of a loop".to_string())?;
+                let continue_bb = ctx.continue_bb;
+                self.builder
+                    .build_unconditional_branch(continue_bb)
+                    .map_err(|e| format!("failed to build continue branch: {}", e))?;
+                Ok(())
+            }
+            Stmt::Break { .. } => {
+                let ctx = self
+                    .loop_stack
+                    .last()
+                    .ok_or_else(|| "cannot use `break` outside of a loop".to_string())?;
+                let break_bb = ctx.break_bb;
+                self.builder
+                    .build_unconditional_branch(break_bb)
+                    .map_err(|e| format!("failed to build break branch: {}", e))?;
+                Ok(())
+            }
         }
     }
 
-    /// Compile a block's statements and return the value of its tail expression (if any).
+    /// Compile a block's statements
     fn compile_block_get_value(
         &mut self,
         block: &Block,
@@ -4350,6 +4766,7 @@ impl<'ctx> CodeGen<'ctx> {
             // Compile the elif body
             self.builder.position_at_end(then_bb);
             let saved_symbols = self.symbols.clone();
+            let saved_moved_vars = self.moved_vars.clone();
             if let Some(mut val) = self.compile_block_get_value(elif_body)? {
                 let elif_ty = elif_body
                     .tail_expr
@@ -4364,6 +4781,7 @@ impl<'ctx> CodeGen<'ctx> {
                     .map_err(|e| format!("failed to store elif result: {}", e))?;
             }
             self.symbols = saved_symbols;
+            self.moved_vars = saved_moved_vars;
             let then_terminated = self
                 .builder
                 .get_insert_block()
@@ -4388,6 +4806,7 @@ impl<'ctx> CodeGen<'ctx> {
             )?;
         } else if let Some(el_block) = else_block {
             let saved_symbols = self.symbols.clone();
+            let saved_moved_vars = self.moved_vars.clone();
             if let Some(mut val) = self.compile_block_get_value(el_block)? {
                 let else_ty = el_block
                     .tail_expr
@@ -4402,6 +4821,7 @@ impl<'ctx> CodeGen<'ctx> {
                     .map_err(|e| format!("failed to store else result: {}", e))?;
             }
             self.symbols = saved_symbols;
+            self.moved_vars = saved_moved_vars;
         }
         Ok(())
     }
@@ -4760,6 +5180,10 @@ impl<'ctx> CodeGen<'ctx> {
                 Ok(str_struct.into_struct_value().into())
             }
             Expr::Ident(name) => {
+                // Use-after-move check
+                if self.moved_vars.contains(name) {
+                    return Err(format!("cannot use moved variable '{}'", name));
+                }
                 if let Some(val) = self.consts.get(name) {
                     return Ok(self.i32_type.const_int(*val as u64, true).into());
                 }
@@ -5174,6 +5598,20 @@ impl<'ctx> CodeGen<'ctx> {
                     .builder
                     .build_call(fn_val, &arg_values, "call")
                     .map_err(|e| format!("failed to build call to '{}': {}", callee, e))?;
+                // Move detection: mark by-value args as moved if not Copy
+                let param_tys = self.fn_param_types.get(&param_tys_key);
+                for (i, arg) in args.iter().enumerate() {
+                    if let Expr::Ident(arg_name) = arg
+                        && let Some(param_tys) = param_tys
+                        && let Some(param_ty) = param_tys.get(i)
+                    {
+                        // By-value (not &T / &mut T) and not Copy -> moved
+                        let is_ref = matches!(param_ty, Type::Ref { .. } | Type::Ptr { .. });
+                        if !is_ref && !self.is_copy_type(&self.expr_type(arg)) {
+                            self.moved_vars.insert(arg_name.clone());
+                        }
+                    }
+                }
                 Ok(self.try_extract_result(result))
             }
             Expr::QualifiedCall {
@@ -5254,6 +5692,18 @@ impl<'ctx> CodeGen<'ctx> {
                     .builder
                     .build_call(fn_val, &arg_values, "call")
                     .map_err(|e| format!("failed to build call to '{}': {}", qualified_name, e))?;
+                // Move detection: mark by-value args as moved if not Copy
+                for (i, arg) in args.iter().enumerate() {
+                    if let Expr::Ident(arg_name) = arg
+                        && let Some(param_tys) = self.fn_param_types.get(&resolved_name)
+                        && let Some(param_ty) = param_tys.get(i)
+                    {
+                        let is_ref = matches!(param_ty, Type::Ref { .. } | Type::Ptr { .. });
+                        if !is_ref && !self.is_copy_type(&self.expr_type(arg)) {
+                            self.moved_vars.insert(arg_name.clone());
+                        }
+                    }
+                }
                 Ok(self.try_extract_result(result))
             }
             Expr::Binary { op, lhs, rhs } => {
@@ -5612,6 +6062,36 @@ impl<'ctx> CodeGen<'ctx> {
                 method,
                 args,
             } => {
+                // Reject direct .drop() calls
+                if method == "drop" {
+                    // Only reject if the type implements the Drop trait
+                    let receiver_type = self.expr_type(receiver);
+                    let type_name = match &receiver_type {
+                        Type::Struct(name) => Some(name.clone()),
+                        Type::GenericInstance(name, args) => {
+                            Some(Self::mangle_generic_instance(name, args))
+                        }
+                        Type::Ref { inner, .. } => match inner.as_ref() {
+                            Type::Struct(name) => Some(name.clone()),
+                            Type::GenericInstance(name, args) => {
+                                Some(Self::mangle_generic_instance(name, args))
+                            }
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some(ref tn) = type_name
+                        && self
+                            .trait_impls
+                            .get(tn)
+                            .is_some_and(|traits| traits.contains("Drop"))
+                    {
+                        return Err(
+                            "cannot call Drop::drop directly, use std::mem::drop()".to_string()
+                        );
+                    }
+                }
+
                 // Special case: .len() on &str and &[T]
                 if method == "len" && args.is_empty() {
                     let rt = self.expr_type(receiver);
@@ -6197,6 +6677,7 @@ impl<'ctx> CodeGen<'ctx> {
                 // Compile then block
                 self.builder.position_at_end(then_bb);
                 let saved_symbols = self.symbols.clone();
+                let saved_moved_vars = self.moved_vars.clone();
                 if let Some(mut then_val) = self.compile_block_get_value(then_block)? {
                     let then_ty = then_block
                         .tail_expr
@@ -6211,6 +6692,7 @@ impl<'ctx> CodeGen<'ctx> {
                         .map_err(|e| format!("failed to store then result: {}", e))?;
                 }
                 self.symbols = saved_symbols;
+                self.moved_vars = saved_moved_vars;
                 let then_terminated = self
                     .builder
                     .get_insert_block()
@@ -6270,8 +6752,15 @@ impl<'ctx> CodeGen<'ctx> {
 
                 self.builder.position_at_end(header_bb);
                 let saved_symbols = self.symbols.clone();
+                let saved_moved_vars = self.moved_vars.clone();
+                self.loop_stack.push(LoopContext {
+                    continue_bb: header_bb,
+                    break_bb: after_bb,
+                });
                 self.compile_block_get_value(body)?;
+                self.loop_stack.pop();
                 self.symbols = saved_symbols;
+                self.moved_vars = saved_moved_vars;
 
                 // Branch back to header
                 let terminated = self
@@ -6332,8 +6821,15 @@ impl<'ctx> CodeGen<'ctx> {
                 // Body block
                 self.builder.position_at_end(body_bb);
                 let saved_symbols = self.symbols.clone();
+                let saved_moved_vars = self.moved_vars.clone();
+                self.loop_stack.push(LoopContext {
+                    continue_bb: cond_bb,
+                    break_bb: after_bb,
+                });
                 self.compile_block_get_value(body)?;
+                self.loop_stack.pop();
                 self.symbols = saved_symbols;
+                self.moved_vars = saved_moved_vars;
                 let terminated = self
                     .builder
                     .get_insert_block()
@@ -6490,14 +6986,22 @@ impl<'ctx> CodeGen<'ctx> {
             Expr::Match { scrutinee, arms } => self.compile_match(scrutinee, arms),
             Expr::Block(block) => {
                 let saved_symbols = self.symbols.clone();
-                let result = self.compile_block_get_value(block)?;
+                let saved_moved_vars = self.moved_vars.clone();
+                self.enter_scope();
+                let result = self.compile_block_get_value(block);
+                // Exit scope (drops non-moved vars) even if block compilation fails
+                if result.is_ok() {
+                    let _ = self.exit_scope();
+                }
+                self.moved_vars = saved_moved_vars;
                 self.symbols = saved_symbols;
                 match result {
-                    Some(val) => Ok(val),
-                    None => {
+                    Ok(Some(val)) => Ok(val),
+                    Ok(None) => {
                         let unit_ty = self.context.struct_type(&[], false);
                         Ok(unit_ty.get_undef().into())
                     }
+                    Err(e) => Err(e),
                 }
             }
         }
@@ -6544,6 +7048,7 @@ impl<'ctx> CodeGen<'ctx> {
         // === Then block: bind variables, execute body ===
         self.builder.position_at_end(then_bb);
         let saved = self.symbols.clone();
+        let saved_moved = self.moved_vars.clone();
         for (name, ptr, ty) in &bindings {
             self.symbols.insert(name.clone(), (*ptr, false, ty.clone()));
         }
@@ -6561,6 +7066,7 @@ impl<'ctx> CodeGen<'ctx> {
                 .map_err(|e| format!("failed to store if_let then result: {}", e))?;
         }
         self.symbols = saved;
+        self.moved_vars = saved_moved;
         if self
             .builder
             .get_insert_block()
@@ -6576,6 +7082,7 @@ impl<'ctx> CodeGen<'ctx> {
         // === Else block ===
         self.builder.position_at_end(else_bb);
         let saved = self.symbols.clone();
+        let saved_moved = self.moved_vars.clone();
         if let Some(el_block) = else_block
             && let Some(mut val) = self.compile_block_get_value(el_block)?
         {
@@ -6592,6 +7099,7 @@ impl<'ctx> CodeGen<'ctx> {
                 .map_err(|e| format!("failed to store if_let else result: {}", e))?;
         }
         self.symbols = saved;
+        self.moved_vars = saved_moved;
         if self
             .builder
             .get_insert_block()
@@ -6657,6 +7165,7 @@ impl<'ctx> CodeGen<'ctx> {
         // Create a temporary mock scope to retrieve the return type of iterator.next()
         let iter_ty = self.expr_type(&iterator_expr);
         let outer_saved_symbols = self.symbols.clone();
+        let outer_saved_moved_vars = self.moved_vars.clone();
         self.symbols.insert(
             "__for_loop_iter".to_string(),
             (
@@ -6721,11 +7230,18 @@ impl<'ctx> CodeGen<'ctx> {
         // --- Body block ---
         self.builder.position_at_end(body_bb);
         let saved_symbols = self.symbols.clone();
+        let saved_moved_vars = self.moved_vars.clone();
         for (name, ptr, ty) in &bindings {
             self.symbols.insert(name.clone(), (*ptr, false, ty.clone()));
         }
+        self.loop_stack.push(LoopContext {
+            continue_bb: cond_bb,
+            break_bb: after_bb,
+        });
         self.compile_block_get_value(body)?;
+        self.loop_stack.pop();
         self.symbols = saved_symbols;
+        self.moved_vars = saved_moved_vars;
         let terminated = self
             .builder
             .get_insert_block()
@@ -6741,6 +7257,7 @@ impl<'ctx> CodeGen<'ctx> {
         self.builder.position_at_end(after_bb);
         // Restore outer symbols
         self.symbols = outer_saved_symbols;
+        self.moved_vars = outer_saved_moved_vars;
         // Loop produces unit value
         let unit_ty = self.context.struct_type(&[], false);
         Ok(unit_ty.get_undef().into())
@@ -6850,6 +7367,7 @@ impl<'ctx> CodeGen<'ctx> {
             // Compile arm body
             self.builder.position_at_end(body_bb);
             let saved = self.symbols.clone();
+            let saved_moved = self.moved_vars.clone();
             for (name, ptr, ty) in &bindings {
                 self.symbols.insert(name.clone(), (*ptr, false, ty.clone()));
             }
@@ -6868,6 +7386,7 @@ impl<'ctx> CodeGen<'ctx> {
                     .map_err(|e| format!("failed to store match arm result: {}", e))?;
             }
             self.symbols = saved;
+            self.moved_vars = saved_moved;
             if self
                 .builder
                 .get_insert_block()
@@ -9148,11 +9667,120 @@ mod tests {
     }
 
     #[test]
+    fn test_jit_trait_default_method() {
+        // Trait default method is used when not overridden
+        assert_eq!(
+            jit(
+                "struct Foo { x: i32, }\ntrait Bar { fn get(&self) -> i32 { 42 } }\nimpl Bar for Foo { }\nfn main() -> i32 { let f = Foo { x: 10 }; f.get() }"
+            )
+            .unwrap(),
+            42
+        );
+    }
+
+    #[test]
+    fn test_jit_trait_default_method_override() {
+        // Explicit override takes precedence over default
+        assert_eq!(
+            jit(
+                "struct Foo { x: i32, }\ntrait Bar { fn get(&self) -> i32 { 42 } }\nimpl Bar for Foo { fn get(&self) -> i32 { 99 } }\nfn main() -> i32 { let f = Foo { x: 10 }; f.get() }"
+            )
+            .unwrap(),
+            99
+        );
+    }
+
+    #[test]
+    fn test_jit_trait_default_method_multi() {
+        // Mixed: some overridden, some using default
+        assert_eq!(
+            jit(
+                "struct Foo { x: i32, }\ntrait Bar { fn one(&self) -> i32 { 1 } fn two(&self) -> i32 { 2 } }\nimpl Bar for Foo { fn two(&self) -> i32 { 22 } }\nfn main() -> i32 { let f = Foo { x: 0 }; f.one() + f.two() }"
+            )
+            .unwrap(),
+            23
+        );
+    }
+
+    #[test]
     fn test_jit_block_expr_result_used_in_arithmetic() {
         // Block expression result used in arithmetic
         assert_eq!(
             jit("fn main() -> i32 { let x = 1; let y = { x + 2 } + 3; y }").unwrap(),
             6
+        );
+    }
+
+    #[test]
+    fn test_jit_loop_break() {
+        assert_eq!(jit("fn main() { loop { break; }; }").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_jit_loop_continue() {
+        assert_eq!(
+            jit(
+                "fn main() -> i32 { let mut i = 0; loop { i = i + 1; if i == 10 { break; }; }; i }"
+            )
+            .unwrap(),
+            10
+        );
+    }
+
+    #[test]
+    fn test_jit_while_break() {
+        assert_eq!(
+            jit(
+                "fn main() -> i32 { let mut i = 0; while i < 10 { i = i + 1; if i == 5 { break; }; }; i }"
+            )
+            .unwrap(),
+            5
+        );
+    }
+
+    #[test]
+    fn test_jit_while_continue() {
+        assert_eq!(
+            jit(
+                "fn main() -> i32 { let mut i = 0; let mut count = 0; while i < 5 { i = i + 1; if i == 3 { continue; }; count = count + 1; }; count }"
+            )
+            .unwrap(),
+            4
+        );
+    }
+
+    #[test]
+    fn test_jit_break_outside_loop_errors() {
+        let result = jit("fn main() { break; }");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("outside"),
+            "expected 'outside' in error message, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_jit_continue_outside_loop_errors() {
+        let result = jit("fn main() { continue; }");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("outside"),
+            "expected 'outside' in error message, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_jit_nested_break_breaks_inner() {
+        assert_eq!(
+            jit(
+                "fn main() -> i32 { let mut x = 0; loop { loop { x = 1; break; }; x = 2; break; }; x }"
+            )
+            .unwrap(),
+            2
         );
     }
 }

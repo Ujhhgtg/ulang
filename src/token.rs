@@ -36,6 +36,8 @@ mod tests {
     fn test_token_equality() {
         assert_eq!(Token::Fn, Token::Fn);
         assert_eq!(Token::Let, Token::Let);
+        assert_eq!(Token::Continue, Token::Continue);
+        assert_eq!(Token::Break, Token::Break);
         assert_eq!(Token::Mod, Token::Mod);
         assert_eq!(Token::Mut, Token::Mut);
         assert_eq!(Token::Const, Token::Const);
@@ -124,6 +126,8 @@ pub enum Token {
     Loop,
     While,
     Return,
+    Continue,
+    Break,
     Mod,
     // Literals
     Bool,

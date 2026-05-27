@@ -2441,6 +2441,7 @@ fn qualify_block(
                     );
                 }
             }
+            crate::ast::Stmt::Continue { .. } | crate::ast::Stmt::Break { .. } => {}
         }
     }
     if let Some(tail) = &mut block.tail_expr {

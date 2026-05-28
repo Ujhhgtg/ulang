@@ -238,7 +238,7 @@ fn test_trait_default_method_override() {
 fn test_trait_default_method_mixed() {
     assert!(run_test(
         "trait_default_mixed",
-        "use std::panic::panic;\ntrait Animal { fn noise(&self) -> i32 { 42 } fn legs(&self) -> i32; }\nstruct Dog {}\nimpl Animal for Dog { fn legs(&self) -> i32 { 4 } }\nfn main() {\n    let d = Dog {};\n    let n = d.noise();\n    let l = d.legs();\n    if n != 42 { panic(\"expected 42\"); }\n    if l != 4 { panic(\"expected 4\"); }\n}\n"
+        "use std::panic::panic;\ntrait Animal { fn noise(&self) -> i32 { 42 } fn legs(&self) -> i32; }\nstruct Dog {}\nimpl Animal for Dog { fn legs(&self) -> i32 { 4 } }\nfn main() {\n    let d = Dog {};\n    let n = d.noise();\n    let l = d.legs();\n    if n != 42 { panic(\"expected 42\"); };\n    if l != 4 { panic(\"expected 4\"); }\n}\n"
     ));
 }
 
@@ -1555,6 +1555,33 @@ fn test_continue_break_loop() {
                 sum = sum + i;
             };
             sum
+        }
+        "#
+    ));
+}
+
+#[test]
+fn test_never_type_blocks_diverge() {
+    assert!(run_test(
+        "never_type_blocks_diverge",
+        r#"
+        fn main() -> i32 {
+            let val = if true { return 0; } else { return 1; };
+            val
+        }
+        "#
+    ));
+}
+
+#[test]
+fn test_never_type_coercion() {
+    assert!(run_test(
+        "never_type_coercion",
+        r#"
+        use std::process::exit;
+        fn main() -> i32 {
+            let val = if true { 42 } else { exit(0) };
+            val
         }
         "#
     ));

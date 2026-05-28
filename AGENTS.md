@@ -21,6 +21,32 @@ Pipeline is sequential, single-pass, no IR middle-end.
 - **CodeGen** (`codegen.rs`): LLVM IR generation via `inkwell`. Two modes — `new_jit` (with `ExecutionEngine` for in-memory JIT) and `new_native` (for `.o` → `cc` link). `print()` compiles to `printf("%d\n", value)`.
 - **Error reporting** (`error.rs`): uses `annotate-snippets` for pretty-printed source-level diagnostics to stderr.
 
+## Syntax Differences from Rust
+
+### Semicolons after Control Flow Statements
+In Rust, block-like expressions (such as `if`, `while`, `loop`, `for`, `match`, and `{}`) used as statements do not require a trailing semicolon.
+However, in `ulang`, to clarify statements and expressions, **every statement containing a block-like control flow expression MUST be terminated with a semicolon** if it is followed by subsequent statements. Lacking a semicolon causes the control flow block to be parsed as the tail expression (implicit return of the block), resulting in a syntax error if subsequent statements are found.
+
+For example:
+```rust
+// Correct statement usage:
+println("do something");
+if true {
+    println("do something 1");
+} else {
+    println("do something 2");
+}; // <- Trailing semicolon is required!
+println("do something");
+```
+
+```rust
+// Correct tail expression (implicit return) usage:
+fn main() -> i32 {
+    let val = if true { return 0; } else { return 1; }; // semicolons inside let binding
+    val // tail expression does not have a semicolon
+}
+```
+
 ## Key Directories
 
 | Path | Purpose |

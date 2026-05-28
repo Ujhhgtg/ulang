@@ -3503,58 +3503,77 @@ impl<'ctx> CodeGen<'ctx> {
         }
     }
 
+    fn block_type(&self, block: &Block) -> Type {
+        if let Some(ref tail) = block.tail_expr {
+            self.expr_type(tail)
+        } else if self.block_diverges(block) {
+            Type::Never
+        } else {
+            Type::Unit
+        }
+    }
+
+    fn block_diverges(&self, block: &Block) -> bool {
+        for stmt in &block.stmts {
+            if self.stmt_diverges(stmt) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn stmt_diverges(&self, stmt: &Stmt) -> bool {
+        match stmt {
+            Stmt::Return { .. } | Stmt::Break { .. } | Stmt::Continue { .. } => true,
+            Stmt::Expr(expr) => self.expr_type(expr) == Type::Never,
+            Stmt::Let { init, .. } => self.expr_type(init) == Type::Never,
+            Stmt::Const { init, .. } => self.expr_type(init) == Type::Never,
+        }
+    }
+
     fn resolve_if_result_type(
         &self,
         then_block: &Block,
         else_ifs: &[(Expr, Block)],
         else_block: &Option<Block>,
     ) -> Type {
-        let mut candidate = None;
-        if let Some(ref e) = then_block.tail_expr {
-            let ty = self.expr_type(e);
-            if ty != Type::Never {
-                return ty;
-            }
-            candidate = Some(ty);
+        let then_ty = self.block_type(then_block);
+        if then_ty != Type::Never {
+            return then_ty;
         }
+        let mut candidate = Some(then_ty);
+
         for (_, block) in else_ifs {
-            if let Some(ref e) = block.tail_expr {
-                let ty = self.expr_type(e);
-                if ty != Type::Never {
-                    return ty;
-                }
-                candidate = Some(ty);
+            let block_ty = self.block_type(block);
+            if block_ty != Type::Never {
+                return block_ty;
             }
+            candidate = Some(block_ty);
         }
-        if let Some(block) = else_block
-            && let Some(ref e) = block.tail_expr
-        {
-            let ty = self.expr_type(e);
-            if ty != Type::Never {
-                return ty;
+
+        if let Some(block) = else_block {
+            let block_ty = self.block_type(block);
+            if block_ty != Type::Never {
+                return block_ty;
             }
-            candidate = Some(ty);
+            candidate = Some(block_ty);
         }
         candidate.unwrap_or(Type::I32)
     }
 
     fn resolve_if_let_result_type(&self, then_block: &Block, else_block: &Option<Block>) -> Type {
-        let mut candidate = None;
-        if let Some(ref e) = then_block.tail_expr {
-            let ty = self.expr_type(e);
-            if ty != Type::Never {
-                return ty;
-            }
-            candidate = Some(ty);
+        let then_ty = self.block_type(then_block);
+        if then_ty != Type::Never {
+            return then_ty;
         }
-        if let Some(block) = else_block
-            && let Some(ref e) = block.tail_expr
-        {
-            let ty = self.expr_type(e);
-            if ty != Type::Never {
-                return ty;
+        let mut candidate = Some(then_ty);
+
+        if let Some(block) = else_block {
+            let block_ty = self.block_type(block);
+            if block_ty != Type::Never {
+                return block_ty;
             }
-            candidate = Some(ty);
+            candidate = Some(block_ty);
         }
         candidate.unwrap_or(Type::Unit)
     }
@@ -3617,8 +3636,8 @@ impl<'ctx> CodeGen<'ctx> {
         let scrutinee_ty = self.expr_type(scrutinee_expr);
         let mut candidate = None;
         for arm in arms {
-            if let Some(ref e) = arm.body.tail_expr {
-                let ty = if let Expr::Ident(name) = e.as_ref() {
+            let ty = if let Some(ref e) = arm.body.tail_expr {
+                if let Expr::Ident(name) = e.as_ref() {
                     if self.consts.contains_key(name.as_str())
                         || self.symbols.contains_key(name.as_str())
                     {
@@ -3629,16 +3648,20 @@ impl<'ctx> CodeGen<'ctx> {
                     }
                 } else {
                     self.expr_type(e)
-                };
-                eprintln!(
-                    "DEBUG resolve_match_result_type: arm tail_expr={:?}, type={:?}",
-                    e, ty
-                );
-                if ty != Type::Never {
-                    return ty;
                 }
-                candidate = Some(ty);
+            } else if self.block_diverges(&arm.body) {
+                Type::Never
+            } else {
+                Type::Unit
+            };
+            eprintln!(
+                "DEBUG resolve_match_result_type: arm body type={:?}",
+                ty
+            );
+            if ty != Type::Never {
+                return ty;
             }
+            candidate = Some(ty);
         }
         candidate.unwrap_or(Type::Unit)
     }
@@ -3889,11 +3912,7 @@ impl<'ctx> CodeGen<'ctx> {
             } => self.resolve_if_let_result_type(then_block, else_block),
             Expr::For { .. } => Type::Unit,
             Expr::Block(block) => {
-                if let Some(ref tail) = block.tail_expr {
-                    self.expr_type(tail)
-                } else {
-                    Type::Unit
-                }
+                self.block_type(block)
             }
             Expr::Match {
                 scrutinee, arms, ..
@@ -4312,7 +4331,11 @@ impl<'ctx> CodeGen<'ctx> {
         if !already_terminated {
             if let Some(tail_expr) = &func.body.tail_expr {
                 let ret_ty = func.return_type.clone().unwrap_or(Type::I32);
-                let val = self.with_expected_type(&ret_ty, |this| this.compile_expr(tail_expr))?;
+                let mut val = self.with_expected_type(&ret_ty, |this| this.compile_expr(tail_expr))?;
+                let tail_ty = self.expr_type(tail_expr);
+                if tail_ty == Type::Never && ret_ty != Type::Never {
+                    val = self.emit_cast(val, &tail_ty, &ret_ty)?;
+                }
                 self.builder
                     .build_return(Some(&val))
                     .map_err(|e| format!("failed to build return for tail expr: {}", e))?;

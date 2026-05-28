@@ -1236,10 +1236,6 @@ impl<'a> Parser<'a> {
             if *self.peek_token() == Token::Semicolon {
                 self.advance();
                 stmts.push(Stmt::Expr(expr));
-            } else if Self::expr_is_block_like(&expr) && *self.peek_token() != Token::RBrace {
-                // Block-like expression (if, while, loop, for, match, {}) without semicolon
-                // but more statements follow → treat as expression statement, not tail expression
-                stmts.push(Stmt::Expr(expr));
             } else {
                 // No semicolon — tail expression
                 tail_expr = Some(Box::new(expr));
@@ -1256,21 +1252,6 @@ impl<'a> Parser<'a> {
             tail_expr,
             span: Span::new(lo, hi),
         })
-    }
-
-    /// Returns true if the expression is a block-like construct (ends with }),
-    /// so it can be used as an expression statement without a trailing semicolon.
-    fn expr_is_block_like(expr: &Expr) -> bool {
-        matches!(
-            expr,
-            Expr::If { .. }
-                | Expr::While { .. }
-                | Expr::Loop { .. }
-                | Expr::For { .. }
-                | Expr::IfLet { .. }
-                | Expr::Match { .. }
-                | Expr::Block(..)
-        )
     }
 
     fn parse_stmt(&mut self) -> Result<Stmt, ParseError> {
@@ -4738,5 +4719,17 @@ mod tests {
                 is_mut: false
             })
         );
+    }
+
+    #[test]
+    fn test_control_flow_statement_semicolon_required() {
+        // With semicolon: compiles successfully
+        let prog = parse("fn main() { if true { }; println(1); }");
+        assert!(prog.is_ok());
+
+        // Without semicolon: fails to parse with expected '}' error
+        let err = parse("fn main() { if true { } println(1); }");
+        assert!(err.is_err());
+        assert!(err.unwrap_err().msg.contains("expected RBrace"));
     }
 }

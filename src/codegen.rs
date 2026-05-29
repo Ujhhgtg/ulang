@@ -148,7 +148,7 @@ impl<'ctx> CodeGen<'ctx> {
         opt: OptimizationLevel,
         source: String,
         path: String,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, CodegenError> {
         let module = context.create_module("ulang");
         let execution_engine = module
             .create_jit_execution_engine(opt)
@@ -313,7 +313,7 @@ impl<'ctx> CodeGen<'ctx> {
         &self,
         caller_path: &[String],
         target_name: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(), CodegenError> {
         let target_def_path = self.get_module_path_for_item_name(target_name);
         let is_descendant = caller_path.len() >= target_def_path.len()
             && caller_path[0..target_def_path.len()] == target_def_path;
@@ -341,7 +341,7 @@ impl<'ctx> CodeGen<'ctx> {
         Ok(())
     }
 
-    fn check_visibility_of_type(&self, caller_path: &[String], ty: &Type) -> Result<(), String> {
+    fn check_visibility_of_type(&self, caller_path: &[String], ty: &Type) -> Result<(), CodegenError> {
         match ty {
             Type::Struct(name) => {
                 self.check_visibility_of_path(caller_path, name)?;
@@ -379,7 +379,7 @@ impl<'ctx> CodeGen<'ctx> {
         caller_path: &[String],
         struct_name: &str,
         field_name: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(), CodegenError> {
         let target_def_path = self.get_module_path_for_item_name(struct_name);
         let is_descendant = caller_path.len() >= target_def_path.len()
             && caller_path[0..target_def_path.len()] == target_def_path;
@@ -406,7 +406,7 @@ impl<'ctx> CodeGen<'ctx> {
         &self,
         caller_path: &[String],
         struct_name: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(), CodegenError> {
         let target_def_path = self.get_module_path_for_item_name(struct_name);
         let is_descendant = caller_path.len() >= target_def_path.len()
             && caller_path[0..target_def_path.len()] == target_def_path;
@@ -440,9 +440,9 @@ impl<'ctx> CodeGen<'ctx> {
         }
     }
 
-    fn with_expected_type<F, R>(&mut self, ty: &Type, f: F) -> Result<R, String>
+    fn with_expected_type<F, R>(&mut self, ty: &Type, f: F) -> Result<R, CodegenError>
     where
-        F: FnOnce(&mut Self) -> Result<R, String>,
+        F: FnOnce(&mut Self) -> Result<R, CodegenError>,
     {
         let mut saved = None;
         let mut current_ty = ty;
@@ -510,7 +510,7 @@ impl<'ctx> CodeGen<'ctx> {
         }
     }
 
-    fn generate_primitive_trait_impls(&mut self) -> Result<(), String> {
+    fn generate_primitive_trait_impls(&mut self) -> Result<(), CodegenError> {
         let primitives = [
             Type::Bool,
             Type::I8,
@@ -1109,7 +1109,7 @@ impl<'ctx> CodeGen<'ctx> {
         name: &str,
         ty: &Type,
         ptr: PointerValue<'ctx>,
-    ) -> Result<(), String> {
+    ) -> Result<(), CodegenError> {
         // 1. Direct Drop impl: call __trait_Drop_drop_<Type>(ptr)
         if self.check_type_implements_trait(ty, "Drop") {
             let type_name = Self::type_to_mangled_name(ty);
@@ -1166,7 +1166,7 @@ impl<'ctx> CodeGen<'ctx> {
 
     /// Exit the current scope: drop non-moved variables in reverse declaration
     /// order, then pop the scope.
-    fn exit_scope(&mut self) -> Result<(), String> {
+    fn exit_scope(&mut self) -> Result<(), CodegenError> {
         // Clone scope data to avoid borrow conflicts with drop_variable
         let scope_data: Vec<(String, Type, inkwell::values::PointerValue)> =
             self.scope_stack.last().cloned().unwrap_or_default();
@@ -1190,7 +1190,7 @@ impl<'ctx> CodeGen<'ctx> {
         &mut self,
         decl: &StructDecl,
         _program: &Program,
-    ) -> Result<(), String> {
+    ) -> Result<(), CodegenError> {
         for attr in &decl.attribs {
             if attr.name != "derive" {
                 continue;
@@ -1203,7 +1203,7 @@ impl<'ctx> CodeGen<'ctx> {
     }
 
     /// Process a single derived trait for a struct.
-    fn process_derive_trait(&mut self, decl: &StructDecl, trait_name: &str) -> Result<(), String> {
+    fn process_derive_trait(&mut self, decl: &StructDecl, trait_name: &str) -> Result<(), CodegenError> {
         // Special handling for Copy and Drop
         match trait_name {
             "Drop" => {
@@ -1275,7 +1275,7 @@ impl<'ctx> CodeGen<'ctx> {
     }
 
     /// Generate `Default::default()` for a struct.
-    fn generate_derive_default(&mut self, decl: &StructDecl) -> Result<(), String> {
+    fn generate_derive_default(&mut self, decl: &StructDecl) -> Result<(), CodegenError> {
         let fn_name =
             Self::trait_method_name(&Type::Struct(decl.name.clone()), "Default", "default");
         let struct_ty = self
@@ -1339,7 +1339,7 @@ impl<'ctx> CodeGen<'ctx> {
     }
 
     /// Generate `Clone::clone(&self)` for a struct.
-    fn generate_derive_clone(&mut self, decl: &StructDecl) -> Result<(), String> {
+    fn generate_derive_clone(&mut self, decl: &StructDecl) -> Result<(), CodegenError> {
         let fn_name = Self::trait_method_name(&Type::Struct(decl.name.clone()), "Clone", "clone");
         let struct_ty = self
             .struct_types
@@ -1423,7 +1423,7 @@ impl<'ctx> CodeGen<'ctx> {
     }
 
     /// Generate `Eq::eq(&self, other: &Self) -> bool` and `ne` for a struct.
-    fn generate_derive_eq(&mut self, decl: &StructDecl) -> Result<(), String> {
+    fn generate_derive_eq(&mut self, decl: &StructDecl) -> Result<(), CodegenError> {
         let struct_ty = self
             .struct_types
             .get(&decl.name)
@@ -1594,7 +1594,7 @@ impl<'ctx> CodeGen<'ctx> {
         decl: &StructDecl,
         trait_name: &str,
         cmp_name: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(), CodegenError> {
         let struct_ty = self
             .struct_types
             .get(&decl.name)
@@ -2338,7 +2338,7 @@ impl<'ctx> CodeGen<'ctx> {
         type_name: &str,
         gen_method: &Function,
         args: &[Expr],
-    ) -> Result<String, String> {
+    ) -> Result<String, CodegenError> {
         let mut cloned = gen_method.clone();
         let param_names: Vec<String> = gen_method
             .type_params
@@ -2455,7 +2455,7 @@ impl<'ctx> CodeGen<'ctx> {
         &mut self,
         gen_func: &Function,
         args: &[Expr],
-    ) -> Result<String, String> {
+    ) -> Result<String, CodegenError> {
         let mut cloned = gen_func.clone();
         let param_names: Vec<String> = gen_func
             .type_params
@@ -2862,7 +2862,7 @@ impl<'ctx> CodeGen<'ctx> {
     }
 
     /// Ensure a generic struct/enum instance is monomorphized.
-    fn ensure_monomorphized(&mut self, base_name: &str, args: &[Type]) -> Result<(), String> {
+    fn ensure_monomorphized(&mut self, base_name: &str, args: &[Type]) -> Result<(), CodegenError> {
         let mangled = Self::mangle_generic_instance(base_name, args);
         if self.monomorphized.contains(&mangled) {
             return Ok(());
@@ -3064,7 +3064,7 @@ impl<'ctx> CodeGen<'ctx> {
             .collect()
     }
 
-    pub fn compile_module(&mut self, program: &Program) -> Result<(), String> {
+    pub fn compile_module(&mut self, program: &Program) -> Result<(), CodegenError> {
         // Populate visibility map
         for func in &program.funcs {
             self.visibility_map.insert(func.name.clone(), func.is_pub);
@@ -3405,7 +3405,7 @@ impl<'ctx> CodeGen<'ctx> {
         }
         Ok(())
     }
-    pub fn jit_run(&mut self, program: &Program) -> Result<i32, String> {
+    pub fn jit_run(&mut self, program: &Program) -> Result<i32, CodegenError> {
         self.compile_module(program)?;
 
         let ee = self
@@ -3422,7 +3422,7 @@ impl<'ctx> CodeGen<'ctx> {
         Ok(result)
     }
 
-    pub fn compile_to_object(&self, path: &Path) -> Result<(), String> {
+    pub fn compile_to_object(&self, path: &Path) -> Result<(), CodegenError> {
         let triple = TargetMachine::get_default_triple();
         self.compile_to_object_for_triple(&triple, path)
     }
@@ -3431,7 +3431,7 @@ impl<'ctx> CodeGen<'ctx> {
         &self,
         triple: &TargetTriple,
         path: &Path,
-    ) -> Result<(), String> {
+    ) -> Result<(), CodegenError> {
         Target::initialize_all(&InitializationConfig::default());
 
         let target = Target::from_triple(triple)
@@ -3457,7 +3457,7 @@ impl<'ctx> CodeGen<'ctx> {
         Ok(())
     }
 
-    pub fn link_executable(args: &[&str], obj_path: &Path, exe_path: &Path) -> Result<(), String> {
+    pub fn link_executable(args: &[&str], obj_path: &Path, exe_path: &Path) -> Result<(), CodegenError> {
         let output = std::process::Command::new(args[0])
             .args(&args[1..])
             .arg(obj_path)
@@ -4468,7 +4468,7 @@ impl<'ctx> CodeGen<'ctx> {
         }
     }
 
-    fn declare_function(&mut self, func: &Function) -> Result<(), String> {
+    fn declare_function(&mut self, func: &Function) -> Result<(), CodegenError> {
         let param_types: Vec<BasicMetadataTypeEnum<'ctx>> = func
             .params
             .iter()
@@ -4512,7 +4512,7 @@ impl<'ctx> CodeGen<'ctx> {
         Ok(())
     }
 
-    fn compile_function_body(&mut self, func: &Function) -> Result<(), String> {
+    fn compile_function_body(&mut self, func: &Function) -> Result<(), CodegenError> {
         let saved_bb = self.builder.get_insert_block();
         let saved_symbols = self.symbols.clone();
         let saved_moved_vars = self.moved_vars.clone();
@@ -4537,7 +4537,7 @@ impl<'ctx> CodeGen<'ctx> {
         result
     }
 
-    fn compile_function_body_inner(&mut self, func: &Function) -> Result<(), String> {
+    fn compile_function_body_inner(&mut self, func: &Function) -> Result<(), CodegenError> {
         eprintln!("DEBUG compile_function_body_inner: {}", func.name);
         self.current_module_path = self.get_module_path_for_item_name(&func.name);
 
@@ -4631,7 +4631,7 @@ impl<'ctx> CodeGen<'ctx> {
         Ok(())
     }
 
-    fn compile_stmt(&mut self, stmt: &Stmt) -> Result<(), String> {
+    fn compile_stmt(&mut self, stmt: &Stmt) -> Result<(), CodegenError> {
         match stmt {
             Stmt::Let {
                 pattern,
@@ -4811,7 +4811,7 @@ impl<'ctx> CodeGen<'ctx> {
     fn compile_block_get_value(
         &mut self,
         block: &Block,
-    ) -> Result<Option<BasicValueEnum<'ctx>>, String> {
+    ) -> Result<Option<BasicValueEnum<'ctx>>, CodegenError> {
         for stmt in &block.stmts {
             self.compile_stmt(stmt)?;
         }
@@ -4831,7 +4831,7 @@ impl<'ctx> CodeGen<'ctx> {
         rhs: &Expr,
         lhs_val: BasicValueEnum<'ctx>,
         rhs_val: BasicValueEnum<'ctx>,
-    ) -> Result<BasicValueEnum<'ctx>, String> {
+    ) -> Result<BasicValueEnum<'ctx>, CodegenError> {
         let lhs_type = self.expr_type(lhs);
         let rhs_type = self.expr_type(rhs);
 
@@ -4960,7 +4960,7 @@ impl<'ctx> CodeGen<'ctx> {
         rhs: &Expr,
         lhs_val: BasicValueEnum<'ctx>,
         rhs_val: BasicValueEnum<'ctx>,
-    ) -> Result<BasicValueEnum<'ctx>, String> {
+    ) -> Result<BasicValueEnum<'ctx>, CodegenError> {
         let lhs_type = self.expr_type(lhs);
         let rhs_type = self.expr_type(rhs);
 
@@ -5050,7 +5050,7 @@ impl<'ctx> CodeGen<'ctx> {
         merge_bb: inkwell::basic_block::BasicBlock<'ctx>,
         result_alloca: inkwell::values::PointerValue<'ctx>,
         result_type: &Type,
-    ) -> Result<(), String> {
+    ) -> Result<(), CodegenError> {
         let result_llvm_ty = self.type_to_llvm(result_type);
         if let Some((elif_cond, elif_body)) = else_ifs.first() {
             let cond_val = self.compile_expr(elif_cond)?;
@@ -5157,7 +5157,7 @@ impl<'ctx> CodeGen<'ctx> {
     /// First processes GenericArray impl blocks from slice_impls (which compile method bodies
     /// calling __builtin_slice_* intrinsics), then falls back to compiler intrinsics for any
     /// remaining methods not provided by the stdlib.
-    fn ensure_slice_methods(&mut self, elem_ty: &Type, len: usize) -> Result<(), String> {
+    fn ensure_slice_methods(&mut self, elem_ty: &Type, len: usize) -> Result<(), CodegenError> {
         let key = Self::array_type_key(elem_ty, len);
         if self.impl_methods.contains_key(&key) {
             return Ok(()); // already generated
@@ -5459,7 +5459,7 @@ impl<'ctx> CodeGen<'ctx> {
         }
     }
 
-    fn compile_expr(&mut self, expr: &Expr) -> Result<BasicValueEnum<'ctx>, String> {
+    fn compile_expr(&mut self, expr: &Expr) -> Result<BasicValueEnum<'ctx>, CodegenError> {
         match expr {
             Expr::BoolLit(val, ..) => Ok(self
                 .bool_type
@@ -7358,7 +7358,7 @@ impl<'ctx> CodeGen<'ctx> {
         scrutinee: &Expr,
         then_block: &Block,
         else_block: &Option<Block>,
-    ) -> Result<BasicValueEnum<'ctx>, String> {
+    ) -> Result<BasicValueEnum<'ctx>, CodegenError> {
         let scrutinee_val = self.compile_expr(scrutinee)?;
         let scrutinee_ty = self.expr_type(scrutinee);
         let result_type = self.resolve_if_let_result_type(then_block, else_block);
@@ -7475,7 +7475,7 @@ impl<'ctx> CodeGen<'ctx> {
         pattern: &Pattern,
         container: &Expr,
         body: &Block,
-    ) -> Result<BasicValueEnum<'ctx>, String> {
+    ) -> Result<BasicValueEnum<'ctx>, CodegenError> {
         let container_type = self.expr_type(container);
         let mut base_ty = &container_type;
         while let Type::Ref { inner, .. } = base_ty {
@@ -7617,7 +7617,7 @@ impl<'ctx> CodeGen<'ctx> {
         &mut self,
         scrutinee: &Expr,
         arms: &[MatchArm],
-    ) -> Result<BasicValueEnum<'ctx>, String> {
+    ) -> Result<BasicValueEnum<'ctx>, CodegenError> {
         let scrutinee_val = self.compile_expr(scrutinee)?;
         let scrutinee_ty = self.expr_type(scrutinee);
         let result_type = self.resolve_match_result_type(scrutinee, arms);
@@ -7775,7 +7775,7 @@ impl<'ctx> CodeGen<'ctx> {
             inkwell::values::IntValue<'ctx>,
             Vec<(String, inkwell::values::PointerValue<'ctx>, Type)>,
         ),
-        String,
+        CodegenError,
     > {
         match pattern {
             Pattern::Wildcard => Ok((self.bool_type.const_int(1, false), Vec::new())),
@@ -8040,7 +8040,7 @@ impl<'ctx> CodeGen<'ctx> {
         &mut self,
         callee: &str,
         args: &[Expr],
-    ) -> Result<Option<BasicValueEnum<'ctx>>, String> {
+    ) -> Result<Option<BasicValueEnum<'ctx>>, CodegenError> {
         match callee {
             "__builtin_slice_index" if args.len() == 2 => {
                 let self_val = self.compile_expr(&args[0])?;
@@ -8144,7 +8144,7 @@ impl<'ctx> CodeGen<'ctx> {
     fn compile_args_vec(
         &mut self,
         args: &[Expr],
-    ) -> Result<Vec<BasicMetadataValueEnum<'ctx>>, String> {
+    ) -> Result<Vec<BasicMetadataValueEnum<'ctx>>, CodegenError> {
         let mut values = Vec::with_capacity(args.len());
         for arg in args {
             let val = self.compile_expr(arg)?;
@@ -8167,7 +8167,7 @@ impl<'ctx> CodeGen<'ctx> {
         }
     }
 
-    fn const_eval(&self, expr: &Expr) -> Result<i64, String> {
+    fn const_eval(&self, expr: &Expr) -> Result<i64, CodegenError> {
         match expr {
             Expr::BoolLit(val, ..) => Ok(if *val { 1 } else { 0 }),
             Expr::IntLit(val, ..) => Ok(*val),
@@ -8246,7 +8246,7 @@ impl<'ctx> CodeGen<'ctx> {
         arg_val: BasicValueEnum<'ctx>,
         arg_ty: &Type,
         param_ty: &Type,
-    ) -> Result<BasicValueEnum<'ctx>, String> {
+    ) -> Result<BasicValueEnum<'ctx>, CodegenError> {
         let mut arg_val = arg_val;
         let mut arg_ty = arg_ty.clone();
 
@@ -8342,7 +8342,7 @@ impl<'ctx> CodeGen<'ctx> {
         val: BasicValueEnum<'ctx>,
         from_type: &Type,
         to_type: &Type,
-    ) -> Result<BasicValueEnum<'ctx>, String> {
+    ) -> Result<BasicValueEnum<'ctx>, CodegenError> {
         if *from_type == Type::Never {
             let dst_llvm = self.type_to_llvm(to_type);
             return Ok(self.get_undef_value(&dst_llvm));
@@ -8642,7 +8642,7 @@ mod tests {
     use crate::parser::Parser;
     use crate::token::Token;
 
-    fn jit(src: &str) -> Result<i32, String> {
+    fn jit(src: &str) -> Result<i32, CodegenError> {
         let mut lexer = Lexer::new(src);
         let mut tokens = Vec::new();
         loop {
@@ -8665,7 +8665,7 @@ mod tests {
         cg.jit_run(&program)
     }
 
-    fn compile_only(src: &str) -> Result<(), String> {
+    fn compile_only(src: &str) -> Result<(), CodegenError> {
         let mut lexer = Lexer::new(src);
         let mut tokens = Vec::new();
         loop {

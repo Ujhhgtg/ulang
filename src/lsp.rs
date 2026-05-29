@@ -236,11 +236,19 @@ fn type_to_string(ty: &crate::ast::Type) -> String {
     }
 }
 
-fn get_hover_text_from_program(program: &Program, name: &str) -> Option<String> {
-    get_hover_text_recursive(program, name)
+fn get_hover_text_from_program(
+    program: &Program,
+    name: &str,
+    struct_context: Option<&str>,
+) -> Option<String> {
+    get_hover_text_recursive(program, name, struct_context)
 }
 
-fn get_hover_text_recursive(program: &Program, name: &str) -> Option<String> {
+fn get_hover_text_recursive(
+    program: &Program,
+    name: &str,
+    struct_context: Option<&str>,
+) -> Option<String> {
     // 1. Search functions
     if let Some(func) = program.funcs.iter().find(|f| f.name == name) {
         let params: Vec<String> = func
@@ -287,6 +295,26 @@ fn get_hover_text_recursive(program: &Program, name: &str) -> Option<String> {
         ));
     }
 
+    // Search struct fields
+    for st in &program.structs {
+        let matches_context = match struct_context {
+            Some(ctx) => st.name == ctx,
+            None => true,
+        };
+        if matches_context && let Some(field) = st.fields.iter().find(|f| f.name == name) {
+            let pub_str = if st.is_pub { "pub " } else { "" };
+            let f_pub = if field.is_pub { "pub " } else { "" };
+            return Some(format!(
+                "```rust\n{}struct {} {{\n    {}{}: {}\n}}\n```",
+                pub_str,
+                st.name,
+                f_pub,
+                field.name,
+                type_to_string(&field.ty)
+            ));
+        }
+    }
+
     // 3. Search enums
     if let Some(en) = program.enums.iter().find(|e| e.name == name) {
         let variants: Vec<String> = en
@@ -306,6 +334,25 @@ fn get_hover_text_recursive(program: &Program, name: &str) -> Option<String> {
             type_params,
             variants.join(",\n")
         ));
+    }
+
+    // Search enum variants
+    for en in &program.enums {
+        let matches_context = match struct_context {
+            Some(ctx) => en.name == ctx,
+            None => true,
+        };
+        if matches_context && let Some(variant) = en.variants.iter().find(|v| v.name == name) {
+            let variant_str = match &variant.ty {
+                Some(ty) => format!("{}({})", variant.name, type_to_string(ty)),
+                None => variant.name.clone(),
+            };
+            let pub_str = if en.is_pub { "pub " } else { "" };
+            return Some(format!(
+                "```rust\n{}enum {} {{\n    {}\n}}\n```",
+                pub_str, en.name, variant_str
+            ));
+        }
     }
 
     // 4. Search traits
@@ -390,7 +437,7 @@ fn get_hover_text_recursive(program: &Program, name: &str) -> Option<String> {
     // 8. Recursively search inside submodules
     for m in &program.modules {
         if let Some(ref body) = m.body
-            && let Some(res) = get_hover_text_recursive(body, name)
+            && let Some(res) = get_hover_text_recursive(body, name, struct_context)
         {
             return Some(res);
         }
@@ -399,51 +446,323 @@ fn get_hover_text_recursive(program: &Program, name: &str) -> Option<String> {
     None
 }
 
-fn find_definition_span(tokens: &[(Token, Span)], name: &str, hover_offset: usize) -> Option<Span> {
-    // 1. Local backward search for variables or parameters
-    let hover_index = tokens
-        .iter()
-        .position(|(_, span)| span.lo <= hover_offset && hover_offset <= span.hi);
-    if let Some(idx) = hover_index {
-        let mut i = idx;
-        while i > 0 {
-            i -= 1;
-            if i + 1 < tokens.len() {
-                if let Token::Ident(ref id) = tokens[i].0
-                    && id == name
-                    && i > 0
-                    && (tokens[i - 1].0 == Token::Let || tokens[i - 1].0 == Token::Mut)
-                {
-                    return Some(tokens[i].1);
-                }
-                if let Token::Ident(ref id) = tokens[i + 1].0
-                    && id == name
-                    && tokens[i].0 == Token::Let
-                {
-                    return Some(tokens[i + 1].1);
+fn get_path_prefix(tokens: &[(Token, Span)], clicked_idx: usize) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut idx = clicked_idx;
+    while idx >= 2 && tokens[idx - 1].0 == Token::DoubleColon {
+        match &tokens[idx - 2].0 {
+            Token::Ident(name) => {
+                segments.push(name.clone());
+            }
+            Token::SelfType => {
+                segments.push("Self".to_string());
+            }
+            Token::Self_ => {
+                segments.push("self".to_string());
+            }
+            _ => break,
+        }
+        idx -= 2;
+    }
+    segments.reverse();
+    segments
+}
+
+fn get_struct_context(tokens: &[(Token, Span)], clicked_idx: usize) -> Option<String> {
+    let mut brace_depth = 0;
+    let mut paren_depth = 0;
+    let mut bracket_depth = 0;
+    let mut i = clicked_idx;
+    while i > 0 {
+        i -= 1;
+        match &tokens[i].0 {
+            Token::RBrace => brace_depth += 1,
+            Token::LBrace => {
+                if brace_depth == 0 {
+                    // Walk backward to find the identifier before LBrace (or before Lt/Gt generic parameters)
+                    let mut j = i;
+                    let mut lt_depth = 0;
+                    while j > 0 {
+                        j -= 1;
+                        match &tokens[j].0 {
+                            Token::Gt => lt_depth += 1,
+                            Token::Lt => {
+                                if lt_depth > 0 {
+                                    lt_depth -= 1;
+                                }
+                            }
+                            Token::Ident(name) if lt_depth == 0 => {
+                                return Some(name.clone());
+                            }
+                            Token::DoubleColon | Token::SelfType | Token::Self_ => {}
+                            _ if lt_depth > 0 => {}
+                            _ => break,
+                        }
+                    }
+                    break;
+                } else {
+                    brace_depth -= 1;
                 }
             }
-            if tokens[i].0 == Token::Fn {
-                // Check parameters of this enclosing function boundary
+            Token::RParen => paren_depth += 1,
+            Token::LParen => {
+                if paren_depth > 0 {
+                    paren_depth -= 1;
+                }
+            }
+            Token::RBracket => bracket_depth += 1,
+            Token::LBracket if bracket_depth > 0 => {
+                bracket_depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn resolve_prefix_to_full_path(uses: &[crate::ast::Use], prefix: &[String]) -> Vec<String> {
+    if prefix.is_empty() {
+        return Vec::new();
+    }
+    let first = &prefix[0];
+    if first == "std" || first == "core" {
+        return prefix.to_vec();
+    }
+    // Search for a matching import
+    for u in uses {
+        if let Some(last) = u.path.last()
+            && last == first
+        {
+            let mut full_path = u.path.clone();
+            full_path.extend_from_slice(&prefix[1..]);
+            return full_path;
+        }
+    }
+    prefix.to_vec()
+}
+
+fn find_stdlib_entry_by_path<'a>(
+    cache: &'a StdlibCache,
+    resolved_path: &[String],
+) -> Option<(&'a Url, &'a StdlibEntry)> {
+    if resolved_path.len() < 2 {
+        return None;
+    }
+    let dir = &resolved_path[0];
+    let mod_name = &resolved_path[1];
+    if dir != "std" && dir != "core" {
+        return None;
+    }
+    let suffix = format!("/{}/{}.u", dir, mod_name);
+    for (url, entry) in &cache.entries {
+        if url.path().ends_with(&suffix) {
+            return Some((url, entry));
+        }
+    }
+    None
+}
+
+#[derive(Debug)]
+struct GenericParamDecl {
+    name: String,
+    span: Span,
+}
+
+fn find_matching_brace_or_semicolon(tokens: &[(Token, Span)], start_idx: usize, allow_semicolon: bool) -> usize {
+    let mut i = start_idx;
+    let mut brace_depth = 0;
+    let mut has_braces = false;
+    while i < tokens.len() {
+        match &tokens[i].0 {
+            Token::LBrace => {
+                has_braces = true;
+                brace_depth += 1;
+            }
+            Token::RBrace => {
+                if brace_depth > 0 {
+                    brace_depth -= 1;
+                    if brace_depth == 0 {
+                        return i;
+                    }
+                }
+            }
+            Token::Semicolon if allow_semicolon && brace_depth == 0 && !has_braces => {
+                return i;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    tokens.len().saturating_sub(1)
+}
+
+fn parse_generic_params(tokens: &[(Token, Span)], lt_idx: usize) -> (Vec<GenericParamDecl>, usize) {
+    let mut params = Vec::new();
+    if lt_idx >= tokens.len() || tokens[lt_idx].0 != Token::Lt {
+        return (params, lt_idx);
+    }
+    let mut i = lt_idx + 1;
+    let mut depth = 1;
+    let mut new_param = true;
+    while i < tokens.len() && depth > 0 {
+        match &tokens[i].0 {
+            Token::Lt => {
+                depth += 1;
+                new_param = false;
+            }
+            Token::Gt => {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+                new_param = false;
+            }
+            Token::Comma if depth == 1 => {
+                new_param = true;
+            }
+            Token::Const if depth == 1 && new_param => {
+                if i + 1 < tokens.len() {
+                    if let Token::Ident(name) = &tokens[i + 1].0 {
+                        params.push(GenericParamDecl {
+                            name: name.clone(),
+                            span: tokens[i + 1].1,
+                        });
+                    }
+                }
+                new_param = false;
+            }
+            Token::Ident(name) if depth == 1 && new_param => {
+                params.push(GenericParamDecl {
+                    name: name.clone(),
+                    span: tokens[i].1,
+                });
+                new_param = false;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    (params, i)
+}
+
+fn collect_generic_scopes(tokens: &[(Token, Span)]) -> Vec<(usize, usize, Vec<GenericParamDecl>)> {
+    let mut scopes = Vec::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        match &tokens[i].0 {
+            Token::Impl | Token::Struct | Token::Enum | Token::Trait | Token::Fn | Token::Type => {
+                let start_idx = i;
+                let allow_semicolon = matches!(&tokens[start_idx].0, Token::Fn | Token::Type);
+                let mut lt_idx = None;
                 let mut j = i + 1;
-                let mut in_params = false;
-                while j < tokens.len()
-                    && tokens[j].0 != Token::LBrace
-                    && tokens[j].0 != Token::Semicolon
-                {
-                    if tokens[j].0 == Token::LParen {
-                        in_params = true;
-                    } else if tokens[j].0 == Token::RParen {
-                        break;
-                    } else if in_params
-                        && let Token::Ident(ref id) = tokens[j].0
-                        && id == name
-                    {
-                        return Some(tokens[j].1);
+                while j < tokens.len() {
+                    match &tokens[j].0 {
+                        Token::Lt => {
+                            lt_idx = Some(j);
+                            break;
+                        }
+                        Token::LBrace => {
+                            break;
+                        }
+                        Token::Semicolon if allow_semicolon => {
+                            break;
+                        }
+                        _ => {}
                     }
                     j += 1;
                 }
-                break; // Stop local search at the function definition boundary
+
+                let mut params = Vec::new();
+                if let Some(idx) = lt_idx {
+                    let (parsed, _) = parse_generic_params(tokens, idx);
+                    params = parsed;
+                }
+
+                let end_idx = find_matching_brace_or_semicolon(tokens, start_idx, allow_semicolon);
+                scopes.push((start_idx, end_idx, params));
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    scopes
+}
+
+fn find_definition_span(
+    tokens: &[(Token, Span)],
+    name: &str,
+    hover_offset: usize,
+    struct_context: Option<&str>,
+) -> Option<Span> {
+    // 1. Local backward search for variables or parameters
+    let hover_index = tokens
+        .iter()
+        .position(|(_, span)| span.lo <= hover_offset && hover_offset < span.hi);
+    if let Some(idx) = hover_index {
+        let is_member_access = idx > 0 && tokens[idx - 1].0 == Token::Dot;
+        let is_path_access = idx > 0 && tokens[idx - 1].0 == Token::DoubleColon;
+        let is_struct_field_name =
+            struct_context.is_some() && idx + 1 < tokens.len() && tokens[idx + 1].0 == Token::Colon;
+
+        if !is_member_access && !is_path_access && !is_struct_field_name {
+            let mut i = idx;
+            while i > 0 {
+                i -= 1;
+                if i + 1 < tokens.len() {
+                    if let Token::Ident(ref id) = tokens[i].0
+                        && id == name
+                        && i > 0
+                        && (tokens[i - 1].0 == Token::Let || tokens[i - 1].0 == Token::Mut)
+                    {
+                        return Some(tokens[i].1);
+                    }
+                    if let Token::Ident(ref id) = tokens[i + 1].0
+                        && id == name
+                        && tokens[i].0 == Token::Let
+                    {
+                        return Some(tokens[i + 1].1);
+                    }
+                }
+                if tokens[i].0 == Token::Fn {
+                    // Check parameters of this enclosing function boundary
+                    let mut j = i + 1;
+                    let mut in_params = false;
+                    while j < tokens.len()
+                        && tokens[j].0 != Token::LBrace
+                        && tokens[j].0 != Token::Semicolon
+                    {
+                        if tokens[j].0 == Token::LParen {
+                            in_params = true;
+                        } else if tokens[j].0 == Token::RParen {
+                            break;
+                        } else if in_params
+                            && let Token::Ident(ref id) = tokens[j].0
+                            && id == name
+                        {
+                            return Some(tokens[j].1);
+                        }
+                        j += 1;
+                    }
+                    break; // Stop local search at the function definition boundary
+                }
+            }
+        }
+    }
+
+    // 1b. Generic parameters search in enclosing scopes
+    if let Some(idx) = hover_index {
+        let scopes = collect_generic_scopes(tokens);
+        let mut matching_scopes = Vec::new();
+        for (start, end, params) in scopes {
+            if start <= idx && idx <= end {
+                matching_scopes.push((start, end, params));
+            }
+        }
+        // Sort by scope range size (end - start) ascending so innermost scopes come first
+        matching_scopes.sort_by_key(|(start, end, _)| end - start);
+        for (_, _, params) in matching_scopes {
+            if let Some(param) = params.iter().find(|p| p.name == name) {
+                return Some(param.span);
             }
         }
     }
@@ -452,12 +771,134 @@ fn find_definition_span(tokens: &[(Token, Span)], name: &str, hover_offset: usiz
     let mut i = 0;
     while i < tokens.len() {
         match &tokens[i].0 {
-            Token::Fn | Token::Struct | Token::Enum | Token::Trait | Token::Type | Token::Mod => {
+            Token::Fn | Token::Trait | Token::Type | Token::Mod => {
                 if i + 1 < tokens.len()
                     && let Token::Ident(ref id) = tokens[i + 1].0
                     && id == name
                 {
                     return Some(tokens[i + 1].1);
+                }
+            }
+            Token::Struct => {
+                let struct_name = if i + 1 < tokens.len() {
+                    if let Token::Ident(ref id) = tokens[i + 1].0 {
+                        Some(id.as_str())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                if let Some(s_name) = struct_name
+                    && s_name == name
+                {
+                    return Some(tokens[i + 1].1);
+                }
+
+                // Scan fields of the struct only if there is no struct_context OR the struct_name matches struct_context
+                let matches_context = match struct_context {
+                    Some(ctx) => struct_name == Some(ctx),
+                    None => true,
+                };
+
+                if matches_context {
+                    // Scan fields of the struct
+                    let mut j = i + 1;
+                    while j < tokens.len() && tokens[j].0 != Token::LBrace {
+                        j += 1;
+                    }
+                    if j < tokens.len() {
+                        j += 1; // move past LBrace
+                        let mut brace_depth = 1;
+                        let mut paren_depth = 0;
+                        let mut bracket_depth = 0;
+                        let mut lt_depth = 0;
+                        while j < tokens.len() && brace_depth > 0 {
+                            match &tokens[j].0 {
+                                Token::LBrace => brace_depth += 1,
+                                Token::RBrace => brace_depth -= 1,
+                                Token::LParen => paren_depth += 1,
+                                Token::RParen => paren_depth -= 1,
+                                Token::LBracket => bracket_depth += 1,
+                                Token::RBracket => bracket_depth -= 1,
+                                Token::Lt => lt_depth += 1,
+                                Token::Gt => lt_depth -= 1,
+                                Token::Ident(id)
+                                    if brace_depth == 1
+                                        && paren_depth == 0
+                                        && bracket_depth == 0
+                                        && lt_depth == 0
+                                        && id == name =>
+                                {
+                                    return Some(tokens[j].1);
+                                }
+                                _ => {}
+                            }
+                            j += 1;
+                        }
+                    }
+                }
+            }
+            Token::Enum => {
+                let enum_name = if i + 1 < tokens.len() {
+                    if let Token::Ident(ref id) = tokens[i + 1].0 {
+                        Some(id.as_str())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                if let Some(e_name) = enum_name
+                    && e_name == name
+                {
+                    return Some(tokens[i + 1].1);
+                }
+
+                // Scan variants of the enum only if there is no struct_context OR the enum_name matches struct_context
+                let matches_context = match struct_context {
+                    Some(ctx) => enum_name == Some(ctx),
+                    None => true,
+                };
+
+                if matches_context {
+                    // Scan variants of the enum
+                    let mut j = i + 1;
+                    while j < tokens.len() && tokens[j].0 != Token::LBrace {
+                        j += 1;
+                    }
+                    if j < tokens.len() {
+                        j += 1; // move past LBrace
+                        let mut brace_depth = 1;
+                        let mut paren_depth = 0;
+                        let mut bracket_depth = 0;
+                        let mut lt_depth = 0;
+                        while j < tokens.len() && brace_depth > 0 {
+                            match &tokens[j].0 {
+                                Token::LBrace => brace_depth += 1,
+                                Token::RBrace => brace_depth -= 1,
+                                Token::LParen => paren_depth += 1,
+                                Token::RParen => paren_depth -= 1,
+                                Token::LBracket => bracket_depth += 1,
+                                Token::RBracket => bracket_depth -= 1,
+                                Token::Lt => lt_depth += 1,
+                                Token::Gt => lt_depth -= 1,
+                                Token::Ident(id)
+                                    if brace_depth == 1
+                                        && paren_depth == 0
+                                        && bracket_depth == 0
+                                        && lt_depth == 0
+                                        && id == name =>
+                                {
+                                    return Some(tokens[j].1);
+                                }
+                                _ => {}
+                            }
+                            j += 1;
+                        }
+                    }
                 }
             }
             _ => {}
@@ -610,13 +1051,44 @@ fn handle_hover(
         }
     }
 
-    let hovered_token = tokens
+    let hovered_idx = tokens
         .iter()
-        .find(|(_, span)| span.lo <= offset && offset <= span.hi)?;
+        .position(|(_, span)| span.lo <= offset && offset < span.hi)?;
+    let hovered_token = &tokens[hovered_idx];
 
     if let Token::Ident(ref name) = hovered_token.0 {
+        let struct_context = get_struct_context(&tokens, hovered_idx);
+
+        // 1. Try to resolve path prefix if one exists
+        let path_prefix = get_path_prefix(&tokens, hovered_idx);
+        if !path_prefix.is_empty() {
+            let mut resolved_path = path_prefix.clone();
+            if let Some(prog) = &doc.last_valid_program {
+                resolved_path = resolve_prefix_to_full_path(&prog.uses, &path_prefix);
+            }
+            if let Some((_, target_entry)) = find_stdlib_entry_by_path(stdlib_cache, &resolved_path)
+                && let Some(contents) = get_hover_text_from_program(
+                    &target_entry.program,
+                    name,
+                    struct_context.as_deref(),
+                )
+            {
+                return Some(Hover {
+                    contents: HoverContents::Markup(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: contents,
+                    }),
+                    range: Some(Range::new(
+                        offset_to_position(&doc.source, hovered_token.1.lo),
+                        offset_to_position(&doc.source, hovered_token.1.hi),
+                    )),
+                });
+            }
+        }
+
+        // 2. Fallback: Search locally in current file
         let hover_text = if let Some(prog) = &doc.last_valid_program {
-            get_hover_text_from_program(prog, name)
+            get_hover_text_from_program(prog, name, struct_context.as_deref())
         } else {
             None
         };
@@ -634,8 +1106,10 @@ fn handle_hover(
             });
         }
 
-        // Fallback: search stdlib cache
-        if let Some(stdlib_text) = get_hover_text_from_stdlib(stdlib_cache, name) {
+        // 3. Fallback: Search globally in the standard library cache
+        if let Some(stdlib_text) =
+            get_hover_text_from_stdlib(stdlib_cache, name, struct_context.as_deref())
+        {
             return Some(Hover {
                 contents: HoverContents::Markup(MarkupContent {
                     kind: MarkupKind::Markdown,
@@ -701,9 +1175,13 @@ fn find_stdlib_root() -> std::path::PathBuf {
 }
 
 /// Search for a definition in the stdlib cache.
-fn find_stdlib_definition(cache: &StdlibCache, name: &str) -> Option<(Url, Range)> {
+fn find_stdlib_definition(
+    cache: &StdlibCache,
+    name: &str,
+    struct_context: Option<&str>,
+) -> Option<(Url, Range)> {
     for (url, entry) in &cache.entries {
-        if get_hover_text_from_program(&entry.program, name).is_some() {
+        if get_hover_text_from_program(&entry.program, name, struct_context).is_some() {
             // Token-based search for exact span
             let mut lexer = Lexer::new(&entry.source);
             let mut tokens = Vec::new();
@@ -718,7 +1196,7 @@ fn find_stdlib_definition(cache: &StdlibCache, name: &str) -> Option<(Url, Range
                     Err(_) => break,
                 }
             }
-            if let Some(def_span) = find_definition_span(&tokens, name, 0) {
+            if let Some(def_span) = find_definition_span(&tokens, name, 0, struct_context) {
                 let start = offset_to_position(&entry.source, def_span.lo);
                 let end = offset_to_position(&entry.source, def_span.hi);
                 let range = Range::new(start, end);
@@ -730,9 +1208,13 @@ fn find_stdlib_definition(cache: &StdlibCache, name: &str) -> Option<(Url, Range
 }
 
 /// Search for hover text in the stdlib cache.
-fn get_hover_text_from_stdlib(cache: &StdlibCache, name: &str) -> Option<String> {
+fn get_hover_text_from_stdlib(
+    cache: &StdlibCache,
+    name: &str,
+    struct_context: Option<&str>,
+) -> Option<String> {
     for (_, entry) in &cache.entries {
-        if let Some(text) = get_hover_text_recursive(&entry.program, name) {
+        if let Some(text) = get_hover_text_recursive(&entry.program, name, struct_context) {
             return Some(text);
         }
     }
@@ -765,20 +1247,66 @@ fn handle_definition(
         }
     }
 
-    let clicked_token = tokens
+    let clicked_idx = tokens
         .iter()
-        .find(|(_, span)| span.lo <= offset && offset <= span.hi)?;
+        .position(|(_, span)| span.lo <= offset && offset < span.hi)?;
+    let clicked_token = &tokens[clicked_idx];
 
     if let Token::Ident(ref name) = clicked_token.0 {
-        if let Some(def_span) = find_definition_span(&tokens, name, offset) {
+        let struct_context = get_struct_context(&tokens, clicked_idx);
+
+        // 1. Try to resolve path prefix if one exists
+        let path_prefix = get_path_prefix(&tokens, clicked_idx);
+        if !path_prefix.is_empty() {
+            let mut resolved_path = path_prefix.clone();
+            if let Some(prog) = &doc.last_valid_program {
+                resolved_path = resolve_prefix_to_full_path(&prog.uses, &path_prefix);
+            }
+            if let Some((target_url, target_entry)) =
+                find_stdlib_entry_by_path(stdlib_cache, &resolved_path)
+            {
+                // Token-based search in target stdlib entry
+                let mut target_lexer = Lexer::new(&target_entry.source);
+                let mut target_tokens = Vec::new();
+                loop {
+                    match target_lexer.next_token() {
+                        Ok((token, span)) => {
+                            target_tokens.push((token, span));
+                            if let Token::Eof = target_tokens.last().unwrap().0 {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                if let Some(def_span) =
+                    find_definition_span(&target_tokens, name, 0, struct_context.as_deref())
+                {
+                    let start = offset_to_position(&target_entry.source, def_span.lo);
+                    let end = offset_to_position(&target_entry.source, def_span.hi);
+                    let range = Range::new(start, end);
+                    let file_uri = target_url.to_string().parse::<Uri>().unwrap();
+                    return Some(GotoDefinitionResponse::Scalar(Location::new(
+                        file_uri, range,
+                    )));
+                }
+            }
+        }
+
+        // 2. Fallback: Search locally in the current file
+        if let Some(def_span) =
+            find_definition_span(&tokens, name, offset, struct_context.as_deref())
+        {
             let start = offset_to_position(&doc.source, def_span.lo);
             let end = offset_to_position(&doc.source, def_span.hi);
             let range = Range::new(start, end);
             return Some(GotoDefinitionResponse::Scalar(Location::new(uri, range)));
         }
 
-        // Fallback: Search the standard library cache
-        if let Some((file_url, range)) = find_stdlib_definition(stdlib_cache, name) {
+        // 3. Fallback: Search globally in the standard library cache
+        if let Some((file_url, range)) =
+            find_stdlib_definition(stdlib_cache, name, struct_context.as_deref())
+        {
             let file_uri = file_url.to_string().parse::<Uri>().unwrap();
             return Some(GotoDefinitionResponse::Scalar(Location::new(
                 file_uri, range,
@@ -972,19 +1500,19 @@ mod tests {
         let prog = parser.parse_program().unwrap();
 
         // 1. Check mod hover text
-        let mod_hover = get_hover_text_from_program(&prog, "mymod");
+        let mod_hover = get_hover_text_from_program(&prog, "mymod", None);
         assert!(mod_hover.is_some());
         let mod_text = mod_hover.unwrap();
         assert!(mod_text.contains("pub mod mymod;"));
 
         // 2. Check pub fn hover text inside submodules (recursive)
-        let fn_hover = get_hover_text_from_program(&prog, "myfn");
+        let fn_hover = get_hover_text_from_program(&prog, "myfn", None);
         assert!(fn_hover.is_some());
         let fn_text = fn_hover.unwrap();
         assert!(fn_text.contains("pub fn myfn()"));
 
         // 3. Check definition span for mod in find_definition_span
-        let def_span = find_definition_span(&tokens, "mymod", 0);
+        let def_span = find_definition_span(&tokens, "mymod", 0, None);
         assert!(def_span.is_some());
     }
 
@@ -1006,13 +1534,13 @@ mod tests {
         let prog = parser.parse_program().unwrap();
 
         // 1. Check single extern hover text
-        let ext_hover = get_hover_text_from_program(&prog, "fork");
+        let ext_hover = get_hover_text_from_program(&prog, "fork", None);
         assert!(ext_hover.is_some());
         let ext_text = ext_hover.unwrap();
         assert!(ext_text.contains("pub extern \"C\" fn fork() -> i32"));
 
         // 2. Check definition span for single extern
-        let def_span = find_definition_span(&tokens, "fork", 0);
+        let def_span = find_definition_span(&tokens, "fork", 0, None);
         assert!(def_span.is_some());
     }
 
@@ -1037,21 +1565,21 @@ mod tests {
         }
 
         // Find method 'bar' inside impl block
-        let span_bar = find_definition_span(&tokens, "bar", 0);
+        let span_bar = find_definition_span(&tokens, "bar", 0, None);
         assert!(
             span_bar.is_some(),
             "should find 'bar' method definition inside impl"
         );
 
         // Find method 'baz' inside impl block (no pub)
-        let span_baz = find_definition_span(&tokens, "baz", 0);
+        let span_baz = find_definition_span(&tokens, "baz", 0, None);
         assert!(
             span_baz.is_some(),
             "should find 'baz' method definition inside impl"
         );
 
         // Find struct 'Foo' definition alongside impl
-        let span_foo = find_definition_span(&tokens, "Foo", 0);
+        let span_foo = find_definition_span(&tokens, "Foo", 0, None);
         assert!(span_foo.is_some(), "should find 'Foo' struct definition");
     }
 
@@ -1076,7 +1604,7 @@ mod tests {
             .map(|i| tokens[i].1.lo)
             .unwrap_or(0);
 
-        let def_span = find_definition_span(&tokens, "x", second_x_offset);
+        let def_span = find_definition_span(&tokens, "x", second_x_offset, None);
         assert!(
             def_span.is_some(),
             "should find 'x' let-binding definition from usage"
@@ -1095,7 +1623,7 @@ mod tests {
 
         // Verify we get expected modules by checking hover text
         // io.u should export `print` and `println`
-        let print_hover = get_hover_text_from_stdlib(&cache, "print");
+        let print_hover = get_hover_text_from_stdlib(&cache, "print", None);
         assert!(print_hover.is_some(), "should find 'print' in stdlib");
         let print_text = print_hover.unwrap();
         assert!(
@@ -1104,7 +1632,7 @@ mod tests {
         );
 
         // option.u should export `Option` enum
-        let option_hover = get_hover_text_from_stdlib(&cache, "Option");
+        let option_hover = get_hover_text_from_stdlib(&cache, "Option", None);
         assert!(option_hover.is_some(), "should find 'Option' in stdlib");
         let option_text = option_hover.unwrap();
         assert!(
@@ -1113,7 +1641,7 @@ mod tests {
         );
 
         // panic.u should export `panic` function
-        let panic_hover = get_hover_text_from_stdlib(&cache, "panic");
+        let panic_hover = get_hover_text_from_stdlib(&cache, "panic", None);
         assert!(panic_hover.is_some(), "should find 'panic' in stdlib");
         let panic_text = panic_hover.unwrap();
         assert!(
@@ -1122,19 +1650,19 @@ mod tests {
         );
 
         // alloc.u should export `malloc`, `free`, `realloc`, `memcpy`
-        let malloc_hover = get_hover_text_from_stdlib(&cache, "malloc");
+        let malloc_hover = get_hover_text_from_stdlib(&cache, "malloc", None);
         assert!(malloc_hover.is_some(), "should find 'malloc' in stdlib");
         assert!(malloc_hover.unwrap().contains("fn malloc"));
 
-        let free_hover = get_hover_text_from_stdlib(&cache, "free");
+        let free_hover = get_hover_text_from_stdlib(&cache, "free", None);
         assert!(free_hover.is_some(), "should find 'free' in stdlib");
         assert!(free_hover.unwrap().contains("fn free"));
 
         // process.u should export `exit`, `Command`
-        let exit_hover = get_hover_text_from_stdlib(&cache, "exit");
+        let exit_hover = get_hover_text_from_stdlib(&cache, "exit", None);
         assert!(exit_hover.is_some(), "should find 'exit' in stdlib");
 
-        let command_hover = get_hover_text_from_stdlib(&cache, "Command");
+        let command_hover = get_hover_text_from_stdlib(&cache, "Command", None);
         assert!(command_hover.is_some(), "should find 'Command' in stdlib");
     }
 
@@ -1144,7 +1672,7 @@ mod tests {
         let cache = load_stdlib_cache();
 
         // Try to find definition of 'print' in stdlib
-        let def = find_stdlib_definition(&cache, "print");
+        let def = find_stdlib_definition(&cache, "print", None);
         assert!(
             def.is_some(),
             "should find definition for 'print' in stdlib"
@@ -1165,7 +1693,7 @@ mod tests {
         );
 
         // Find definition of 'Option' enum
-        let option_def = find_stdlib_definition(&cache, "Option");
+        let option_def = find_stdlib_definition(&cache, "Option", None);
         assert!(
             option_def.is_some(),
             "should find definition for 'Option' in stdlib"
@@ -1179,7 +1707,7 @@ mod tests {
         );
 
         // Find definition of 'malloc' which is extern "C"
-        let malloc_def = find_stdlib_definition(&cache, "malloc");
+        let malloc_def = find_stdlib_definition(&cache, "malloc", None);
         assert!(
             malloc_def.is_some(),
             "should find definition for 'malloc' in stdlib"
@@ -1199,7 +1727,7 @@ mod tests {
         let cache = load_stdlib_cache();
 
         // Option::unwrap is defined inside impl<T> Option<T> { ... }
-        let unwrap_def = find_stdlib_definition(&cache, "unwrap");
+        let unwrap_def = find_stdlib_definition(&cache, "unwrap", None);
         assert!(
             unwrap_def.is_some(),
             "should find 'unwrap' method inside impl block in stdlib"
@@ -1215,7 +1743,7 @@ mod tests {
         );
 
         // Vec::push is defined inside impl<T> Vec<T> { ... }
-        let push_def = find_stdlib_definition(&cache, "push");
+        let push_def = find_stdlib_definition(&cache, "push", None);
         assert!(
             push_def.is_some(),
             "should find 'push' method inside impl block in stdlib"
@@ -1227,5 +1755,466 @@ mod tests {
             "push definition should be in vec.u, got {:?}",
             push_path
         );
+    }
+
+    #[test]
+    fn test_get_path_prefix() {
+        let src = "std::vec::Vec::with_capacity(cap)";
+        let mut tokens = Vec::new();
+        let mut lexer = Lexer::new(src);
+        loop {
+            let (t, s) = lexer.next_token().unwrap();
+            tokens.push((t, s));
+            if tokens.last().unwrap().0 == Token::Eof {
+                break;
+            }
+        }
+        let with_cap_idx = tokens
+            .iter()
+            .position(|(tok, _)| matches!(tok, Token::Ident(id) if id == "with_capacity"))
+            .unwrap();
+        let prefix = get_path_prefix(&tokens, with_cap_idx);
+        assert_eq!(
+            prefix,
+            vec!["std".to_string(), "vec".to_string(), "Vec".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_resolve_prefix_to_full_path() {
+        let uses = vec![crate::ast::Use {
+            path: vec!["std".to_string(), "vec".to_string(), "Vec".to_string()],
+            is_pub: false,
+            module_path: Vec::new(),
+            span: Span::new(0, 0),
+        }];
+        let resolved = resolve_prefix_to_full_path(&uses, &["Vec".to_string()]);
+        assert_eq!(
+            resolved,
+            vec!["std".to_string(), "vec".to_string(), "Vec".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_path_prefixed_definition_navigation() {
+        let cache = load_stdlib_cache();
+        let mut documents = HashMap::new();
+        let doc_url = Url::parse("file:///home/user/project/main.u").unwrap();
+        let src = "use std::vec::Vec;\nfn main() {\n    Vec::with_capacity(10);\n}";
+        let diags = update_document(&mut documents, doc_url.clone(), src.to_string());
+        assert!(
+            diags.is_empty(),
+            "Document should compile without diagnostics, but got: {:?}",
+            diags
+        );
+        let doc = documents.get(&doc_url).unwrap();
+        assert!(
+            doc.last_valid_program.is_some(),
+            "last_valid_program should be Some"
+        );
+
+        let position = Position::new(2, 9); // line 2 (0-indexed), char 9
+        let params = GotoDefinitionParams {
+            text_document_position_params: lsp_types::TextDocumentPositionParams {
+                text_document: lsp_types::TextDocumentIdentifier {
+                    uri: doc_url.to_string().parse().unwrap(),
+                },
+                position,
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+
+        let response = handle_definition(&documents, &cache, params);
+        assert!(
+            response.is_some(),
+            "Should find definition for Vec::with_capacity"
+        );
+        if let Some(GotoDefinitionResponse::Scalar(location)) = response {
+            let url = Url::parse(location.uri.as_str()).unwrap();
+            let path = url.to_file_path().unwrap();
+            assert!(
+                path.to_string_lossy().contains("vec.u"),
+                "Should navigate to vec.u, got {:?}",
+                path
+            );
+        } else {
+            panic!("Expected Scalar response");
+        }
+    }
+
+    #[test]
+    fn test_enum_variant_definition_navigation() {
+        let cache = load_stdlib_cache();
+        let mut documents = HashMap::new();
+        let doc_url = Url::parse("file:///home/user/project/main.u").unwrap();
+        let src = "use std::option::Option;\nfn main() {\n    let val = Option::Some(42);\n}";
+        update_document(&mut documents, doc_url.clone(), src.to_string());
+
+        let position = Position::new(2, 22);
+        let params = GotoDefinitionParams {
+            text_document_position_params: lsp_types::TextDocumentPositionParams {
+                text_document: lsp_types::TextDocumentIdentifier {
+                    uri: doc_url.to_string().parse().unwrap(),
+                },
+                position,
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+
+        let response = handle_definition(&documents, &cache, params);
+        assert!(
+            response.is_some(),
+            "Should find definition for Option::Some"
+        );
+        if let Some(GotoDefinitionResponse::Scalar(location)) = response {
+            let url = Url::parse(location.uri.as_str()).unwrap();
+            let path = url.to_file_path().unwrap();
+            assert!(
+                path.to_string_lossy().contains("option.u"),
+                "Should navigate to option.u, got {:?}",
+                path
+            );
+        } else {
+            panic!("Expected Scalar response");
+        }
+
+        let hover_params = HoverParams {
+            text_document_position_params: lsp_types::TextDocumentPositionParams {
+                text_document: lsp_types::TextDocumentIdentifier {
+                    uri: doc_url.to_string().parse().unwrap(),
+                },
+                position,
+            },
+            work_done_progress_params: Default::default(),
+        };
+        let hover_res = handle_hover(&documents, &cache, hover_params);
+        assert!(hover_res.is_some(), "Should find hover for Option::Some");
+        if let Some(hover) = hover_res {
+            if let HoverContents::Markup(markup) = hover.contents {
+                assert!(
+                    markup.value.contains("Some(T)") || markup.value.contains("Some"),
+                    "Hover text should contain Some(T), got: {}",
+                    markup.value
+                );
+            } else {
+                panic!("Expected Markup contents");
+            }
+        }
+    }
+
+    #[test]
+    fn test_member_method_navigation() {
+        let cache = load_stdlib_cache();
+        let mut documents = HashMap::new();
+        let doc_url = Url::parse("file:///home/user/project/main.u").unwrap();
+        let src = "use std::slice;\nfn foo(args: &[i32]) {\n    let len = args.len();\n}";
+        update_document(&mut documents, doc_url.clone(), src.to_string());
+
+        let position = Position::new(2, 19);
+        let params = GotoDefinitionParams {
+            text_document_position_params: lsp_types::TextDocumentPositionParams {
+                text_document: lsp_types::TextDocumentIdentifier {
+                    uri: doc_url.to_string().parse().unwrap(),
+                },
+                position,
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+
+        let response = handle_definition(&documents, &cache, params);
+        assert!(response.is_some(), "Should find definition for .len()");
+        if let Some(GotoDefinitionResponse::Scalar(location)) = response {
+            let url = Url::parse(location.uri.as_str()).unwrap();
+            let path = url.to_file_path().unwrap();
+            assert!(
+                path.to_string_lossy().contains("slice.u"),
+                "Should navigate to slice.u, got {:?}",
+                path
+            );
+        } else {
+            panic!("Expected Scalar response");
+        }
+    }
+
+    #[test]
+    fn test_struct_field_navigation_and_hover() {
+        let cache = load_stdlib_cache();
+        let mut documents = HashMap::new();
+        let doc_url = Url::parse("file:///home/user/project/main.u").unwrap();
+        let src = "struct Point { x: i32, y: i32 }\nfn main() {\n    let p = Point { x: 10, y: 20 };\n    let val = p.x;\n}";
+        update_document(&mut documents, doc_url.clone(), src.to_string());
+
+        let position = Position::new(3, 16);
+        let params = GotoDefinitionParams {
+            text_document_position_params: lsp_types::TextDocumentPositionParams {
+                text_document: lsp_types::TextDocumentIdentifier {
+                    uri: doc_url.to_string().parse().unwrap(),
+                },
+                position,
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+
+        let response = handle_definition(&documents, &cache, params);
+        assert!(
+            response.is_some(),
+            "Should find definition for struct field x"
+        );
+        if let Some(GotoDefinitionResponse::Scalar(location)) = response {
+            let url = Url::parse(location.uri.as_str()).unwrap();
+            assert_eq!(url, doc_url);
+            assert_eq!(location.range.start.line, 0);
+            assert_eq!(location.range.start.character, 15);
+        } else {
+            panic!("Expected Scalar response");
+        }
+
+        let hover_params = HoverParams {
+            text_document_position_params: lsp_types::TextDocumentPositionParams {
+                text_document: lsp_types::TextDocumentIdentifier {
+                    uri: doc_url.to_string().parse().unwrap(),
+                },
+                position,
+            },
+            work_done_progress_params: Default::default(),
+        };
+        let hover_res = handle_hover(&documents, &cache, hover_params);
+        assert!(hover_res.is_some(), "Should find hover for struct field x");
+        if let Some(hover) = hover_res {
+            if let HoverContents::Markup(markup) = hover.contents {
+                assert!(
+                    markup.value.contains("struct Point") && markup.value.contains("x: i32"),
+                    "Hover text should contain struct Point and x: i32, got: {}",
+                    markup.value
+                );
+            } else {
+                panic!("Expected Markup contents");
+            }
+        }
+    }
+
+    #[test]
+    fn test_struct_field_context_navigation() {
+        let cache = load_stdlib_cache();
+        let mut documents = HashMap::new();
+        let doc_url = Url::parse("file:///home/user/project/main.u").unwrap();
+        let src = r#"
+            struct Iter { ptr: *mut u8, end: *mut u8 }
+            struct IterMut { ptr: *mut u8, end: *mut u8 }
+            fn main() {
+                let it = IterMut { ptr: 0 as *mut u8, end: 0 as *mut u8 };
+            }
+        "#;
+        update_document(&mut documents, doc_url.clone(), src.to_string());
+
+        let position = Position::new(4, 35);
+        let params = GotoDefinitionParams {
+            text_document_position_params: lsp_types::TextDocumentPositionParams {
+                text_document: lsp_types::TextDocumentIdentifier {
+                    uri: doc_url.to_string().parse().unwrap(),
+                },
+                position,
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+
+        let response = handle_definition(&documents, &cache, params);
+        assert!(
+            response.is_some(),
+            "Should find definition for struct field ptr"
+        );
+        if let Some(GotoDefinitionResponse::Scalar(location)) = response {
+            let url = Url::parse(location.uri.as_str()).unwrap();
+            assert_eq!(url, doc_url);
+            assert_eq!(location.range.start.line, 2);
+            assert_eq!(location.range.start.character, 29);
+        } else {
+            panic!("Expected Scalar response");
+        }
+    }
+
+    #[test]
+    fn test_struct_field_vs_local_variable_navigation() {
+        let cache = load_stdlib_cache();
+        let mut documents = HashMap::new();
+        let doc_url = Url::parse("file:///home/user/project/main.u").unwrap();
+        let src = r#"
+            struct Iter { ptr: *mut u8, end: *mut u8 }
+            fn main() {
+                let end = 0 as *mut u8;
+                let it = Iter { ptr: end, end: end };
+            }
+        "#;
+        update_document(&mut documents, doc_url.clone(), src.to_string());
+
+        // 1. Click on the first `end` (the field name) at line 4, character 42
+        let params_field = GotoDefinitionParams {
+            text_document_position_params: lsp_types::TextDocumentPositionParams {
+                text_document: lsp_types::TextDocumentIdentifier {
+                    uri: doc_url.to_string().parse().unwrap(),
+                },
+                position: Position::new(4, 42),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+
+        let response_field = handle_definition(&documents, &cache, params_field);
+        assert!(
+            response_field.is_some(),
+            "Should find definition for struct field end"
+        );
+        if let Some(GotoDefinitionResponse::Scalar(location)) = response_field {
+            assert_eq!(location.range.start.line, 1);
+            assert_eq!(location.range.start.character, 40);
+        } else {
+            panic!("Expected Scalar response for field");
+        }
+
+        // 2. Click on the second `end` (the variable) at line 4, character 47
+        let params_var = GotoDefinitionParams {
+            text_document_position_params: lsp_types::TextDocumentPositionParams {
+                text_document: lsp_types::TextDocumentIdentifier {
+                    uri: doc_url.to_string().parse().unwrap(),
+                },
+                position: Position::new(4, 47),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+
+        let response_var = handle_definition(&documents, &cache, params_var);
+        assert!(
+            response_var.is_some(),
+            "Should find definition for local variable end"
+        );
+        if let Some(GotoDefinitionResponse::Scalar(location)) = response_var {
+            assert_eq!(location.range.start.line, 3);
+            assert_eq!(location.range.start.character, 20);
+        } else {
+            panic!("Expected Scalar response for variable");
+        }
+    }
+
+    #[test]
+    fn test_generic_param_navigation() {
+        let cache = load_stdlib_cache();
+        let mut documents = HashMap::new();
+        let doc_url = Url::parse("file:///home/user/project/main.u").unwrap();
+        let src = r#"
+            pub enum Option<T> {
+                Some(T),
+                None,
+            }
+            impl<T> Option<T> {
+                pub fn unwrap(&self) -> T {
+                    match *self {
+                        Option::Some(val) => val,
+                        Option::None => {
+                            panic("error");
+                        }
+                    }
+                }
+            }
+        "#;
+        update_document(&mut documents, doc_url.clone(), src.to_string());
+
+        // 1. Click on generic T inside Option<T> definition on line 2 (Some(T)):
+        // "                Some(T),"
+        // 16 spaces + `Some(` (5 chars) = 21. Let's click at line 2, character 21.
+        let params_enum = GotoDefinitionParams {
+            text_document_position_params: lsp_types::TextDocumentPositionParams {
+                text_document: lsp_types::TextDocumentIdentifier {
+                    uri: doc_url.to_string().parse().unwrap(),
+                },
+                position: Position::new(2, 21),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+
+        let response_enum = handle_definition(&documents, &cache, params_enum);
+        assert!(response_enum.is_some(), "Should find definition for generic T in enum");
+        if let Some(GotoDefinitionResponse::Scalar(location)) = response_enum {
+            assert_eq!(location.range.start.line, 1); // pub enum Option<T>
+            assert_eq!(location.range.start.character, 28); // generic T is at character index 28 (12 spaces + `pub enum Option<` is 28)
+        } else {
+            panic!("Expected Scalar response for generic T in enum");
+        }
+
+        // 2. Click on generic T inside unwrap return type on line 6 (-> T):
+        // "                pub fn unwrap(&self) -> T {"
+        // 16 spaces + `pub fn unwrap(&self) -> ` (24 chars) = 40.
+        let params_impl = GotoDefinitionParams {
+            text_document_position_params: lsp_types::TextDocumentPositionParams {
+                text_document: lsp_types::TextDocumentIdentifier {
+                    uri: doc_url.to_string().parse().unwrap(),
+                },
+                position: Position::new(6, 40),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+
+        let response_impl = handle_definition(&documents, &cache, params_impl);
+        assert!(response_impl.is_some(), "Should find definition for generic T in impl block");
+        if let Some(GotoDefinitionResponse::Scalar(location)) = response_impl {
+            assert_eq!(location.range.start.line, 5); // impl<T> Option<T>
+            assert_eq!(location.range.start.character, 17); // generic T is at character index 17 (12 spaces + `impl<` is 17)
+        } else {
+            panic!("Expected Scalar response for generic T in impl block");
+        }
+    }
+
+    #[test]
+    fn test_const_generic_param_navigation() {
+        let cache = load_stdlib_cache();
+        let mut documents = HashMap::new();
+        let doc_url = Url::parse("file:///home/user/project/main.u").unwrap();
+        let src = r#"
+            impl<T, const L: usize> [T; L] {
+                fn len(&self) -> usize {
+                    L
+                }
+            }
+        "#;
+        update_document(&mut documents, doc_url.clone(), src.to_string());
+
+        // Click on const generic param L inside the function body on line 3:
+        // "                    L"
+        // 20 spaces. Click at line 3, character 20.
+        let params = GotoDefinitionParams {
+            text_document_position_params: lsp_types::TextDocumentPositionParams {
+                text_document: lsp_types::TextDocumentIdentifier {
+                    uri: doc_url.to_string().parse().unwrap(),
+                },
+                position: Position::new(3, 20),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+
+        let mut lexer = Lexer::new(&src);
+        let mut tokens = Vec::new();
+        while let Ok((tok, span)) = lexer.next_token() {
+            tokens.push((tok.clone(), span));
+            if matches!(tok, Token::Eof) {
+                break;
+            }
+        }
+        let scopes = collect_generic_scopes(&tokens);
+        let response = handle_definition(&documents, &cache, params);
+        assert!(response.is_some(), "Should find definition for const generic L\nTokens: {:#?}\nScopes: {:#?}", tokens, scopes);
+        if let Some(GotoDefinitionResponse::Scalar(location)) = response {
+            assert_eq!(location.range.start.line, 1); // impl<T, const L: usize>
+            assert_eq!(location.range.start.character, 26); // L is at character index 26 (12 spaces + `impl<T, const ` is 26)
+        } else {
+            panic!("Expected Scalar response for const generic L");
+        }
     }
 }

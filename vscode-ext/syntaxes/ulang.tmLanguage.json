@@ -258,7 +258,7 @@
       "patterns": [
         {
           "name": "keyword.other.underscore.u",
-          "match": "_"
+          "match": "\\b_\\b"
         }
       ]
     }

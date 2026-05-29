@@ -6,6 +6,8 @@
 
 **Target Platform**: ulang officially supports targeting Linux only. Support for Windows and other operating systems is only guaranteed when using `cosmocc` as the linker. The standard library is written specifically for Linux, making direct use of Linux syscalls, POSIX calls, and `libc`.
 
+**vscode-ext**: The VS Code extension located in `./vscode-ext/` provides syntax highlighting and LSP integration for `ulang`. The LSP extension connects to the compiler's own built-in Language Server (`ulang lsp`). Deno must be installed system-wide and is preferred over npm for development tasks inside this folder.
+
 **Design goal**: ulang's grammar & syntax should mostly be a subset of Rust, with minimal modifications. When adding new features, prefer Rust-compatible syntax over novel inventions.
 
 ## Architecture & Data Flow
@@ -58,6 +60,7 @@ fn main() -> i32 {
 | `root/stdlib/core/` | Core library: clean modules containing no `extern "C"` declarations or allocation dependencies |
 | `root/stdlib/std/` | Standard library: modules requiring `extern "C"` or allocation, and re-exporting `core` |
 | `target/` | Build artifacts (gitignored) |
+| `vscode-ext/` | VS Code extension source, containing TypeScript extension logic, configurations, and TextMate syntax highlighting |
 
 ## Development Commands
 
@@ -85,6 +88,16 @@ cargo clippy
 
 The default output for `build` is `a.out`; override with `-o <path>`.
 
+### VS Code Extension Development
+
+Use Deno (which must be installed system-wide) rather than npm for task execution.
+
+```shell
+# Compile VS Code extension using Deno
+cd vscode-ext
+deno run compile
+```
+
 ## Code Conventions & Common Patterns
 
 - **Error handling**: Functions propagate errors as `Result<(), String>`. The `main` function calls `process::exit(1)` on any error after printing diagnostics. No `thiserror` or `anyhow` — plain `String` errors.
@@ -109,11 +122,13 @@ The default output for `build` is `a.out`; override with `-o <path>`.
 | `src/error.rs` | `emit_error` — pretty source-level diagnostics |
 | `examples/calc.u` | Example program |
 | `Cargo.toml` | Single crate; depends on `inkwell 0.9` (LLVM 22), `clap 4`, `annotate-snippets 0.12` |
+| `vscode-ext/syntaxes/ulang.tmLanguage.json` | TextMate grammar rules for syntax highlighting |
+| `vscode-ext/src/extension.ts` | Entry point of the VS Code extension, launches the ulang LSP client |
 
 ## Runtime/Tooling Preferences
 
-- **Required**: Linux operating system (targeting Linux is required; Windows and other OS support is only guaranteed when using `cosmocc` as the linker), Rust toolchain (edition 2024), LLVM 22 (via `inkwell`), linker.
-- **Package manager**: Cargo.
+- **Required**: Linux operating system (targeting Linux is required; Windows and other OS support is only guaranteed when using `cosmocc` as the linker), Rust toolchain (edition 2024), LLVM 22 (via `inkwell`), linker. Also requires Deno installed system-wide for VS Code extension tasks.
+- **Package manager**: Cargo. For the VS Code extension, prefer Deno over npm.
 - **Formatter**: `cargo fmt` (default).
 - **Linter**: `cargo clippy` (default).
 

@@ -8,17 +8,23 @@ import {
 let client: LanguageClient | undefined;
 
 export function activate(context: vscode.ExtensionContext) {
-    console.log('vscode-ulang extension is now active!');
+    console.log('ulang extension is now active!');
 
     function startLanguageServer() {
         const config = vscode.workspace.getConfiguration('ulang');
         const executablePath = config.get<string>('executablePath') || 'ulang';
+        const rootPath = config.get<string>('rootPath');
 
         console.log(`Starting ulang LSP server with executable: ${executablePath}`);
 
+        const env: Record<string, string> = { ...process.env } as Record<string, string>;
+        if (rootPath) {
+            env['ULANG_ROOT'] = rootPath;
+        }
+
         const serverOptions: ServerOptions = {
-            run: { command: executablePath, args: ['lsp'] },
-            debug: { command: executablePath, args: ['lsp'] }
+            run: { command: executablePath, args: ['lsp'], options: { env } },
+            debug: { command: executablePath, args: ['lsp'], options: { env } }
         };
 
         const clientOptions: LanguageClientOptions = {
@@ -46,10 +52,14 @@ export function activate(context: vscode.ExtensionContext) {
 
     context.subscriptions.push(
         vscode.workspace.onDidChangeConfiguration(async (event) => {
-            if (event.affectsConfiguration('ulang.executablePath')) {
-                vscode.window.showInformationMessage(
-                    'ulang executable path changed. Restarting language server...'
-                );
+            if (
+                event.affectsConfiguration('ulang.executablePath') ||
+                event.affectsConfiguration('ulang.rootPath')
+            ) {
+                const message = event.affectsConfiguration('ulang.rootPath')
+                    ? 'ulang root path changed. Restarting language server...'
+                    : 'ulang executable path changed. Restarting language server...';
+                vscode.window.showInformationMessage(message);
                 if (client) {
                     try {
                         await client.stop();

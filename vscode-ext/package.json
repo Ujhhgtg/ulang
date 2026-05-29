@@ -34,27 +34,32 @@
             }
         ],
         "configuration": {
-            "title": "Ulang",
+            "title": "ulang",
             "properties": {
                 "ulang.executablePath": {
                     "type": "string",
                     "default": "ulang",
                     "description": "Path to the ulang compiler binary. Can be a command on PATH (like 'ulang') or a relative/absolute path (like './target/debug/ulang')."
+                },
+                "ulang.rootPath": {
+                    "type": "string",
+                    "default": "",
+                    "description": "Path to the ULANG_ROOT directory containing standard libraries (stdlib)."
                 }
             }
         }
     },
     "scripts": {
-        "vscode:prepublish": "npm run compile",
+        "vscode:prepublish": "deno run compile",
         "compile": "tsc -p ./",
         "watch": "tsc -watch -p ./"
     },
     "dependencies": {
-        "vscode-languageclient": "^8.1.0"
+        "vscode-languageclient": "^9"
     },
     "devDependencies": {
-        "@types/node": "^18.0.0",
-        "@types/vscode": "^1.75.0",
-        "typescript": "^5.0.0"
+        "@types/node": "^25",
+        "@types/vscode": "^1",
+        "typescript": "^6"
     }
 }

@@ -653,34 +653,51 @@ fn handle_hover(
 }
 
 fn find_stdlib_root() -> std::path::PathBuf {
+    let check_dir = |path: std::path::PathBuf| -> Option<std::path::PathBuf> {
+        if path.is_dir() {
+            Some(std::fs::canonicalize(&path).unwrap_or(path))
+        } else {
+            None
+        }
+    };
+
+    // 1. Try $ULANG_ROOT
     if let Ok(val) = std::env::var("ULANG_ROOT") {
         let root_path = std::path::PathBuf::from(val);
-        let candidate1 = root_path.join("stdlib");
-        if candidate1.is_dir() {
-            return candidate1;
+        if let Some(p) = check_dir(root_path.join("stdlib")) {
+            return p;
         }
-        let candidate2 = root_path.join("root").join("stdlib");
-        if candidate2.is_dir() {
-            return candidate2;
+        if let Some(p) = check_dir(root_path.join("root").join("stdlib")) {
+            return p;
         }
-        return candidate1;
-    }
-    if let Ok(mut dir) = std::env::current_dir() {
-        loop {
-            let candidate1 = dir.join("root").join("stdlib");
-            if candidate1.is_dir() {
-                return candidate1;
-            }
-            let candidate2 = dir.join("stdlib");
-            if candidate2.is_dir() {
-                return candidate2;
-            }
-            if !dir.pop() {
-                break;
-            }
+        if let Some(p) = check_dir(root_path.clone()) {
+            return p;
         }
     }
-    std::path::PathBuf::from("root/stdlib")
+
+    // 2. Try ./root
+    let root_path = std::path::PathBuf::from("root");
+    if let Some(p) = check_dir(root_path.join("stdlib")) {
+        return p;
+    }
+    if let Some(p) = check_dir(root_path) {
+        return p;
+    }
+
+    // 3. Try /usr/share/ulang/
+    let share_path = std::path::PathBuf::from("/usr/share/ulang");
+    if let Some(p) = check_dir(share_path.join("stdlib")) {
+        return p;
+    }
+    if let Some(p) = check_dir(share_path) {
+        return p;
+    }
+
+    // 4. Fails
+    eprintln!("error: standard library (stdlib) not found.");
+    eprintln!("Please specify the location using the ULANG_ROOT environment variable,");
+    eprintln!("or ensure standard library is present at './root' or '/usr/share/ulang/'.");
+    std::process::exit(1);
 }
 
 /// Search for a definition in the stdlib cache.

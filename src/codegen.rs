@@ -1333,7 +1333,7 @@ impl<'ctx> CodeGen<'ctx> {
                     .map_err(|e| CodegenError::new(format!("failed to build default return: {}", e)))?;
             }
             _ => {
-                return Err("expected struct value for default".to_string());
+                return Err("expected struct value for default".to_string().into());
             }
         }
 
@@ -1418,7 +1418,7 @@ impl<'ctx> CodeGen<'ctx> {
                     .map_err(|e| CodegenError::new(format!("failed to build clone return: {}", e)))?;
             }
             _ => {
-                return Err("expected struct value for clone".to_string());
+                return Err("expected struct value for clone".to_string().into());
             }
         }
 
@@ -4716,7 +4716,7 @@ impl<'ctx> CodeGen<'ctx> {
                     _ => {
                         // Refutable patterns (EnumVariant, IntLit, BoolLit) are rejected
                         // by the parser's exhaustiveness check and should never reach codegen
-                        return Err("internal error: refutable pattern reached codegen".to_string());
+                        return Err("internal error: refutable pattern reached codegen".to_string().into());
                     }
                 }
                 Ok(())
@@ -4784,7 +4784,7 @@ impl<'ctx> CodeGen<'ctx> {
 
                 if let Some(break_expr) = value {
                     if !ctx.is_loop_expr {
-                        return Err("can only break with a value inside `loop`".to_string());
+                        return Err("can only break with a value inside `loop`".to_string().into());
                     }
                     let break_type = self.expr_type(break_expr);
                     let expected_type = ctx.result_type.as_ref().unwrap();
@@ -5077,7 +5077,7 @@ impl<'ctx> CodeGen<'ctx> {
                     }
                 }
                 _ => {
-                    return Err("else-if condition must be a boolean or integer".to_string());
+                    return Err("else-if condition must be a boolean or integer".to_string().into());
                 }
             };
 
@@ -5568,7 +5568,7 @@ impl<'ctx> CodeGen<'ctx> {
                                     return Err(format!("undefined variable '{}'", name).into());
                                 }
                             } else {
-                                return Err("expected pointer for member assignment".to_string());
+                                return Err("expected pointer for member assignment".to_string().into());
                             }
                         }
                     };
@@ -5578,7 +5578,7 @@ impl<'ctx> CodeGen<'ctx> {
                         Type::Ref { inner, is_mut } => {
                             if !is_mut {
                                 return Err("cannot assign to field through immutable reference"
-                                    .to_string());
+                                    .to_string().into());
                             }
                             match inner.as_ref() {
                                 Type::Struct(name) => {
@@ -5597,7 +5597,7 @@ impl<'ctx> CodeGen<'ctx> {
                                 }
                                 _ => {
                                     return Err(
-                                        "cannot access field on non-struct type".to_string()
+                                        "cannot access field on non-struct type".to_string().into()
                                     );
                                 }
                             }
@@ -5619,7 +5619,7 @@ impl<'ctx> CodeGen<'ctx> {
                                 .ok_or_else(|| CodegenError::new(format!("unknown struct type '{}'", mangled)))?;
                             (st, mangled)
                         }
-                        _ => return Err("cannot assign to field on non-struct type".to_string()),
+                        _ => return Err("cannot assign to field on non-struct type".to_string().into()),
                     };
 
                     if let Some(field_name) = field {
@@ -5679,7 +5679,7 @@ impl<'ctx> CodeGen<'ctx> {
                                 .builder
                                 .build_extract_value(sv, 0, "slice_ptr")
                                 .map_err(|e| CodegenError::new(format!("failed to extract slice ptr: {}", e)))?,
-                            _ => return Err("expected slice fat pointer".to_string()),
+                            _ => return Err("expected slice fat pointer".to_string().into()),
                         };
                         let ptr = ptr_field.into_pointer_value();
                         let elem_ty = match &array_ty {
@@ -5774,7 +5774,7 @@ impl<'ctx> CodeGen<'ctx> {
                         .map_err(|e| CodegenError::new(format!("failed to store through index_mut: {}", e)))?;
                     Ok(val)
                 }
-                _ => Err("invalid assignment target".to_string()),
+                _ => Err("invalid assignment target".to_string().into()),
             },
             Expr::Ref { expr, .. } => {
                 if let Expr::Ident(name, ..) = expr.as_ref() {
@@ -6064,7 +6064,7 @@ impl<'ctx> CodeGen<'ctx> {
                         }
                         _ => {
                             return Err(
-                                "logical AND operands must be booleans or integers".to_string()
+                                "logical AND operands must be booleans or integers".to_string().into()
                             );
                         }
                     };
@@ -6106,7 +6106,7 @@ impl<'ctx> CodeGen<'ctx> {
                         }
                         _ => {
                             return Err(
-                                "logical AND operands must be booleans or integers".to_string()
+                                "logical AND operands must be booleans or integers".to_string().into()
                             );
                         }
                     };
@@ -6172,7 +6172,7 @@ impl<'ctx> CodeGen<'ctx> {
                         }
                         _ => {
                             return Err(
-                                "logical OR operands must be booleans or integers".to_string()
+                                "logical OR operands must be booleans or integers".to_string().into()
                             );
                         }
                     };
@@ -6212,7 +6212,7 @@ impl<'ctx> CodeGen<'ctx> {
                         }
                         _ => {
                             return Err(
-                                "logical OR operands must be booleans or integers".to_string()
+                                "logical OR operands must be booleans or integers".to_string().into()
                             );
                         }
                     };
@@ -6381,7 +6381,7 @@ impl<'ctx> CodeGen<'ctx> {
                             .map_err(|e| CodegenError::new(format!("failed to extract struct field: {}", e)))?;
                         Ok(extracted)
                     }
-                    _ => Err("cannot access member of non-struct value".to_string()),
+                    _ => Err("cannot access member of non-struct value".to_string().into()),
                 }
             }
             Expr::MethodCall {
@@ -6415,7 +6415,7 @@ impl<'ctx> CodeGen<'ctx> {
                             .is_some_and(|traits| traits.contains("Drop"))
                     {
                         return Err(
-                            "cannot call Drop::drop directly, use std::mem::drop()".to_string()
+                            "cannot call Drop::drop directly, use std::mem::drop()".to_string().into()
                         );
                     }
                 }
@@ -6438,7 +6438,7 @@ impl<'ctx> CodeGen<'ctx> {
                             }
                             _ => {
                                 return Err(
-                                    "cannot call .len() on a non-fat-pointer value".to_string()
+                                    "cannot call .len() on a non-fat-pointer value".to_string().into()
                                 );
                             }
                         }
@@ -6461,7 +6461,7 @@ impl<'ctx> CodeGen<'ctx> {
                             }
                             _ => {
                                 return Err(
-                                    "cannot call .as_ptr() on a non-fat-pointer value".to_string()
+                                    "cannot call .as_ptr() on a non-fat-pointer value".to_string().into()
                                 );
                             }
                         }
@@ -6763,7 +6763,7 @@ impl<'ctx> CodeGen<'ctx> {
             }
             Expr::Array(elems, ..) => {
                 if elems.is_empty() {
-                    return Err("empty array literals are not supported".to_string());
+                    return Err("empty array literals are not supported".to_string().into());
                 }
                 let elem_ty = self.expr_type(&elems[0]);
                 let elem_llvm = self.type_to_llvm(&elem_ty);
@@ -6862,7 +6862,7 @@ impl<'ctx> CodeGen<'ctx> {
                             .builder
                             .build_extract_value(sv, 0, "slice_ptr")
                             .map_err(|e| CodegenError::new(format!("failed to extract slice ptr: {}", e)))?,
-                        _ => return Err("expected slice fat pointer".to_string()),
+                        _ => return Err("expected slice fat pointer".to_string().into()),
                     };
                     let ptr = ptr_field.into_pointer_value();
                     let elem_ty = match &array_ty {
@@ -6981,7 +6981,7 @@ impl<'ctx> CodeGen<'ctx> {
                 let cond_i1 = match cond_val {
                     BasicValueEnum::IntValue(v) => v,
                     _ => {
-                        return Err("if condition must be a boolean".to_string());
+                        return Err("if condition must be a boolean".to_string().into());
                     }
                 };
 
@@ -7159,7 +7159,7 @@ impl<'ctx> CodeGen<'ctx> {
                 let cond_i1 = match cond_val {
                     BasicValueEnum::IntValue(v) => v,
                     _ => {
-                        return Err("while condition must be a boolean".to_string());
+                        return Err("while condition must be a boolean".to_string().into());
                     }
                 };
                 self.builder
@@ -7207,7 +7207,7 @@ impl<'ctx> CodeGen<'ctx> {
                         .build_not(v, "not")
                         .map_err(|e| CodegenError::new(format!("failed to build unary not: {}", e)))?
                         .into()),
-                    _ => Err("unary ! requires integer operand".to_string()),
+                    _ => Err("unary ! requires integer operand".to_string().into()),
                 }
             }
             Expr::UnaryMinus(inner_expr, ..) => {
@@ -7223,7 +7223,7 @@ impl<'ctx> CodeGen<'ctx> {
                         .build_float_neg(v, "neg")
                         .map_err(|e| CodegenError::new(format!("failed to build unary minus: {}", e)))?
                         .into()),
-                    _ => Err("unary - requires numeric operand".to_string()),
+                    _ => Err("unary - requires numeric operand".to_string().into()),
                 }
             }
             Expr::EnumLit {
@@ -7704,7 +7704,7 @@ impl<'ctx> CodeGen<'ctx> {
                         }
                     }
                     _ => {
-                        return Err("match guard must be a boolean".to_string());
+                        return Err("match guard must be a boolean".to_string().into());
                     }
                 };
                 matches_val = self
@@ -7810,7 +7810,7 @@ impl<'ctx> CodeGen<'ctx> {
                 // Compare scrutinee (must be integer) with literal
                 let scrutinee_int = match scrutinee_val {
                     BasicValueEnum::IntValue(v) => v,
-                    _ => return Err("integer pattern requires integer scrutinee".to_string()),
+                    _ => return Err("integer pattern requires integer scrutinee".to_string().into()),
                 };
                 let lit_val = scrutinee_int.get_type().const_int(*n as u64, true);
                 let cmp = self
@@ -7827,7 +7827,7 @@ impl<'ctx> CodeGen<'ctx> {
             Pattern::BoolLit(b) => {
                 let scrutinee_int = match scrutinee_val {
                     BasicValueEnum::IntValue(v) => v,
-                    _ => return Err("bool pattern requires integer scrutinee".to_string()),
+                    _ => return Err("bool pattern requires integer scrutinee".to_string().into()),
                 };
                 let lit_val = scrutinee_int
                     .get_type()
@@ -7893,7 +7893,7 @@ impl<'ctx> CodeGen<'ctx> {
                 let scrutinee_struct = match scrutinee_val {
                     BasicValueEnum::StructValue(sv) => sv,
                     _ => {
-                        return Err("enum pattern matching requires struct scrutinee".to_string());
+                        return Err("enum pattern matching requires struct scrutinee".to_string().into());
                     }
                 };
                 let tag_val = self
@@ -7902,7 +7902,7 @@ impl<'ctx> CodeGen<'ctx> {
                     .map_err(|e| CodegenError::new(format!("failed to extract enum tag: {}", e)))?;
                 let tag_int = match tag_val {
                     BasicValueEnum::IntValue(v) => v,
-                    _ => return Err("enum tag is not an integer".to_string()),
+                    _ => return Err("enum tag is not an integer".to_string().into()),
                 };
 
                 // Compare tag with variant index
@@ -8184,10 +8184,10 @@ impl<'ctx> CodeGen<'ctx> {
             Expr::BoolLit(val, ..) => Ok(if *val { 1 } else { 0 }),
             Expr::IntLit(val, ..) => Ok(*val),
             Expr::FloatLit(..) => {
-                Err("float literals are not supported in const initializers".to_string())
+                Err("float literals are not supported in const initializers".to_string().into())
             }
             Expr::StrLit(..) => {
-                Err("string literals are not supported in const initializers".to_string())
+                Err("string literals are not supported in const initializers".to_string().into())
             }
             Expr::Ident(name, ..) => self
                 .consts
@@ -8203,7 +8203,7 @@ impl<'ctx> CodeGen<'ctx> {
                     BinOp::Mul => Ok(lhs * rhs),
                     BinOp::Div => {
                         if rhs == 0 {
-                            Err("division by zero in const expression".to_string())
+                            Err("division by zero in const expression".to_string().into())
                         } else {
                             Ok(lhs / rhs)
                         }
@@ -8219,17 +8219,17 @@ impl<'ctx> CodeGen<'ctx> {
                 }
             }
             Expr::Ref { .. } => {
-                Err("reference expressions are not supported in const initializers".to_string())
+                Err("reference expressions are not supported in const initializers".to_string().into())
             }
             Expr::UnaryMinus(expr, ..) => {
                 let val = self.const_eval(expr)?;
                 Ok(-val)
             }
             Expr::Deref(..) => {
-                Err("dereference expressions are not supported in const initializers".to_string())
+                Err("dereference expressions are not supported in const initializers".to_string().into())
             }
             Expr::Assign { .. } => {
-                Err("assignment is not supported in const initializers".to_string())
+                Err("assignment is not supported in const initializers".to_string().into())
             }
             Expr::MethodCall {
                 expr, method, args, ..
@@ -8239,14 +8239,14 @@ impl<'ctx> CodeGen<'ctx> {
                         Ok(s.len() as i64)
                     } else {
                         Err("non-constant receiver for method call in const initializer"
-                            .to_string())
+                            .to_string().into())
                     }
                 } else {
-                    Err("non-constant method call in const initializer".to_string())
+                    Err("non-constant method call in const initializer".to_string().into())
                 }
             }
             Expr::Cast { expr, .. } => self.const_eval(expr),
-            _ => Err("non-constant expression in const initializer".to_string()),
+            _ => Err("non-constant expression in const initializer".to_string().into()),
         }
     }
 
@@ -8409,7 +8409,7 @@ impl<'ctx> CodeGen<'ctx> {
                     return Ok(cmp.into());
                 }
                 _ => {
-                    return Err("unsupported value type for cast to bool".to_string());
+                    return Err("unsupported value type for cast to bool".to_string().into());
                 }
             }
         }
@@ -8527,7 +8527,7 @@ impl<'ctx> CodeGen<'ctx> {
 
                 let dst_width = match to_type {
                     Type::ImplTrait(_) => {
-                        return Err("cannot cast to impl Trait type".to_string());
+                        return Err("cannot cast to impl Trait type".to_string().into());
                     }
                     Type::I8 | Type::U8 => 8,
                     Type::I16 | Type::U16 => 16,
@@ -8535,26 +8535,26 @@ impl<'ctx> CodeGen<'ctx> {
                     Type::I64 | Type::U64 | Type::Isize | Type::Usize => 64,
                     Type::F32 | Type::F64 => 0,
                     Type::Never => {
-                        return Err("cast to never type is not allowed".to_string());
+                        return Err("cast to never type is not allowed".to_string().into());
                     }
                     Type::Tuple(_) | Type::Unit => {
-                        return Err("cannot cast to tuple or unit type".to_string());
+                        return Err("cannot cast to tuple or unit type".to_string().into());
                     }
                     Type::Str => {
-                        return Err("cannot cast to string type".to_string());
+                        return Err("cannot cast to string type".to_string().into());
                     }
-                    Type::Ref { .. } => return Err("cannot cast to reference type".to_string()),
+                    Type::Ref { .. } => return Err("cannot cast to reference type".to_string().into()),
                     Type::Ptr { .. } => unreachable!(),
                     Type::Struct(_) | Type::GenericInstance(_, _) | Type::Alias(_, _) => {
-                        return Err("cannot cast to struct type".to_string());
+                        return Err("cannot cast to struct type".to_string().into());
                     }
                     Type::Array { .. } => {
-                        return Err("cannot cast to array type".to_string());
+                        return Err("cannot cast to array type".to_string().into());
                     }
                     Type::Slice { .. } | Type::GenericArray { .. } => {
-                        return Err("cannot cast to slice or generic array type".to_string());
+                        return Err("cannot cast to slice or generic array type".to_string().into());
                     }
-                    Type::SelfType => return Err("cannot cast to Self type".to_string()),
+                    Type::SelfType => return Err("cannot cast to Self type".to_string().into()),
                     // Bool caught by early return above, but keep for completeness
                     Type::Bool => 1,
                 };

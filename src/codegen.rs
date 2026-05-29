@@ -43,6 +43,8 @@ pub struct CodeGen<'ctx> {
     consts: HashMap<String, i64>,
     pub overloads: OverloadMap,
     opt_level: OptimizationLevel,
+    pub source: String,
+    pub path: String,
     struct_fields: HashMap<String, Vec<StructField>>,
     // Maps type_name -> LLVM struct type
     struct_types: HashMap<String, inkwell::types::StructType<'ctx>>,
@@ -99,7 +101,12 @@ struct LoopContext<'ctx> {
 }
 
 impl<'ctx> CodeGen<'ctx> {
-    pub fn new_jit(context: &'ctx Context, opt: OptimizationLevel) -> Result<Self, String> {
+    pub fn new_jit(
+        context: &'ctx Context,
+        opt: OptimizationLevel,
+        source: String,
+        path: String,
+    ) -> Result<Self, String> {
         let module = context.create_module("ulang");
         let execution_engine = module
             .create_jit_execution_engine(opt)
@@ -147,10 +154,17 @@ impl<'ctx> CodeGen<'ctx> {
             drop_types: HashSet::new(),
             loop_stack: Vec::new(),
             opt_level: opt,
+            source,
+            path,
         })
     }
 
-    pub fn new_native(context: &'ctx Context, opt: OptimizationLevel) -> Self {
+    pub fn new_native(
+        context: &'ctx Context,
+        opt: OptimizationLevel,
+        source: String,
+        path: String,
+    ) -> Self {
         let module = context.create_module("ulang");
         let builder = context.create_builder();
 
@@ -195,6 +209,8 @@ impl<'ctx> CodeGen<'ctx> {
             drop_types: HashSet::new(),
             loop_stack: Vec::new(),
             opt_level: opt,
+            source,
+            path,
         }
     }
 
@@ -2028,7 +2044,8 @@ impl<'ctx> CodeGen<'ctx> {
                 if let Some(pos) = const_params.iter().position(|p| p == name)
                     && let Some(&val) = values.get(pos)
                 {
-                    *expr = Expr::IntLit(val);
+                    let span = expr.span();
+                    *expr = Expr::IntLit(val, span);
                 }
             }
             Expr::Binary { lhs, rhs, .. } => {
@@ -2075,7 +2092,7 @@ impl<'ctx> CodeGen<'ctx> {
                     Self::m_substitute_const_in_expr(elem, const_params, values);
                 }
             }
-            Expr::Repeat(inner, .., _) => {
+            Expr::Repeat(inner, ..) => {
                 Self::m_substitute_const_in_expr(inner, const_params, values);
             }
             Expr::If {
@@ -3168,6 +3185,7 @@ impl<'ctx> CodeGen<'ctx> {
                             && trait_method.params[0].name == "self",
                         is_pub: false,
                         attribs: vec![],
+                        span: Span::empty(0),
                     };
                     if Self::has_impl_trait_param(&method_func) {
                         self.generic_methods
@@ -3332,6 +3350,7 @@ impl<'ctx> CodeGen<'ctx> {
                             && trait_method.params[0].name == "self",
                         is_pub: false,
                         attribs: vec![],
+                        span: Span::empty(0),
                     };
                     if Self::has_impl_trait_param(&method_func) {
                         continue;
@@ -3939,11 +3958,11 @@ impl<'ctx> CodeGen<'ctx> {
                 ..
             } => self.resolve_if_let_result_type(then_block, else_block),
             Expr::For { .. } => Type::Unit,
-            Expr::Block(block) => self.block_type(block),
+            Expr::Block(block, _) => self.block_type(block),
             Expr::Match {
                 scrutinee, arms, ..
             } => self.resolve_match_result_type(scrutinee, arms),
-            Expr::Call { callee, args } => {
+            Expr::Call { callee, args, .. } => {
                 // Handle builtin slice intrinsics
                 if let Some(ret_ty) = self.slice_intrinsic_return_type(callee, args) {
                     return ret_ty;
@@ -4171,7 +4190,7 @@ impl<'ctx> CodeGen<'ctx> {
                 inner: Box::new(Self::literal_type(expr)),
                 is_mut: *is_mut,
             },
-            Expr::Deref(expr) => {
+            Expr::Deref(expr, _) => {
                 let inner_ty = Self::literal_type(expr);
                 match inner_ty {
                     Type::Ptr { inner, .. } => *inner,
@@ -4230,7 +4249,7 @@ impl<'ctx> CodeGen<'ctx> {
                     }
                 }
             }
-            Expr::Repeat(expr, count) => Type::Array {
+            Expr::Repeat(expr, count, _) => Type::Array {
                 inner: Box::new(Self::literal_type(expr)),
                 len: *count,
             },
@@ -4629,7 +4648,7 @@ impl<'ctx> CodeGen<'ctx> {
                         }
 
                         // Move detection: if init is a simple ident and source is not Copy
-                        if let Expr::Ident(src_name) = init {
+                        if let Expr::Ident(src_name, _) = init {
                             let src_ty = self.expr_type(init);
                             if !self.is_copy_type(&src_ty) {
                                 self.moved_vars.insert(src_name.clone());
@@ -7430,6 +7449,7 @@ impl<'ctx> CodeGen<'ctx> {
                 expr: Box::new(container.clone()),
                 method: "iter".to_string(),
                 args: vec![],
+                span: Span::empty(0),
             }
         } else if is_iter {
             container.clone()
@@ -7441,9 +7461,10 @@ impl<'ctx> CodeGen<'ctx> {
         };
         // Determine loop element type by simulating calling next() on the iterator
         let next_expr = Expr::MethodCall {
-            expr: Box::new(Expr::Ident("__for_loop_iter".to_string())),
+            expr: Box::new(Expr::Ident("__for_loop_iter".to_string(), Span::empty(0))),
             method: "next".to_string(),
             args: vec![],
+            span: Span::empty(0),
         };
         // Create a temporary mock scope to retrieve the return type of iterator.next()
         let iter_ty = self.expr_type(&iterator_expr);
@@ -8593,7 +8614,12 @@ mod tests {
         let program = parser.parse_program().map_err(|e| e.msg)?;
 
         let context = Context::create();
-        let mut cg = CodeGen::new_jit(&context, OptimizationLevel::None)?;
+        let mut cg = CodeGen::new_jit(
+            &context,
+            OptimizationLevel::None,
+            src.to_string(),
+            "<test>".to_string(),
+        )?;
         cg.jit_run(&program)
     }
 
@@ -8611,7 +8637,12 @@ mod tests {
         let program = parser.parse_program().map_err(|e| e.msg)?;
 
         let context = Context::create();
-        let mut cg = CodeGen::new_jit(&context, OptimizationLevel::None)?;
+        let mut cg = CodeGen::new_jit(
+            &context,
+            OptimizationLevel::None,
+            src.to_string(),
+            "<test>".to_string(),
+        )?;
         cg.compile_module(&program)?;
         Ok(())
     }
@@ -8836,7 +8867,12 @@ mod tests {
         let program = parser.parse_program().expect("parse error");
 
         let context = Context::create();
-        let mut cg = CodeGen::new_native(&context, OptimizationLevel::None);
+        let mut cg = CodeGen::new_native(
+            &context,
+            OptimizationLevel::None,
+            src.to_string(),
+            "<test>".to_string(),
+        );
         assert!(cg.compile_module(&program).is_ok());
     }
 
@@ -8952,7 +8988,12 @@ mod tests {
         let program = parser.parse_program().expect("parse error");
 
         let context = Context::create();
-        let mut cg = CodeGen::new_native(&context, OptimizationLevel::None);
+        let mut cg = CodeGen::new_native(
+            &context,
+            OptimizationLevel::None,
+            src.to_string(),
+            "<test>".to_string(),
+        );
         assert!(cg.compile_module(&program).is_ok());
     }
 
@@ -9087,7 +9128,12 @@ mod tests {
         let program = parser.parse_program().expect("parse error");
 
         let context = Context::create();
-        let mut cg = CodeGen::new_native(&context, OptimizationLevel::None);
+        let mut cg = CodeGen::new_native(
+            &context,
+            OptimizationLevel::None,
+            src.to_string(),
+            "<test>".to_string(),
+        );
         assert!(cg.compile_module(&program).is_ok());
     }
 

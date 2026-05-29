@@ -625,13 +625,13 @@ fn parse_generic_params(tokens: &[(Token, Span)], lt_idx: usize) -> (Vec<Generic
                 new_param = true;
             }
             Token::Const if depth == 1 && new_param => {
-                if i + 1 < tokens.len() {
-                    if let Token::Ident(name) = &tokens[i + 1].0 {
-                        params.push(GenericParamDecl {
-                            name: name.clone(),
-                            span: tokens[i + 1].1,
-                        });
-                    }
+                if i + 1 < tokens.len()
+                    && let Token::Ident(name) = &tokens[i + 1].0
+                {
+                    params.push(GenericParamDecl {
+                        name: name.clone(),
+                        span: tokens[i + 1].1,
+                    });
                 }
                 new_param = false;
             }

@@ -24,10 +24,12 @@ Pipeline is sequential, single-pass, no IR middle-end.
 ## Syntax Differences from Rust
 
 ### Semicolons after Control Flow Statements
+
 In Rust, block-like expressions (such as `if`, `while`, `loop`, `for`, `match`, and `{}`) used as statements do not require a trailing semicolon.
 However, in `ulang`, to clarify statements and expressions, **every statement containing a block-like control flow expression MUST be terminated with a semicolon** if it is followed by subsequent statements. Lacking a semicolon causes the control flow block to be parsed as the tail expression (implicit return of the block), resulting in a syntax error if subsequent statements are found.
 
 For example:
+
 ```rust
 // Correct statement usage:
 println("do something");
@@ -53,6 +55,8 @@ fn main() -> i32 {
 |---|---|
 | `src/` | All source code (single crate, no workspace) |
 | `examples/` | Example `.u` programs |
+| `root/stdlib/core/` | Core library: clean modules containing no `extern "C"` declarations or allocation dependencies |
+| `root/stdlib/std/` | Standard library: modules requiring `extern "C"` or allocation, and re-exporting `core` |
 | `target/` | Build artifacts (gitignored) |
 
 ## Development Commands
@@ -108,7 +112,7 @@ The default output for `build` is `a.out`; override with `-o <path>`.
 
 ## Runtime/Tooling Preferences
 
-- **Required**: Linux operating system (targeting Linux is required; Windows and other OS support is only guaranteed when using `cosmocc` as the linker), Rust toolchain (edition 2024), LLVM 22 (via `inkwell`), `cc` linker (system `cc` for native builds).
+- **Required**: Linux operating system (targeting Linux is required; Windows and other OS support is only guaranteed when using `cosmocc` as the linker), Rust toolchain (edition 2024), LLVM 22 (via `inkwell`), linker.
 - **Package manager**: Cargo.
 - **Formatter**: `cargo fmt` (default).
 - **Linter**: `cargo clippy` (default).
@@ -154,7 +158,7 @@ cargo test --test integration_test
 
 ### Clippy
 
-- When `cargo clippy` reports auto-fixable warnings, run `cargo clippy --fix --bin ulang -- -W clippy::all` to apply them immediately. Do not hand-fix clippy suggestions.
+- When `cargo clippy` reports auto-fixable warnings, run `cargo clippy --fix --allow-dirty` to apply them automatically and immediately, and ignore other non-autofixable ones. DO NOT hand-fix clippy suggestions.
 
 ### Notes
 

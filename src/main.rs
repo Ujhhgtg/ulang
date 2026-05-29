@@ -254,14 +254,14 @@ fn find_project_root() -> Option<std::path::PathBuf> {
     None
 }
 
-fn find_stdlib_dir() -> std::path::PathBuf {
+fn find_stdlib_root() -> std::path::PathBuf {
     if let Ok(val) = std::env::var("ULANG_ROOT") {
         let root_path = std::path::PathBuf::from(val);
-        let candidate1 = root_path.join("stdlib").join("std");
+        let candidate1 = root_path.join("stdlib");
         if candidate1.is_dir() {
             return candidate1;
         }
-        let candidate2 = root_path.join("root").join("stdlib").join("std");
+        let candidate2 = root_path.join("root").join("stdlib");
         if candidate2.is_dir() {
             return candidate2;
         }
@@ -269,11 +269,11 @@ fn find_stdlib_dir() -> std::path::PathBuf {
     }
     if let Ok(mut dir) = std::env::current_dir() {
         loop {
-            let candidate1 = dir.join("root").join("stdlib").join("std");
+            let candidate1 = dir.join("root").join("stdlib");
             if candidate1.is_dir() {
                 return candidate1;
             }
-            let candidate2 = dir.join("stdlib").join("std");
+            let candidate2 = dir.join("stdlib");
             if candidate2.is_dir() {
                 return candidate2;
             }
@@ -282,7 +282,7 @@ fn find_stdlib_dir() -> std::path::PathBuf {
             }
         }
     }
-    std::path::PathBuf::from("root/stdlib/std")
+    std::path::PathBuf::from("root/stdlib")
 }
 
 fn do_new_project(name: &str) {
@@ -734,25 +734,53 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
     let mut all_stdlib_progs: HashMap<String, Program> = HashMap::new();
     // Map from struct name to canonical source module (e.g., "String" → "string")
     let mut canonical_struct_sources: HashMap<String, String> = HashMap::new();
-    let stdlib_dir = find_stdlib_dir();
-    if let Ok(entries) = std::fs::read_dir(&stdlib_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().is_some_and(|e| e == "u")
-                && let Some(name) = path.file_stem().and_then(|s| s.to_str())
-                && let Ok(src) = std::fs::read_to_string(&path)
-            {
-                let prog = lex_and_parse(&src, &path.to_string_lossy());
-                // Register canonical struct sources
-                for decl in &prog.structs {
-                    canonical_struct_sources
-                        .entry(decl.name.clone())
-                        .or_insert_with(|| name.to_string());
+    let stdlib_root_dir = find_stdlib_root();
+    let std_dir = stdlib_root_dir.join("std");
+    let core_dir = stdlib_root_dir.join("core");
+
+    // Helper closure to load a root mod and its submodules
+    let load_stdlib_dir = |dir: &std::path::Path,
+                           all_progs: &mut HashMap<String, Program>,
+                           sources: &mut HashMap<String, String>| {
+        let mod_path = dir.join("mod.u");
+        if let Ok(mod_src) = fs::read_to_string(&mod_path) {
+            let stdlib_root = lex_and_parse(&mod_src, &mod_path.to_string_lossy());
+            for m in &stdlib_root.modules {
+                let name = &m.name;
+                let sub_path = dir.join(format!("{}.u", name));
+                match fs::read_to_string(&sub_path) {
+                    Ok(src) => {
+                        let prog = lex_and_parse(&src, &sub_path.to_string_lossy());
+                        for decl in &prog.structs {
+                            sources
+                                .entry(decl.name.clone())
+                                .or_insert_with(|| name.clone());
+                        }
+                        all_progs.insert(name.clone(), prog);
+                    }
+                    Err(_) => {
+                        eprintln!(
+                            "error: standard library module '{}' declared in 'mod.u' but not found at '{}'",
+                            name,
+                            sub_path.display()
+                        );
+                        process::exit(1);
+                    }
                 }
-                all_stdlib_progs.entry(name.to_string()).or_insert(prog);
             }
         }
-    }
+    };
+
+    load_stdlib_dir(
+        &core_dir,
+        &mut all_stdlib_progs,
+        &mut canonical_struct_sources,
+    );
+    load_stdlib_dir(
+        &std_dir,
+        &mut all_stdlib_progs,
+        &mut canonical_struct_sources,
+    );
 
     // Resolve each use declaration using a fixed-point loop to support transitive re-exports and nested uses
     let mut pending = program.uses.clone();
@@ -767,8 +795,10 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
                 continue;
             }
 
-            if path[0] == "std" {
-                if no_std {
+            let is_std = path[0] == "std";
+            let is_core = path[0] == "core";
+            if is_std || is_core {
+                if is_std && no_std {
                     eprintln!(
                         "error: use of std::{} requires the standard library (use --no-std)",
                         path[1..].join("::")
@@ -778,13 +808,23 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
 
                 // Resolve stdlib/module_name.u
                 let module_name = &path[1];
-                let stdlib_path = stdlib_dir.join(format!("{}.u", module_name));
+                let stdlib_path = if is_core {
+                    core_dir.join(format!("{}.u", module_name))
+                } else {
+                    let std_path = std_dir.join(format!("{}.u", module_name));
+                    if std_path.exists() {
+                        std_path
+                    } else {
+                        core_dir.join(format!("{}.u", module_name))
+                    }
+                };
 
                 let stdlib_src = match fs::read_to_string(&stdlib_path) {
                     Ok(s) => s,
                     Err(_) => {
                         eprintln!(
-                            "error: cannot find std::{} module at '{}'",
+                            "error: cannot find {}::{} module at '{}'",
+                            path[0],
                             module_name,
                             stdlib_path.display()
                         );

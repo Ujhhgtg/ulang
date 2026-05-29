@@ -1,9 +1,6 @@
 use std::string::String;
 use std::vec::Vec;
-
-extern "C" {
-    fn printf(fmt: *const i8, ...) -> i32;
-}
+use std::libc::printf;
 
 pub fn print(x: i32) {
     printf("%d".0, x);

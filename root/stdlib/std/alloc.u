@@ -1,4 +1,4 @@
-pub extern "C" fn malloc(size: usize) -> *mut u8;
-pub extern "C" fn realloc(ptr: *mut u8, new_size: usize) -> *mut u8;
-pub extern "C" fn free(ptr: *mut u8);
-pub extern "C" fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut u8;
+pub use std::libc::malloc;
+pub use std::libc::realloc;
+pub use std::libc::free;
+pub use std::libc::memcpy;

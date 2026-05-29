@@ -3,13 +3,7 @@ use std::option::Option;
 use std::alloc::malloc;
 use std::alloc::free;
 use std::alloc::memcpy;
-
-extern "C" {
-    fn _Exit(code: i32) -> !;
-    fn fork() -> i32;
-    fn execvp(file: *const u8, argv: *const *mut u8) -> i32;
-    fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
-}
+use std::libc::{_Exit, fork, execvp, waitpid};
 
 pub fn exit() -> ! {
     _Exit(0);

@@ -1,0 +1,12 @@
+extern "C" {
+    pub fn malloc(size: usize) -> *mut u8;
+    pub fn realloc(ptr: *mut u8, new_size: usize) -> *mut u8;
+    pub fn free(ptr: *mut u8);
+    pub fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut u8;
+    pub fn printf(fmt: *const i8, ...) -> i32;
+    pub fn abort() -> !;
+    pub fn _Exit(code: i32) -> !;
+    pub fn fork() -> i32;
+    pub fn execvp(file: *const u8, argv: *const *mut u8) -> i32;
+    pub fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
+}

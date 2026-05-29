@@ -27,43 +27,79 @@ struct StdlibCache {
 
 fn load_stdlib_cache() -> StdlibCache {
     let mut entries = Vec::new();
-    let stdlib_dir = find_stdlib_dir();
-    if let Ok(dir) = std::fs::read_dir(&stdlib_dir) {
-        for entry in dir.flatten() {
-            let path = entry.path();
-            if path.extension().is_some_and(|e| e == "u")
-                && let Ok(src) = std::fs::read_to_string(&path)
-            {
-                let mut lexer = Lexer::new(&src);
-                let mut tokens = Vec::new();
-                loop {
-                    match lexer.next_token() {
-                        Ok((token, span)) => {
-                            tokens.push((token, span));
-                            if let Token::Eof = tokens.last().unwrap().0 {
-                                break;
+    let stdlib_root = find_stdlib_root();
+    let core_dir = stdlib_root.join("core");
+    let std_dir = stdlib_root.join("std");
+
+    let load_dir = |dir: &std::path::Path, entries: &mut Vec<(Url, StdlibEntry)>| {
+        let mod_u_path = dir.join("mod.u");
+        if let Ok(mod_src) = std::fs::read_to_string(&mod_u_path) {
+            let mut lexer = Lexer::new(&mod_src);
+            let mut tokens = Vec::new();
+            loop {
+                match lexer.next_token() {
+                    Ok((token, span)) => {
+                        tokens.push((token, span));
+                        if let Token::Eof = tokens.last().unwrap().0 {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            if !tokens.is_empty() && matches!(tokens.last().unwrap().0, Token::Eof) {
+                let mut parser = Parser::new(&tokens);
+                if let Ok(stdlib_root) = parser.parse_program() {
+                    for m in &stdlib_root.modules {
+                        let sub_path = dir.join(format!("{}.u", m.name));
+                        if let Ok(src) = std::fs::read_to_string(&sub_path) {
+                            let mut lexer = Lexer::new(&src);
+                            let mut tokens = Vec::new();
+                            loop {
+                                match lexer.next_token() {
+                                    Ok((token, span)) => {
+                                        tokens.push((token, span));
+                                        if let Token::Eof = tokens.last().unwrap().0 {
+                                            break;
+                                        }
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                            if !tokens.is_empty() && matches!(tokens.last().unwrap().0, Token::Eof)
+                            {
+                                let mut parser = Parser::new(&tokens);
+                                if let Ok(program) = parser.parse_program()
+                                    && let Ok(url) = Url::from_file_path(&sub_path)
+                                {
+                                    entries.push((
+                                        url,
+                                        StdlibEntry {
+                                            source: src,
+                                            program,
+                                        },
+                                    ));
+                                }
                             }
                         }
-                        Err(_) => break,
                     }
-                }
-                if !tokens.is_empty() && matches!(tokens.last().unwrap().0, Token::Eof) {
-                    let mut parser = Parser::new(&tokens);
-                    if let Ok(program) = parser.parse_program()
-                        && let Ok(url) = Url::from_file_path(&path)
-                    {
+                    if let Ok(url) = Url::from_file_path(&mod_u_path) {
                         entries.push((
                             url,
                             StdlibEntry {
-                                source: src,
-                                program,
+                                source: mod_src,
+                                program: stdlib_root,
                             },
                         ));
                     }
                 }
             }
         }
-    }
+    };
+
+    load_dir(&core_dir, &mut entries);
+    load_dir(&std_dir, &mut entries);
+
     StdlibCache { entries }
 }
 
@@ -613,14 +649,14 @@ fn handle_hover(
     None
 }
 
-fn find_stdlib_dir() -> std::path::PathBuf {
+fn find_stdlib_root() -> std::path::PathBuf {
     if let Ok(val) = std::env::var("ULANG_ROOT") {
         let root_path = std::path::PathBuf::from(val);
-        let candidate1 = root_path.join("stdlib").join("std");
+        let candidate1 = root_path.join("stdlib");
         if candidate1.is_dir() {
             return candidate1;
         }
-        let candidate2 = root_path.join("root").join("stdlib").join("std");
+        let candidate2 = root_path.join("root").join("stdlib");
         if candidate2.is_dir() {
             return candidate2;
         }
@@ -628,11 +664,11 @@ fn find_stdlib_dir() -> std::path::PathBuf {
     }
     if let Ok(mut dir) = std::env::current_dir() {
         loop {
-            let candidate1 = dir.join("root").join("stdlib").join("std");
+            let candidate1 = dir.join("root").join("stdlib");
             if candidate1.is_dir() {
                 return candidate1;
             }
-            let candidate2 = dir.join("stdlib").join("std");
+            let candidate2 = dir.join("stdlib");
             if candidate2.is_dir() {
                 return candidate2;
             }
@@ -641,7 +677,7 @@ fn find_stdlib_dir() -> std::path::PathBuf {
             }
         }
     }
-    std::path::PathBuf::from("root/stdlib/std")
+    std::path::PathBuf::from("root/stdlib")
 }
 
 /// Search for a definition in the stdlib cache.
@@ -1126,8 +1162,8 @@ mod tests {
         let (m_url, _) = malloc_def.unwrap();
         let m_path = m_url.to_file_path().unwrap();
         assert!(
-            m_path.to_string_lossy().contains("alloc.u"),
-            "malloc definition should be in alloc.u, got {:?}",
+            m_path.to_string_lossy().contains("libc.u"),
+            "malloc definition should be in libc.u, got {:?}",
             m_path
         );
     }

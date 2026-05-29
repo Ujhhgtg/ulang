@@ -98,6 +98,7 @@ pub enum Stmt {
         span: Span,
     },
     Break {
+        value: Option<Box<Expr>>,
         #[allow(dead_code)]
         span: Span,
     },

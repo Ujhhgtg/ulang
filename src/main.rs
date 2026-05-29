@@ -2481,7 +2481,20 @@ fn qualify_block(
                     );
                 }
             }
-            crate::ast::Stmt::Continue { .. } | crate::ast::Stmt::Break { .. } => {}
+            crate::ast::Stmt::Continue { .. } => {}
+            crate::ast::Stmt::Break { value, .. } => {
+                if let Some(expr) = value {
+                    qualify_expr(
+                        expr,
+                        local_funcs,
+                        local_types,
+                        prefix,
+                        current_path,
+                        submodules,
+                        top_level_modules,
+                    );
+                }
+            }
         }
     }
     if let Some(tail) = &mut block.tail_expr {

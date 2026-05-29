@@ -1356,9 +1356,15 @@ impl<'a> Parser<'a> {
             Token::Break => {
                 let lo = self.current_span_lo();
                 self.advance();
+                let value = if *self.peek_token() == Token::Semicolon {
+                    None
+                } else {
+                    Some(Box::new(self.parse_expr()?))
+                };
                 self.expect(&Token::Semicolon)?;
                 let hi = self.last_span_end();
                 Ok(Stmt::Break {
+                    value,
                     span: Span::new(lo, hi),
                 })
             }

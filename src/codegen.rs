@@ -89,9 +89,13 @@ pub struct CodeGen<'ctx> {
 
 /// Context for a single loop level
 /// `continue` and `break`.
+#[derive(Clone)]
 struct LoopContext<'ctx> {
     continue_bb: inkwell::basic_block::BasicBlock<'ctx>,
     break_bb: inkwell::basic_block::BasicBlock<'ctx>,
+    result_alloca: Option<inkwell::values::PointerValue<'ctx>>,
+    result_type: Option<Type>,
+    is_loop_expr: bool,
 }
 
 impl<'ctx> CodeGen<'ctx> {
@@ -1995,7 +1999,14 @@ impl<'ctx> CodeGen<'ctx> {
                         **inner = *expr_box;
                     }
                 }
-                Stmt::Continue { .. } | Stmt::Break { .. } => {}
+                Stmt::Continue { .. } => {}
+                Stmt::Break { value, .. } => {
+                    if let Some(inner) = value {
+                        let mut expr_box = Box::new((**inner).clone());
+                        Self::m_substitute_types_in_expr(&mut expr_box, params, args);
+                        **inner = *expr_box;
+                    }
+                }
             }
         }
         if let Some(tail) = &mut block.tail_expr {
@@ -2136,7 +2147,12 @@ impl<'ctx> CodeGen<'ctx> {
                         Self::m_substitute_const_in_expr(inner, const_params, values);
                     }
                 }
-                Stmt::Continue { .. } | Stmt::Break { .. } => {}
+                Stmt::Continue { .. } => {}
+                Stmt::Break { value, .. } => {
+                    if let Some(inner) = value {
+                        Self::m_substitute_const_in_expr(inner, const_params, values);
+                    }
+                }
             }
         }
         if let Some(tail) = &mut block.tail_expr {
@@ -2660,7 +2676,12 @@ impl<'ctx> CodeGen<'ctx> {
                         Self::collect_enum_lits_from_expr(expr, instances, seen, one_param_enums);
                     }
                 }
-                Stmt::Continue { .. } | Stmt::Break { .. } => {}
+                Stmt::Continue { .. } => {}
+                Stmt::Break { value, .. } => {
+                    if let Some(expr) = value {
+                        Self::collect_enum_lits_from_expr(expr, instances, seen, one_param_enums);
+                    }
+                }
             }
         }
         if let Some(ref tail) = block.tail_expr {
@@ -4101,6 +4122,24 @@ impl<'ctx> CodeGen<'ctx> {
             Expr::UnaryNot(inner) => self.expr_type(inner),
             Expr::UnaryMinus(inner) => self.expr_type(inner),
             Expr::Tuple(elems) => Type::Tuple(elems.iter().map(|e| self.expr_type(e)).collect()),
+            Expr::Loop { body } => {
+                let mut breaks = Vec::new();
+                Self::find_loop_breaks(body, &mut breaks);
+                if breaks.is_empty() {
+                    Type::Unit
+                } else {
+                    match &breaks[0] {
+                        Stmt::Break { value, .. } => {
+                            if let Some(val) = value {
+                                self.expr_type(val)
+                            } else {
+                                Type::Unit
+                            }
+                        }
+                        _ => Type::Unit,
+                    }
+                }
+            }
             _ => Self::literal_type(expr),
         }
     }
@@ -4193,7 +4232,25 @@ impl<'ctx> CodeGen<'ctx> {
                     _ => Type::I32,
                 }
             }
-            Expr::Loop { .. } | Expr::While { .. } | Expr::For { .. } => Type::Unit,
+            Expr::Loop { body } => {
+                let mut breaks = Vec::new();
+                Self::find_loop_breaks(body, &mut breaks);
+                if breaks.is_empty() {
+                    Type::Unit
+                } else {
+                    match &breaks[0] {
+                        Stmt::Break { value, .. } => {
+                            if let Some(val) = value {
+                                Self::literal_type(val)
+                            } else {
+                                Type::Unit
+                            }
+                        }
+                        _ => Type::Unit,
+                    }
+                }
+            }
+            Expr::While { .. } | Expr::For { .. } => Type::Unit,
             Expr::Block(block) => {
                 if let Some(ref tail) = block.tail_expr {
                     Self::literal_type(tail)
@@ -4202,6 +4259,134 @@ impl<'ctx> CodeGen<'ctx> {
                 }
             }
             _ => Type::I32,
+        }
+    }
+
+    fn find_loop_breaks(block: &Block, breaks: &mut Vec<Stmt>) {
+        for stmt in &block.stmts {
+            Self::find_stmt_breaks(stmt, breaks);
+        }
+        if let Some(tail) = &block.tail_expr {
+            Self::find_expr_breaks(tail, breaks);
+        }
+    }
+
+    fn find_stmt_breaks(stmt: &Stmt, breaks: &mut Vec<Stmt>) {
+        match stmt {
+            Stmt::Break { .. } => {
+                breaks.push(stmt.clone());
+            }
+            Stmt::Let { init, .. } => Self::find_expr_breaks(init, breaks),
+            Stmt::Const { init, .. } => Self::find_expr_breaks(init, breaks),
+            Stmt::Expr(expr) => Self::find_expr_breaks(expr, breaks),
+            Stmt::Return { value, .. } => {
+                if let Some(val) = value {
+                    Self::find_expr_breaks(val, breaks);
+                }
+            }
+            Stmt::Continue { .. } => {}
+        }
+    }
+
+    fn find_expr_breaks(expr: &Expr, breaks: &mut Vec<Stmt>) {
+        match expr {
+            Expr::Loop { .. } | Expr::While { .. } | Expr::For { .. } => {}
+            Expr::If {
+                cond,
+                then_block,
+                else_ifs,
+                else_block,
+            } => {
+                Self::find_expr_breaks(cond, breaks);
+                Self::find_loop_breaks(then_block, breaks);
+                for (else_cond, else_blk) in else_ifs {
+                    Self::find_expr_breaks(else_cond, breaks);
+                    Self::find_loop_breaks(else_blk, breaks);
+                }
+                if let Some(else_blk) = else_block {
+                    Self::find_loop_breaks(else_blk, breaks);
+                }
+            }
+            Expr::IfLet {
+                scrutinee,
+                then_block,
+                else_block,
+                ..
+            } => {
+                Self::find_expr_breaks(scrutinee, breaks);
+                Self::find_loop_breaks(then_block, breaks);
+                if let Some(else_blk) = else_block {
+                    Self::find_loop_breaks(else_blk, breaks);
+                }
+            }
+            Expr::Match { scrutinee, arms } => {
+                Self::find_expr_breaks(scrutinee, breaks);
+                for arm in arms {
+                    if let Some(guard) = &arm.guard {
+                        Self::find_expr_breaks(guard, breaks);
+                    }
+                    Self::find_loop_breaks(&arm.body, breaks);
+                }
+            }
+            Expr::Block(block) => {
+                Self::find_loop_breaks(block, breaks);
+            }
+            Expr::Binary { lhs, rhs, .. } => {
+                Self::find_expr_breaks(lhs, breaks);
+                Self::find_expr_breaks(rhs, breaks);
+            }
+            Expr::Assign { target, value } => {
+                Self::find_expr_breaks(target, breaks);
+                Self::find_expr_breaks(value, breaks);
+            }
+            Expr::Ref { expr, .. } => Self::find_expr_breaks(expr, breaks),
+            Expr::UnaryNot(expr) | Expr::UnaryMinus(expr) | Expr::Deref(expr) => {
+                Self::find_expr_breaks(expr, breaks);
+            }
+            Expr::Cast { expr, .. } => Self::find_expr_breaks(expr, breaks),
+            Expr::Call { args, .. } => {
+                for arg in args {
+                    Self::find_expr_breaks(arg, breaks);
+                }
+            }
+            Expr::QualifiedCall { args, .. } => {
+                for arg in args {
+                    Self::find_expr_breaks(arg, breaks);
+                }
+            }
+            Expr::Tuple(exprs) | Expr::Array(exprs) => {
+                for expr in exprs {
+                    Self::find_expr_breaks(expr, breaks);
+                }
+            }
+            Expr::Member { expr, .. } => Self::find_expr_breaks(expr, breaks),
+            Expr::MethodCall { expr, args, .. } => {
+                Self::find_expr_breaks(expr, breaks);
+                for arg in args {
+                    Self::find_expr_breaks(arg, breaks);
+                }
+            }
+            Expr::StructLit { fields, .. } => {
+                for (_, field_expr) in fields {
+                    Self::find_expr_breaks(field_expr, breaks);
+                }
+            }
+            Expr::EnumLit { payload, .. } => {
+                if let Some(payload_expr) = payload {
+                    Self::find_expr_breaks(payload_expr, breaks);
+                }
+            }
+            Expr::Repeat(expr, _) => Self::find_expr_breaks(expr, breaks),
+            Expr::Index { array, index } => {
+                Self::find_expr_breaks(array, breaks);
+                Self::find_expr_breaks(index, breaks);
+            }
+            Expr::BoolLit(_)
+            | Expr::IntLit(_)
+            | Expr::FloatLit(_)
+            | Expr::StrLit(_)
+            | Expr::Ident(_)
+            | Expr::Unit => {}
         }
     }
 
@@ -4499,12 +4684,43 @@ impl<'ctx> CodeGen<'ctx> {
                     .map_err(|e| format!("failed to build continue branch: {}", e))?;
                 Ok(())
             }
-            Stmt::Break { .. } => {
+            Stmt::Break { value, .. } => {
                 let ctx = self
                     .loop_stack
                     .last()
+                    .cloned()
                     .ok_or_else(|| "cannot use `break` outside of a loop".to_string())?;
                 let break_bb = ctx.break_bb;
+
+                if let Some(break_expr) = value {
+                    if !ctx.is_loop_expr {
+                        return Err("can only break with a value inside `loop`".to_string());
+                    }
+                    let break_type = self.expr_type(break_expr);
+                    let expected_type = ctx.result_type.as_ref().unwrap();
+                    if &break_type != expected_type {
+                        return Err(format!(
+                            "mismatched types: expected {:?}, found {:?}",
+                            expected_type, break_type
+                        ));
+                    }
+                    let val = self.compile_expr(break_expr)?;
+                    let casted_val = self.emit_cast(val, &break_type, expected_type)?;
+                    self.builder
+                        .build_store(ctx.result_alloca.unwrap(), casted_val)
+                        .map_err(|e| format!("failed to store break result: {}", e))?;
+                } else {
+                    if ctx.is_loop_expr {
+                        let expected_type = ctx.result_type.as_ref().unwrap();
+                        if expected_type != &Type::Unit {
+                            return Err(format!(
+                                "mismatched types: expected {:?}, found ()",
+                                expected_type
+                            ));
+                        }
+                    }
+                }
+
                 self.builder
                     .build_unconditional_branch(break_bb)
                     .map_err(|e| format!("failed to build break branch: {}", e))?;
@@ -6762,6 +6978,19 @@ impl<'ctx> CodeGen<'ctx> {
                     .get_parent()
                     .unwrap();
 
+                let result_type = self.expr_type(expr);
+                let result_llvm_ty = self.type_to_llvm(&result_type);
+                let result_alloca = self
+                    .builder
+                    .build_alloca(result_llvm_ty, "loop_result")
+                    .map_err(|e| format!("failed to build loop result alloca: {}", e))?;
+
+                // Store default value so the result is initialized
+                let default_val = self.get_undef_value(&result_llvm_ty);
+                self.builder
+                    .build_store(result_alloca, default_val)
+                    .map_err(|e| format!("failed to initialize loop result: {}", e))?;
+
                 let header_bb = self.context.append_basic_block(parent_fn, "loop_header");
                 let after_bb = self.context.append_basic_block(parent_fn, "loop_after");
 
@@ -6775,6 +7004,9 @@ impl<'ctx> CodeGen<'ctx> {
                 self.loop_stack.push(LoopContext {
                     continue_bb: header_bb,
                     break_bb: after_bb,
+                    result_alloca: Some(result_alloca),
+                    result_type: Some(result_type.clone()),
+                    is_loop_expr: true,
                 });
                 self.compile_block_get_value(body)?;
                 self.loop_stack.pop();
@@ -6797,9 +7029,12 @@ impl<'ctx> CodeGen<'ctx> {
                 // Position at after block for subsequent code
                 self.builder.position_at_end(after_bb);
 
-                // Loop produces unit value
-                let unit_ty = self.context.struct_type(&[], false);
-                Ok(unit_ty.get_undef().into())
+                // Load loop result
+                let result = self
+                    .builder
+                    .build_load(result_llvm_ty, result_alloca, "loop_result")
+                    .map_err(|e| format!("failed to load loop result: {}", e))?;
+                Ok(result)
             }
             Expr::While { cond, body } => {
                 let parent_fn = self
@@ -6844,6 +7079,9 @@ impl<'ctx> CodeGen<'ctx> {
                 self.loop_stack.push(LoopContext {
                     continue_bb: cond_bb,
                     break_bb: after_bb,
+                    result_alloca: None,
+                    result_type: None,
+                    is_loop_expr: false,
                 });
                 self.compile_block_get_value(body)?;
                 self.loop_stack.pop();
@@ -7256,6 +7494,9 @@ impl<'ctx> CodeGen<'ctx> {
         self.loop_stack.push(LoopContext {
             continue_bb: cond_bb,
             break_bb: after_bb,
+            result_alloca: None,
+            result_type: None,
+            is_loop_expr: false,
         });
         self.compile_block_get_value(body)?;
         self.loop_stack.pop();
@@ -9801,5 +10042,40 @@ mod tests {
             .unwrap(),
             2
         );
+    }
+
+    #[test]
+    fn test_jit_loop_expression_i32() {
+        assert_eq!(
+            jit("fn main() -> i32 { let x = loop { break 42; }; x }").unwrap(),
+            42
+        );
+    }
+
+    #[test]
+    fn test_jit_loop_expression_nested() {
+        assert_eq!(
+            jit(
+                "fn main() -> i32 { let x = loop { let y = loop { break 100; }; break y + 5; }; x }"
+            )
+            .unwrap(),
+            105
+        );
+    }
+
+    #[test]
+    fn test_jit_loop_expression_mismatch_error() {
+        let result = jit("fn main() -> i32 { loop { if true { break 1; } else { break; }; }; 0 }");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("mismatched types"));
+    }
+
+    #[test]
+    fn test_jit_while_break_with_value_error() {
+        let result = jit("fn main() { let mut i = 0; while i < 5 { break 1; }; }");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("can only break with a value"));
     }
 }

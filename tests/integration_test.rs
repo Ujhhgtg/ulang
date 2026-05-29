@@ -1586,3 +1586,49 @@ fn test_never_type_coercion() {
         "#
     ));
 }
+
+#[test]
+fn test_match_single_expression() {
+    assert!(run_test(
+        "match_single_expression",
+        r#"
+        use std::option::Option;
+
+        fn main() -> i32 {
+            let opt = Option::Some(42);
+            let result = match opt {
+                Option::Some(x) => x,
+                Option::None => 0
+            };
+            if result == 42 {
+                return 0;
+            };
+            return 1;
+        }
+        "#
+    ));
+}
+
+#[test]
+fn test_match_single_expression_custom_enum() {
+    assert!(run_test(
+        "match_single_expression_custom_enum",
+        r#"
+        enum Status {
+            Ok(i32),
+            Error,
+        }
+        fn main() -> i32 {
+            let s = Status::Ok(100);
+            let val = match s {
+                Status::Ok(x) => x,
+                Status::Error => 0
+            };
+            if val == 100 {
+                return 0;
+            };
+            return 1;
+        }
+        "#
+    ));
+}

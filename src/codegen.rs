@@ -3654,10 +3654,7 @@ impl<'ctx> CodeGen<'ctx> {
             } else {
                 Type::Unit
             };
-            eprintln!(
-                "DEBUG resolve_match_result_type: arm body type={:?}",
-                ty
-            );
+            eprintln!("DEBUG resolve_match_result_type: arm body type={:?}", ty);
             if ty != Type::Never {
                 return ty;
             }
@@ -3911,9 +3908,7 @@ impl<'ctx> CodeGen<'ctx> {
                 ..
             } => self.resolve_if_let_result_type(then_block, else_block),
             Expr::For { .. } => Type::Unit,
-            Expr::Block(block) => {
-                self.block_type(block)
-            }
+            Expr::Block(block) => self.block_type(block),
             Expr::Match {
                 scrutinee, arms, ..
             } => self.resolve_match_result_type(scrutinee, arms),
@@ -4331,7 +4326,8 @@ impl<'ctx> CodeGen<'ctx> {
         if !already_terminated {
             if let Some(tail_expr) = &func.body.tail_expr {
                 let ret_ty = func.return_type.clone().unwrap_or(Type::I32);
-                let mut val = self.with_expected_type(&ret_ty, |this| this.compile_expr(tail_expr))?;
+                let mut val =
+                    self.with_expected_type(&ret_ty, |this| this.compile_expr(tail_expr))?;
                 let tail_ty = self.expr_type(tail_expr);
                 if tail_ty == Type::Never && ret_ty != Type::Never {
                     val = self.emit_cast(val, &tail_ty, &ret_ty)?;

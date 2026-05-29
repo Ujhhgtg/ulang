@@ -1791,7 +1791,7 @@ fn main() {
             };
             codegen.overloads = overloads;
             if let Err(e) = codegen.jit_run(&program) {
-                error::emit_error_opt(&source, &path, e.span, "runtime error", &e.msg);
+                error::emit_error_opt(&source, &path, e.span, "jit runtime error", &e.msg);
                 process::exit(1);
             }
             println!("program executed successfully");

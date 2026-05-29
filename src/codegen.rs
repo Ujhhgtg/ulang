@@ -5726,7 +5726,10 @@ impl<'ctx> CodeGen<'ctx> {
                         .map_err(|e| CodegenError::new(format!("failed to build load: {}", e)))?;
                     Ok(val)
                 } else {
-                    Err(CodegenError::with_span(format!("undefined variable '{}'", name), expr.span()))
+                    Err(CodegenError::with_span(
+                        format!("undefined variable '{}'", name),
+                        expr.span(),
+                    ))
                 }
             }
             Expr::Assign { target, value, .. } => match target.as_ref() {
@@ -5775,7 +5778,10 @@ impl<'ctx> CodeGen<'ctx> {
                                 if let Some((ptr, _, _)) = self.symbols.get(name) {
                                     *ptr
                                 } else {
-                                    return Err(CodegenError::with_span(format!("undefined variable '{}'", name), expr.span()));
+                                    return Err(CodegenError::with_span(
+                                        format!("undefined variable '{}'", name),
+                                        expr.span(),
+                                    ));
                                 }
                             } else {
                                 return Err("expected pointer for member assignment"
@@ -8680,7 +8686,10 @@ impl<'ctx> CodeGen<'ctx> {
                     BinOp::Mul => Ok(lhs * rhs),
                     BinOp::Div => {
                         if rhs == 0 {
-                            Err("division by zero in const expression".to_string().into())
+                            Err(CodegenError::with_span(
+                                "division by zero in const expression",
+                                expr.span(),
+                            ))
                         } else {
                             Ok(lhs / rhs)
                         }

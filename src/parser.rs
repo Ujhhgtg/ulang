@@ -616,6 +616,13 @@ impl<'a> Parser<'a> {
         let mut params = Vec::new();
         self.expect(&Token::Lt)?;
         loop {
+            let is_const = if *self.peek_token() == Token::Const {
+                self.advance();
+                true
+            } else {
+                false
+            };
+
             let param_name = match self.peek_token() {
                 Token::Ident(s) => {
                     let s = s.clone();
@@ -631,9 +638,12 @@ impl<'a> Parser<'a> {
                 }
             };
 
-            // Optional bounds: `: Trait1 + Trait2`
+            // Optional bounds: `: Trait1 + Trait2` (for types) or type annotation (for consts)
             let mut bounds = Vec::new();
-            if *self.peek_token() == Token::Colon {
+            if is_const {
+                self.expect(&Token::Colon)?;
+                let _const_type = self.parse_type()?;
+            } else if *self.peek_token() == Token::Colon {
                 self.advance(); // consume ':'
                 loop {
                     let trait_name = match self.peek_token() {
@@ -4672,6 +4682,43 @@ mod tests {
             }
             _ => panic!("expected Let with array type annotation"),
         }
+    }
+
+    #[test]
+    fn test_const_generic_params_parsing() {
+        let prog =
+            parse("impl<T, const L: usize> [T; L] { fn len(&self) -> usize { L } }").unwrap();
+        assert_eq!(prog.impls.len(), 1);
+        let imp = &prog.impls[0];
+        assert_eq!(
+            imp.type_params,
+            vec![GenericParam {
+                name: "T".to_string(),
+                bounds: vec![]
+            }]
+        );
+        assert_eq!(imp.const_params, vec!["L".to_string()]);
+        match &imp.impl_type {
+            Type::GenericArray { inner, len_var } => {
+                assert_eq!(**inner, Type::Struct("T".to_string()));
+                assert_eq!(len_var, "L");
+            }
+            _ => panic!("expected GenericArray, got {:?}", imp.impl_type),
+        }
+    }
+
+    #[test]
+    fn test_const_generic_struct_params_parsing() {
+        let prog = parse("struct MyStruct<const N: usize> { data: N }").unwrap();
+        assert_eq!(prog.structs.len(), 1);
+        let s = &prog.structs[0];
+        assert_eq!(
+            s.type_params,
+            vec![GenericParam {
+                name: "N".to_string(),
+                bounds: vec![]
+            }]
+        );
     }
 
     #[test]

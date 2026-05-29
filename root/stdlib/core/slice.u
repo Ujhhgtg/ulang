@@ -5,7 +5,7 @@ use std::iter::IntoIteratorMut;
 use std::iter::Iter;
 use std::iter::IterMut;
 
-impl<T, L> [T; L] {
+impl<T, const L: usize> [T; L] {
     fn len(&self) -> usize {
         L
     }
@@ -15,19 +15,19 @@ impl<T, L> [T; L] {
     }
 }
 
-impl<T, L> Index<usize, T> for [T; L] {
+impl<T, const L: usize> Index<usize, T> for [T; L] {
     fn index(&self, idx: usize) -> &T {
         __builtin_slice_index(self, idx)
     }
 }
 
-impl<T, L> IndexMut<usize, T> for [T; L] {
+impl<T, const L: usize> IndexMut<usize, T> for [T; L] {
     fn index_mut(&mut self, idx: usize) -> &mut T {
         __builtin_slice_index_mut(self, idx)
     }
 }
 
-impl<T, L> IntoIterator<T> for [T; L] {
+impl<T, const L: usize> IntoIterator<T> for [T; L] {
     fn iter(&self) -> Iter<T> {
         let elem_size = __builtin_size_of(*(0 as *const T));
         let start = self.as_ptr() as *mut u8;
@@ -36,7 +36,7 @@ impl<T, L> IntoIterator<T> for [T; L] {
     }
 }
 
-impl<T, L> IntoIteratorMut<T> for [T; L] {
+impl<T, const L: usize> IntoIteratorMut<T> for [T; L] {
     fn iter_mut(&mut self) -> IterMut<T> {
         let elem_size = __builtin_size_of(*(0 as *const T));
         let start = self.as_ptr() as *mut u8;

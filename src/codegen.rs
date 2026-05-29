@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::path::Path;
 
 use inkwell::AddressSpace;
@@ -23,6 +24,47 @@ use crate::ast::{
 use crate::token::Span;
 
 type OverloadMap = HashMap<String, Vec<(String, Vec<Type>)>>;
+
+/// Error type for codegen operations, carrying an optional source span.
+#[derive(Debug)]
+pub struct CodegenError {
+    pub msg: String,
+    pub span: Option<Span>,
+}
+
+impl CodegenError {
+    pub fn new(msg: impl Into<String>) -> Self {
+        Self {
+            msg: msg.into(),
+            span: None,
+        }
+    }
+
+    pub fn with_span(msg: impl Into<String>, span: Span) -> Self {
+        Self {
+            msg: msg.into(),
+            span: Some(span),
+        }
+    }
+}
+
+impl From<String> for CodegenError {
+    fn from(msg: String) -> Self {
+        Self::new(msg)
+    }
+}
+
+impl From<&str> for CodegenError {
+    fn from(msg: &str) -> Self {
+        Self::new(msg.to_string())
+    }
+}
+
+impl fmt::Display for CodegenError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.msg)
+    }
+}
 
 type MainFunc = unsafe extern "C" fn() -> i32;
 

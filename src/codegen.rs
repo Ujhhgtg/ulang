@@ -5726,7 +5726,7 @@ impl<'ctx> CodeGen<'ctx> {
                         .map_err(|e| CodegenError::new(format!("failed to build load: {}", e)))?;
                     Ok(val)
                 } else {
-                    Err(format!("undefined variable '{}'", name).into())
+                    Err(CodegenError::with_span(format!("undefined variable '{}'", name), expr.span()))
                 }
             }
             Expr::Assign { target, value, .. } => match target.as_ref() {
@@ -5775,7 +5775,7 @@ impl<'ctx> CodeGen<'ctx> {
                                 if let Some((ptr, _, _)) = self.symbols.get(name) {
                                     *ptr
                                 } else {
-                                    return Err(format!("undefined variable '{}'", name).into());
+                                    return Err(CodegenError::with_span(format!("undefined variable '{}'", name), expr.span()));
                                 }
                             } else {
                                 return Err("expected pointer for member assignment"

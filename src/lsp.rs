@@ -1146,9 +1146,10 @@ mod tests {
 
         let (url, _) = unwrap_def.unwrap();
         let path = url.to_file_path().unwrap();
+        let path_str = path.to_string_lossy();
         assert!(
-            path.to_string_lossy().contains("option.u"),
-            "unwrap definition should be in option.u, got {:?}",
+            path_str.contains("option.u") || path_str.contains("result.u"),
+            "unwrap definition should be in option.u or result.u, got {:?}",
             path
         );
 

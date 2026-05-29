@@ -1,65 +1,64 @@
 {
-    "name": "ulang",
-    "displayName": "ulang Language Support",
-    "description": "Rich language support for the ulang programming language.",
-    "version": "0.1.0",
-    "publisher": "Ujhhgtg",
-    "engines": {
-        "vscode": "^1.75.0"
-    },
-    "categories": [
-        "Programming Languages"
+  "name": "ulang",
+  "displayName": "ulang Language Support",
+  "description": "Rich language support for the ulang programming language.",
+  "version": "0.1.0",
+  "publisher": "Ujhhgtg",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "activationEvents": [],
+  "main": "./out/extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "ulang",
+        "aliases": [
+          "ulang"
+        ],
+        "extensions": [
+          ".u"
+        ],
+        "configuration": "./language-configuration.json"
+      }
     ],
-    "activationEvents": [],
-    "main": "./out/extension.js",
-    "contributes": {
-        "languages": [
-            {
-                "id": "ulang",
-                "aliases": [
-                    "Ulang",
-                    "ulang"
-                ],
-                "extensions": [
-                    ".u"
-                ],
-                "configuration": "./language-configuration.json"
-            }
-        ],
-        "grammars": [
-            {
-                "language": "ulang",
-                "scopeName": "source.u",
-                "path": "./syntaxes/ulang.tmLanguage.json"
-            }
-        ],
-        "configuration": {
-            "title": "ulang",
-            "properties": {
-                "ulang.executablePath": {
-                    "type": "string",
-                    "default": "ulang",
-                    "description": "Path to the ulang compiler binary. Can be a command on PATH (like 'ulang') or a relative/absolute path (like './target/debug/ulang')."
-                },
-                "ulang.rootPath": {
-                    "type": "string",
-                    "default": "",
-                    "description": "Path to the ULANG_ROOT directory containing standard libraries (stdlib)."
-                }
-            }
+    "grammars": [
+      {
+        "language": "ulang",
+        "scopeName": "source.u",
+        "path": "./syntaxes/ulang.tmLanguage.json"
+      }
+    ],
+    "configuration": {
+      "title": "ulang",
+      "properties": {
+        "ulang.executablePath": {
+          "type": "string",
+          "default": "ulang",
+          "description": "Path to the ulang compiler binary. Can be a command on PATH (like 'ulang') or a relative/absolute path (like './target/debug/ulang')."
+        },
+        "ulang.rootPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the ULANG_ROOT directory containing standard libraries (stdlib)."
         }
-    },
-    "scripts": {
-        "vscode:prepublish": "deno run compile",
-        "compile": "tsc -p ./",
-        "watch": "tsc -watch -p ./"
-    },
-    "dependencies": {
-        "vscode-languageclient": "^9"
-    },
-    "devDependencies": {
-        "@types/node": "^25",
-        "@types/vscode": "^1",
-        "typescript": "^6"
+      }
     }
+  },
+  "scripts": {
+    "vscode:prepublish": "deno run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9"
+  },
+  "devDependencies": {
+    "@types/node": "^25",
+    "@types/vscode": "^1",
+    "typescript": "^6"
+  }
 }

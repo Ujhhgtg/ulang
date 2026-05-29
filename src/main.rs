@@ -473,7 +473,7 @@ fn do_build(codegen: &mut codegen::CodeGen<'_>, output: Option<String>, cc: Cc) 
                 &TargetTriple::create("x86_64-pc-linux-gnu"),
                 Path::new(&obj_path),
             ) {
-                error::emit_error_opt(&codegen.source, &codegen.path, None, "codegen error", &msg.msg);
+                error::emit_error_opt(&codegen.source, &codegen.path, msg.span, "codegen error", &msg.msg);
                 process::exit(1);
             }
 
@@ -491,7 +491,7 @@ fn do_build(codegen: &mut codegen::CodeGen<'_>, output: Option<String>, cc: Cc) 
                 &TargetTriple::create("aarch64-linux-gnu"),
                 &aarch64_obj,
             ) {
-                error::emit_error_opt(&codegen.source, &codegen.path, None, "codegen error", &msg.msg);
+                error::emit_error_opt(&codegen.source, &codegen.path, msg.span, "codegen error", &msg.msg);
                 let _ = std::fs::remove_dir_all(&aarch64_dir);
                 let _ = fs::remove_file(&obj_path);
                 process::exit(1);
@@ -503,7 +503,7 @@ fn do_build(codegen: &mut codegen::CodeGen<'_>, output: Option<String>, cc: Cc) 
                 Path::new(&obj_path),
                 Path::new(&exe_path),
             ) {
-                error::emit_error_opt(&codegen.source, &codegen.path, None, "link error", &msg.msg);
+                error::emit_error_opt(&codegen.source, &codegen.path, msg.span, "link error", &msg.msg);
                 let _ = std::fs::remove_dir_all(&aarch64_dir);
                 let _ = fs::remove_file(&obj_path);
                 process::exit(1);
@@ -514,7 +514,7 @@ fn do_build(codegen: &mut codegen::CodeGen<'_>, output: Option<String>, cc: Cc) 
         }
         _ => {
             if let Err(msg) = codegen.compile_to_object(Path::new(&obj_path)) {
-                error::emit_error_opt(&codegen.source, &codegen.path, None, "codegen error", &msg.msg);
+                error::emit_error_opt(&codegen.source, &codegen.path, msg.span, "codegen error", &msg.msg);
                 process::exit(1);
             }
 
@@ -528,7 +528,7 @@ fn do_build(codegen: &mut codegen::CodeGen<'_>, output: Option<String>, cc: Cc) 
                 Path::new(&obj_path),
                 Path::new(&exe_path),
             ) {
-                error::emit_error_opt(&codegen.source, &codegen.path, None, "link error", &msg.msg);
+                error::emit_error_opt(&codegen.source, &codegen.path, msg.span, "link error", &msg.msg);
                 let _ = fs::remove_file(&obj_path);
                 process::exit(1);
             }
@@ -1755,13 +1755,13 @@ fn main() {
             ) {
                 Ok(cg) => cg,
                 Err(e) => {
-                    error::emit_error_opt(&source, &path, None, "codegen error", &e.msg);
+                    error::emit_error_opt(&source, &path, e.span, "codegen error", &e.msg);
                     process::exit(1);
                 }
             };
             codegen.overloads = overloads;
             if let Err(e) = codegen.jit_run(&program) {
-                error::emit_error_opt(&source, &path, None, "runtime error", &e.msg);
+                error::emit_error_opt(&source, &path, e.span, "runtime error", &e.msg);
                 process::exit(1);
             }
             println!("program executed successfully");
@@ -1773,7 +1773,7 @@ fn main() {
             codegen.overloads = overloads;
 
             if let Err(e) = codegen.compile_module(&program) {
-                error::emit_error_opt(&source, &path, None, "codegen error", &e.msg);
+                error::emit_error_opt(&source, &path, e.span, "codegen error", &e.msg);
                 process::exit(1);
             }
 
@@ -1787,7 +1787,7 @@ fn main() {
             codegen.overloads = overloads;
 
             if let Err(e) = codegen.compile_module(&program) {
-                error::emit_error_opt(&source, &path, None, "codegen error", &e.msg);
+                error::emit_error_opt(&source, &path, e.span, "codegen error", &e.msg);
                 process::exit(1);
             }
 
@@ -1817,7 +1817,7 @@ fn main() {
             codegen.overloads = overloads;
 
             if let Err(e) = codegen.compile_module(&program) {
-                error::emit_error_opt(&source, &path, None, "codegen error", &e.msg);
+                error::emit_error_opt(&source, &path, e.span, "codegen error", &e.msg);
                 process::exit(1);
             }
 

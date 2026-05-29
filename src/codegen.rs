@@ -5679,7 +5679,7 @@ impl<'ctx> CodeGen<'ctx> {
                                 .builder
                                 .build_extract_value(sv, 0, "slice_ptr")
                                 .map_err(|e| CodegenError::new(format!("failed to extract slice ptr: {}", e)))?,
-                            _ => return Err("expected slice fat pointer".to_string().into()),
+                            _ => return Err(CodegenError::with_span("expected slice fat pointer", expr.span())),
                         };
                         let ptr = ptr_field.into_pointer_value();
                         let elem_ty = match &array_ty {
@@ -5709,14 +5709,14 @@ impl<'ctx> CodeGen<'ctx> {
                         Type::Ref { inner, .. } => match inner.as_ref() {
                             Type::Array { inner: ai, len } => (*ai.clone(), *len),
                             _ => {
-                                return Err(format!(
+                                return Err(CodegenError::with_span(format!(
                                     "cannot index into non-array type {:?}",
                                     array_ty
-                                ).into());
+                                ), expr.span()));
                             }
                         },
                         _ => {
-                            return Err(format!("cannot index into non-array type {:?}", array_ty).into());
+                            return Err(CodegenError::with_span(format!("cannot index into non-array type {:?}", array_ty), expr.span()));
                         }
                     };
                     self.ensure_slice_methods(&elem_ty, len)?;
@@ -5738,7 +5738,7 @@ impl<'ctx> CodeGen<'ctx> {
                         if let Some((ptr, _, _)) = self.symbols.get(name) {
                             *ptr
                         } else {
-                            return Err(format!("undefined variable '{}'", name).into());
+                            return Err(CodegenError::with_span(format!("undefined variable '{}'", name), expr.span()));
                         }
                     } else {
                         let array_val = self.compile_expr(array)?;
@@ -5774,14 +5774,14 @@ impl<'ctx> CodeGen<'ctx> {
                         .map_err(|e| CodegenError::new(format!("failed to store through index_mut: {}", e)))?;
                     Ok(val)
                 }
-                _ => Err("invalid assignment target".to_string().into()),
+                _ => Err(CodegenError::with_span("invalid assignment target", expr.span())),
             },
             Expr::Ref { expr, .. } => {
                 if let Expr::Ident(name, ..) = expr.as_ref() {
                     if let Some((ptr, _, _)) = self.symbols.get(name) {
                         Ok((*ptr).into())
                     } else {
-                        Err(format!("undefined variable '{}'", name).into())
+                        Err(CodegenError::with_span(format!("undefined variable '{}'", name), expr.span()))
                     }
                 } else if let Expr::Deref(inner, ..) = expr.as_ref() {
                     self.compile_expr(inner)
@@ -5875,7 +5875,7 @@ impl<'ctx> CodeGen<'ctx> {
                             )
                         })?
                 } else {
-                    return Err(format!("unknown function '{}'", callee).into());
+                    return Err(CodegenError::with_span(format!("unknown function '{}'", callee), expr.span()));
                 };
                 let mut arg_values = self.compile_args_vec(args)?;
                 // Coerce arguments to match declared parameter types
@@ -6331,17 +6331,17 @@ impl<'ctx> CodeGen<'ctx> {
                                         Self::mangle_generic_instance(name, args)
                                     }
                                     _ => {
-                                        return Err(format!(
+                                        return Err(CodegenError::with_span(format!(
                                             "cannot access field '{}' on non-struct type",
                                             field_name
-                                        ).into());
+                                    ), expr.span()));
                                     }
                                 },
                                 _ => {
-                                    return Err(format!(
+                                    return Err(CodegenError::with_span(format!(
                                         "cannot access field '{}' on non-struct type",
                                         field_name
-                                    ).into());
+                                    ), expr.span()));
                                 }
                             };
                             if let Some(field_name) = field {
@@ -6370,10 +6370,10 @@ impl<'ctx> CodeGen<'ctx> {
                         };
                         let field_count = struct_ty.count_fields();
                         if (effective_index as usize) >= field_count as usize {
-                            return Err(format!(
+                            return Err(CodegenError::with_span(format!(
                                 "field index {} out of bounds; struct has {} fields",
                                 effective_index, field_count
-                            ).into());
+                            ), expr.span()));
                         }
                         let extracted = self
                             .builder
@@ -6381,7 +6381,7 @@ impl<'ctx> CodeGen<'ctx> {
                             .map_err(|e| CodegenError::new(format!("failed to extract struct field: {}", e)))?;
                         Ok(extracted)
                     }
-                    _ => Err("cannot access member of non-struct value".to_string().into()),
+                    _ => Err(CodegenError::with_span("cannot access member of non-struct value", expr.span())),
                 }
             }
             Expr::MethodCall {
@@ -6502,10 +6502,10 @@ impl<'ctx> CodeGen<'ctx> {
                         Type::F32 => ("f32".to_string(), true),
                         Type::F64 => ("f64".to_string(), true),
                         _ => {
-                            return Err(format!(
+                            return Err(CodegenError::with_span(format!(
                                 "cannot call method '{}' on type {:?}",
                                 method, receiver_type
-                            ).into());
+                            ), expr.span()));
                         }
                     },
                     Type::Bool => ("bool".to_string(), false),
@@ -6522,10 +6522,10 @@ impl<'ctx> CodeGen<'ctx> {
                     Type::F32 => ("f32".to_string(), false),
                     Type::F64 => ("f64".to_string(), false),
                     _ => {
-                        return Err(format!(
+                        return Err(CodegenError::with_span(format!(
                             "cannot call method '{}' on type {:?}",
                             method, receiver_type
-                        ).into());
+                        ), expr.span()));
                     }
                 };
 
@@ -6546,7 +6546,7 @@ impl<'ctx> CodeGen<'ctx> {
                 {
                     mangled_name.clone()
                 } else {
-                    return Err(format!("type '{}' has no method '{}'", type_name, method).into());
+                    return Err(CodegenError::with_span(format!("type '{}' has no method '{}'", type_name, method), expr.span()));
                 };
 
                 self.check_visibility_of_path(&self.current_module_path, &mangled)?;
@@ -6565,7 +6565,7 @@ impl<'ctx> CodeGen<'ctx> {
                             if let Some((ptr, _, _)) = self.symbols.get(name) {
                                 *ptr
                             } else {
-                                return Err(format!("undefined variable '{}'", name).into());
+                                return Err(CodegenError::with_span(format!("undefined variable '{}'", name), expr.span()));
                             }
                         } else {
                             if let Expr::Member {
@@ -6758,12 +6758,12 @@ impl<'ctx> CodeGen<'ctx> {
                 }
                 match result {
                     inkwell::values::AggregateValueEnum::StructValue(sv) => Ok(sv.into()),
-                    _ => Err(format!("expected struct value for '{}'", struct_name).into()),
+                    _ => Err(CodegenError::with_span(format!("expected struct value for '{}'", struct_name), expr.span())),
                 }
             }
             Expr::Array(elems, ..) => {
                 if elems.is_empty() {
-                    return Err("empty array literals are not supported".to_string().into());
+                    return Err(CodegenError::with_span("empty array literals are not supported", expr.span()));
                 }
                 let elem_ty = self.expr_type(&elems[0]);
                 let elem_llvm = self.type_to_llvm(&elem_ty);
@@ -6862,7 +6862,7 @@ impl<'ctx> CodeGen<'ctx> {
                             .builder
                             .build_extract_value(sv, 0, "slice_ptr")
                             .map_err(|e| CodegenError::new(format!("failed to extract slice ptr: {}", e)))?,
-                        _ => return Err("expected slice fat pointer".to_string().into()),
+                        _ => return Err(CodegenError::with_span("expected slice fat pointer", expr.span())),
                     };
                     let ptr = ptr_field.into_pointer_value();
                     let elem_ty = match &array_ty {
@@ -6892,11 +6892,11 @@ impl<'ctx> CodeGen<'ctx> {
                     Type::Ref { inner, .. } => match inner.as_ref() {
                         Type::Array { inner: ai, len } => (*ai.clone(), *len),
                         _ => {
-                            return Err(format!("cannot index into non-array type {:?}", array_ty).into());
+                            return Err(CodegenError::with_span(format!("cannot index into non-array type {:?}", array_ty), expr.span()));
                         }
                     },
                     _ => {
-                        return Err(format!("cannot index into non-array type {:?}", array_ty).into());
+                        return Err(CodegenError::with_span(format!("cannot index into non-array type {:?}", array_ty), expr.span()));
                     }
                 };
                 self.ensure_slice_methods(&elem_ty, len)?;
@@ -6919,7 +6919,7 @@ impl<'ctx> CodeGen<'ctx> {
                     if let Some((ptr, _, _)) = self.symbols.get(name) {
                         *ptr
                     } else {
-                        return Err(format!("undefined variable '{}'", name).into());
+                        return Err(CodegenError::with_span(format!("undefined variable '{}'", name), expr.span()));
                     }
                 } else {
                     let array_val = self.compile_expr(array)?;
@@ -6975,13 +6975,13 @@ impl<'ctx> CodeGen<'ctx> {
 
                 let cond_type = self.expr_type(cond);
                 if cond_type != Type::Bool {
-                    return Err(format!("if condition must be bool, found {:?}", cond_type).into());
+                    return Err(CodegenError::with_span(format!("if condition must be bool, found {:?}", cond_type), expr.span()));
                 }
                 let cond_val = self.compile_expr(cond)?;
                 let cond_i1 = match cond_val {
                     BasicValueEnum::IntValue(v) => v,
                     _ => {
-                        return Err("if condition must be a boolean".to_string().into());
+                        return Err(CodegenError::with_span("if condition must be a boolean", expr.span()));
                     }
                 };
 
@@ -7150,16 +7150,16 @@ impl<'ctx> CodeGen<'ctx> {
                 self.builder.position_at_end(cond_bb);
                 let cond_type = self.expr_type(cond);
                 if cond_type != Type::Bool {
-                    return Err(format!(
+                    return Err(CodegenError::with_span(format!(
                         "while condition must be bool, found {:?}",
                         cond_type
-                    ).into());
+                    ), expr.span()));
                 }
                 let cond_val = self.compile_expr(cond)?;
                 let cond_i1 = match cond_val {
                     BasicValueEnum::IntValue(v) => v,
                     _ => {
-                        return Err("while condition must be a boolean".to_string().into());
+                        return Err(CodegenError::with_span("while condition must be a boolean", expr.span()));
                     }
                 };
                 self.builder
@@ -7207,7 +7207,7 @@ impl<'ctx> CodeGen<'ctx> {
                         .build_not(v, "not")
                         .map_err(|e| CodegenError::new(format!("failed to build unary not: {}", e)))?
                         .into()),
-                    _ => Err("unary ! requires integer operand".to_string().into()),
+                    _ => Err(CodegenError::with_span("unary ! requires integer operand", expr.span())),
                 }
             }
             Expr::UnaryMinus(inner_expr, ..) => {
@@ -7223,7 +7223,7 @@ impl<'ctx> CodeGen<'ctx> {
                         .build_float_neg(v, "neg")
                         .map_err(|e| CodegenError::new(format!("failed to build unary minus: {}", e)))?
                         .into()),
-                    _ => Err("unary - requires numeric operand".to_string().into()),
+                    _ => Err(CodegenError::with_span("unary - requires numeric operand", expr.span())),
                 }
             }
             Expr::EnumLit {
@@ -7321,7 +7321,7 @@ impl<'ctx> CodeGen<'ctx> {
                 }
                 match result {
                     inkwell::values::AggregateValueEnum::StructValue(sv) => Ok(sv.into()),
-                    _ => Err(format!("expected struct value for enum '{}'", enum_name).into()),
+                    _ => Err(CodegenError::with_span(format!("expected struct value for enum '{}'", enum_name), expr.span())),
                 }
             }
             Expr::For {
@@ -7508,10 +7508,10 @@ impl<'ctx> CodeGen<'ctx> {
         } else if is_iter {
             container.clone()
         } else {
-            return Err(format!(
+            return Err(CodegenError::with_span(format!(
                 "type {:?} does not implement IntoIterator or Iterator",
                 container_type
-            ).into());
+            ), container.span()));
         };
         // Determine loop element type by simulating calling next() on the iterator
         let next_expr = Expr::MethodCall {
@@ -7539,10 +7539,10 @@ impl<'ctx> CodeGen<'ctx> {
                 args[0].clone()
             }
             _ => {
-                return Err(format!(
+                return Err(CodegenError::with_span(format!(
                     "iterator's next() must return Option<T>, found {:?}",
                     option_ty
-                ).into());
+                ), container.span()));
             }
         };
         // Ensure Option<elem_ty> is monomorphized so that pattern matching tag layouts are available
@@ -7704,7 +7704,7 @@ impl<'ctx> CodeGen<'ctx> {
                         }
                     }
                     _ => {
-                        return Err("match guard must be a boolean".to_string().into());
+                        return Err(CodegenError::with_span("match guard must be a boolean", scrutinee.span()));
                     }
                 };
                 matches_val = self

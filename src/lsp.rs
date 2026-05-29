@@ -7,9 +7,10 @@ use lsp_types::{
     Diagnostic, DiagnosticSeverity, GotoDefinitionParams, GotoDefinitionResponse, Hover,
     HoverContents, HoverParams, HoverProviderCapability, InitializeParams, Location, MarkupContent,
     MarkupKind, OneOf, Position, PublishDiagnosticsParams, Range, ServerCapabilities,
-    TextDocumentSyncCapability, TextDocumentSyncKind, Url,
+    TextDocumentSyncCapability, TextDocumentSyncKind, Uri,
 };
 use std::collections::HashMap;
+use url::Url;
 
 struct DocumentState {
     source: String,
@@ -574,7 +575,8 @@ fn publish_diagnostics(
     url: Url,
     diagnostics: Vec<Diagnostic>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let params = PublishDiagnosticsParams::new(url, diagnostics, None);
+    let uri = url.to_string().parse::<Uri>().unwrap();
+    let params = PublishDiagnosticsParams::new(uri, diagnostics, None);
     let notification = Notification::new("textDocument/publishDiagnostics".to_string(), params);
     connection
         .sender
@@ -587,7 +589,8 @@ fn handle_hover(
     stdlib_cache: &StdlibCache,
     params: HoverParams,
 ) -> Option<Hover> {
-    let url = params.text_document_position_params.text_document.uri;
+    let uri = params.text_document_position_params.text_document.uri;
+    let url = Url::parse(uri.as_str()).unwrap();
     let doc = documents.get(&url)?;
     let position = params.text_document_position_params.position;
 
@@ -724,7 +727,8 @@ fn handle_definition(
     stdlib_cache: &StdlibCache,
     params: GotoDefinitionParams,
 ) -> Option<GotoDefinitionResponse> {
-    let url = params.text_document_position_params.text_document.uri;
+    let uri = params.text_document_position_params.text_document.uri;
+    let url = Url::parse(uri.as_str()).unwrap();
     let doc = documents.get(&url)?;
     let position = params.text_document_position_params.position;
 
@@ -753,13 +757,14 @@ fn handle_definition(
             let start = offset_to_position(&doc.source, def_span.lo);
             let end = offset_to_position(&doc.source, def_span.hi);
             let range = Range::new(start, end);
-            return Some(GotoDefinitionResponse::Scalar(Location::new(url, range)));
+            return Some(GotoDefinitionResponse::Scalar(Location::new(uri, range)));
         }
 
         // Fallback: Search the standard library cache
         if let Some((file_url, range)) = find_stdlib_definition(stdlib_cache, name) {
+            let file_uri = file_url.to_string().parse::<Uri>().unwrap();
             return Some(GotoDefinitionResponse::Scalar(Location::new(
-                file_url, range,
+                file_uri, range,
             )));
         }
     }
@@ -825,7 +830,8 @@ fn main_loop(
                 "textDocument/didOpen" => {
                     let params =
                         cast_notification::<lsp_types::notification::DidOpenTextDocument>(not)?;
-                    let url = params.text_document.uri;
+                    let uri = params.text_document.uri;
+                    let url = Url::parse(uri.as_str()).unwrap();
                     let text = params.text_document.text;
 
                     let diags = update_document(&mut documents, url.clone(), text);
@@ -834,7 +840,8 @@ fn main_loop(
                 "textDocument/didChange" => {
                     let params =
                         cast_notification::<lsp_types::notification::DidChangeTextDocument>(not)?;
-                    let url = params.text_document.uri;
+                    let uri = params.text_document.uri;
+                    let url = Url::parse(uri.as_str()).unwrap();
                     if let Some(change) = params.content_changes.into_iter().next() {
                         let diags = update_document(&mut documents, url.clone(), change.text);
                         publish_diagnostics(&connection, url, diags)?;
@@ -843,7 +850,8 @@ fn main_loop(
                 "textDocument/didClose" => {
                     let params =
                         cast_notification::<lsp_types::notification::DidCloseTextDocument>(not)?;
-                    documents.remove(&params.text_document.uri);
+                    let url = Url::parse(params.text_document.uri.as_str()).unwrap();
+                    documents.remove(&url);
                 }
                 _ => {}
             },

@@ -473,7 +473,13 @@ fn do_build(codegen: &mut codegen::CodeGen<'_>, output: Option<String>, cc: Cc) 
                 &TargetTriple::create("x86_64-pc-linux-gnu"),
                 Path::new(&obj_path),
             ) {
-                error::emit_error_opt(&codegen.source, &codegen.path, msg.span, "codegen error", &msg.msg);
+                error::emit_error_opt(
+                    &codegen.source,
+                    &codegen.path,
+                    msg.span,
+                    "codegen error",
+                    &msg.msg,
+                );
                 process::exit(1);
             }
 
@@ -491,7 +497,13 @@ fn do_build(codegen: &mut codegen::CodeGen<'_>, output: Option<String>, cc: Cc) 
                 &TargetTriple::create("aarch64-linux-gnu"),
                 &aarch64_obj,
             ) {
-                error::emit_error_opt(&codegen.source, &codegen.path, msg.span, "codegen error", &msg.msg);
+                error::emit_error_opt(
+                    &codegen.source,
+                    &codegen.path,
+                    msg.span,
+                    "codegen error",
+                    &msg.msg,
+                );
                 let _ = std::fs::remove_dir_all(&aarch64_dir);
                 let _ = fs::remove_file(&obj_path);
                 process::exit(1);
@@ -503,7 +515,13 @@ fn do_build(codegen: &mut codegen::CodeGen<'_>, output: Option<String>, cc: Cc) 
                 Path::new(&obj_path),
                 Path::new(&exe_path),
             ) {
-                error::emit_error_opt(&codegen.source, &codegen.path, msg.span, "link error", &msg.msg);
+                error::emit_error_opt(
+                    &codegen.source,
+                    &codegen.path,
+                    msg.span,
+                    "link error",
+                    &msg.msg,
+                );
                 let _ = std::fs::remove_dir_all(&aarch64_dir);
                 let _ = fs::remove_file(&obj_path);
                 process::exit(1);
@@ -514,7 +532,13 @@ fn do_build(codegen: &mut codegen::CodeGen<'_>, output: Option<String>, cc: Cc) 
         }
         _ => {
             if let Err(msg) = codegen.compile_to_object(Path::new(&obj_path)) {
-                error::emit_error_opt(&codegen.source, &codegen.path, msg.span, "codegen error", &msg.msg);
+                error::emit_error_opt(
+                    &codegen.source,
+                    &codegen.path,
+                    msg.span,
+                    "codegen error",
+                    &msg.msg,
+                );
                 process::exit(1);
             }
 
@@ -528,7 +552,13 @@ fn do_build(codegen: &mut codegen::CodeGen<'_>, output: Option<String>, cc: Cc) 
                 Path::new(&obj_path),
                 Path::new(&exe_path),
             ) {
-                error::emit_error_opt(&codegen.source, &codegen.path, msg.span, "link error", &msg.msg);
+                error::emit_error_opt(
+                    &codegen.source,
+                    &codegen.path,
+                    msg.span,
+                    "link error",
+                    &msg.msg,
+                );
                 let _ = fs::remove_file(&obj_path);
                 process::exit(1);
             }

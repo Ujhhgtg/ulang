@@ -74,6 +74,231 @@ fn test_mutable_var_reassign() {
     ));
 }
 
+// ---------------------------------------------------------------------------
+// LSP Completion Integration Tests
+// ---------------------------------------------------------------------------
+
+use std::io::{BufRead, BufReader, Read, Write};
+use std::process::{Child, Stdio};
+
+/// Send a JSON-RPC message to an LSP server via stdin.
+fn lsp_send(stdin: &mut dyn Write, msg: &serde_json::Value) {
+    let body = serde_json::to_string(msg).unwrap();
+    let header = format!("Content-Length: {}\r\n\r\n", body.len());
+    stdin.write_all(header.as_bytes()).unwrap();
+    stdin.write_all(body.as_bytes()).unwrap();
+    stdin.flush().unwrap();
+}
+
+/// Read a JSON-RPC message from an LSP server via stdout.
+fn lsp_read(stdout: &mut BufReader<Box<dyn Read>>) -> serde_json::Value {
+    let mut header = String::new();
+    loop {
+        let mut line = String::new();
+        stdout.read_line(&mut line).unwrap();
+        if line == "\r\n" {
+            break;
+        }
+        header.push_str(&line);
+    }
+    let content_len: usize = header
+        .lines()
+        .find(|l| l.to_lowercase().starts_with("content-length"))
+        .and_then(|l| l.split(':').nth(1))
+        .and_then(|s| s.trim().parse().ok())
+        .expect("Content-Length header");
+    let mut body = vec![0u8; content_len];
+    stdout.read_exact(&mut body).unwrap();
+    serde_json::from_slice(&body).unwrap()
+}
+
+/// Start ulang LSP server, initialize it, return (child, stdin, stdout_reader).
+fn lsp_start() -> (Child, Box<dyn Write>, BufReader<Box<dyn Read>>) {
+    let mut child = Command::new(ulang_binary())
+        .arg("lsp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("Failed to spawn ulang lsp");
+
+    let mut stdin: Box<dyn Write> = Box::new(child.stdin.take().unwrap());
+    let stdout: Box<dyn Read> = Box::new(child.stdout.take().unwrap());
+    let mut stdout_reader = BufReader::new(stdout);
+
+    // Send initialize request
+    lsp_send(
+        &mut *stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "processId": null,
+                "capabilities": {},
+                "rootUri": "file:///tmp/ulang-test-project",
+                "workspaceFolders": [{
+                    "uri": "file:///tmp/ulang-test-project",
+                    "name": "test"
+                }]
+            }
+        }),
+    );
+
+    // Read the initialize response
+    let _init_resp = lsp_read(&mut stdout_reader);
+
+    // Send initialized notification
+    lsp_send(
+        &mut *stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "initialized",
+            "params": {}
+        }),
+    );
+
+    (child, stdin, stdout_reader)
+}
+
+/// Open a document in the LSP server.
+fn lsp_open(stdin: &mut dyn Write, url: &str, text: &str) {
+    lsp_send(
+        stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {
+                "textDocument": {
+                    "uri": url,
+                    "languageId": "ulang",
+                    "version": 1,
+                    "text": text
+                }
+            }
+        }),
+    );
+}
+
+/// Request completion at a given position and return the response.
+fn lsp_completion(
+    stdin: &mut dyn Write,
+    stdout: &mut BufReader<Box<dyn Read>>,
+    url: &str,
+    line: u32,
+    character: u32,
+) -> serde_json::Value {
+    lsp_send(
+        stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 100,
+            "method": "textDocument/completion",
+            "params": {
+                "textDocument": {
+                    "uri": url
+                },
+                "position": {
+                    "line": line,
+                    "character": character
+                }
+            }
+        }),
+    );
+    // Read responses, skipping notifications until we get our result
+    loop {
+        let msg = lsp_read(stdout);
+        if msg.get("id").and_then(|id| id.as_i64()) == Some(100) {
+            return msg;
+        }
+    }
+}
+
+#[test]
+fn test_lsp_completion_stdlib_symbols() {
+    let (mut child, mut stdin, mut stdout) = lsp_start();
+
+    let url = "file:///tmp/ulang-test-project/main.u";
+    lsp_open(&mut stdin, url, "fn main() {}");
+
+    // Request completion on empty document (line 0, after fn main() {})
+    let resp = lsp_completion(&mut stdin, &mut stdout, url, 0, 0);
+
+    // The response should contain an array of completion items
+    let items = resp["result"].as_array().expect("Should have result array");
+    assert!(!items.is_empty(), "Should have completion items");
+
+    // Check that Option and Result are present
+    let labels: Vec<&str> = items.iter().filter_map(|i| i["label"].as_str()).collect();
+    assert!(
+        labels.contains(&"Option"),
+        "Option should be in completions"
+    );
+    assert!(
+        labels.contains(&"Result"),
+        "Result should be in completions"
+    );
+
+    // Unimported symbols should have additionalTextEdits
+    let option_item = items
+        .iter()
+        .find(|i| i["label"].as_str() == Some("Option"))
+        .unwrap();
+    assert!(
+        option_item.get("additionalTextEdits").is_some(),
+        "Option should have additionalTextEdits for use insertion"
+    );
+
+    child.kill().ok();
+}
+
+#[test]
+fn test_lsp_completion_imported_no_use_insertion() {
+    let (mut child, mut stdin, mut stdout) = lsp_start();
+
+    let url = "file:///tmp/ulang-test-project/main.u";
+    lsp_open(
+        &mut stdin,
+        url,
+        "use std::option::Option;\nfn main() { let x = Option::None; }",
+    );
+
+    // Request completion after "Option" is already imported
+    let resp = lsp_completion(&mut stdin, &mut stdout, url, 1, 0);
+
+    let items = resp["result"].as_array().expect("Should have result array");
+    let option_item = items.iter().find(|i| i["label"].as_str() == Some("Option"));
+    assert!(option_item.is_some(), "Option should still appear");
+    assert!(
+        option_item.unwrap().get("additionalTextEdits").is_none(),
+        "Option should NOT have additionalTextEdits (already imported)"
+    );
+
+    child.kill().ok();
+}
+
+#[test]
+fn test_lsp_completion_path_prefix_vec() {
+    let (mut child, mut stdin, mut stdout) = lsp_start();
+
+    let url = "file:///tmp/ulang-test-project/main.u";
+    // Cursor is right after std::vec::
+    lsp_open(&mut stdin, url, "std::vec::");
+
+    let resp = lsp_completion(&mut stdin, &mut stdout, url, 0, "std::vec::".len() as u32);
+
+    let items = resp["result"].as_array().expect("Should have result array");
+    assert!(!items.is_empty(), "Should have vec module completions");
+
+    let labels: Vec<&str> = items.iter().filter_map(|i| i["label"].as_str()).collect();
+    assert!(
+        labels.contains(&"Vec"),
+        "Vec should be in std::vec:: completions"
+    );
+
+    child.kill().ok();
+}
+
 #[test]
 fn test_const_declaration() {
     assert!(run_test(

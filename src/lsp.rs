@@ -3,6 +3,11 @@ use crate::lexer::Lexer;
 use crate::parser::Parser;
 use crate::token::{Span, Token};
 use lsp_server::{Connection, Message, Notification, Request, Response};
+use lsp_types::request::Completion;
+use lsp_types::{
+    CompletionItem, CompletionItemKind, CompletionOptions, CompletionParams, CompletionResponse,
+    InsertTextFormat, TextEdit,
+};
 use lsp_types::{
     Diagnostic, DiagnosticSeverity, GotoDefinitionParams, GotoDefinitionResponse, Hover,
     HoverContents, HoverParams, HoverProviderCapability, InitializeParams, Location, MarkupContent,
@@ -1343,9 +1348,960 @@ where
         .map_err(|e| format!("failed to extract notification: {:?}", e).into())
 }
 
+// ---------------------------------------------------------------------------
+// Completion infrastructure
+// ---------------------------------------------------------------------------
+
+/// Cached parsed project files for cross-file completion.
+struct ProjectCache {
+    entries: Vec<(Url, StdlibEntry)>,
+}
+
+fn build_project_cache(
+    workspace_root: &std::path::Path,
+    documents: &HashMap<Url, DocumentState>,
+) -> ProjectCache {
+    let mut entries = Vec::new();
+    let mut paths = Vec::new();
+    collect_u_files(workspace_root, workspace_root, &mut paths);
+
+    // Compute stdlib root to exclude stdlib files from project cache
+    let stdlib_root = std::fs::canonicalize(find_stdlib_root()).ok();
+
+    for path in &paths {
+        // Skip files that belong to the standard library
+        if let Some(ref stdlib) = stdlib_root {
+            if let Ok(canonical_path) = std::fs::canonicalize(path) {
+                if canonical_path.starts_with(stdlib) {
+                    continue;
+                }
+            }
+        }
+
+        if let Ok(url) = Url::from_file_path(path) {
+            // If the file is open in the editor, use the editor's source.
+            // Otherwise read from disk.
+            let source = if let Some(doc) = documents.get(&url) {
+                doc.source.clone()
+            } else if let Ok(src) = std::fs::read_to_string(path) {
+                src
+            } else {
+                continue;
+            };
+
+            let mut lexer = Lexer::new(&source);
+            let mut tokens = Vec::new();
+            loop {
+                match lexer.next_token() {
+                    Ok((token, span)) => {
+                        tokens.push((token, span));
+                        if let Token::Eof = tokens.last().unwrap().0 {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            if !tokens.is_empty() && matches!(tokens.last().unwrap().0, Token::Eof) {
+                let mut parser = Parser::new(&tokens);
+                if let Ok(program) = parser.parse_program() {
+                    entries.push((url, StdlibEntry { source, program }));
+                }
+            }
+        }
+    }
+
+    ProjectCache { entries }
+}
+
+fn collect_u_files(
+    root: &std::path::Path,
+    dir: &std::path::Path,
+    out: &mut Vec<std::path::PathBuf>,
+) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                // Skip target/ directories (build artifacts)
+                if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                    && (name == "target" || name.starts_with('.'))
+                {
+                    continue;
+                }
+                collect_u_files(root, &path, out);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("u") {
+                out.push(path);
+            }
+        }
+    }
+}
+
+/// Extract the module path for a project file URL relative to the workspace root.
+/// E.g., `src/foo.u` -> `["foo"]`, `src/sub/bar.u` -> `["sub", "bar"]`.
+fn project_file_module_path(workspace_root: &std::path::Path, url: &Url) -> Vec<String> {
+    let file_path = match url.to_file_path() {
+        Ok(p) => p,
+        Err(_) => return Vec::new(),
+    };
+    let relative = match file_path.strip_prefix(workspace_root) {
+        Ok(p) => p,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut segments: Vec<String> = relative
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().to_string())
+        .collect();
+
+    // Strip `.u` extension from last segment
+    if let Some(last) = segments.last_mut()
+        && last.ends_with(".u")
+    {
+        *last = last[..last.len() - 2].to_string();
+    }
+
+    segments
+}
+
+/// Extract the stdlib module path from a cache entry URL.
+/// E.g., `/path/to/stdlib/core/option.u` -> `["core", "option"]`.
+fn stdlib_module_path(url: &Url) -> Vec<String> {
+    let path = url.path();
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+
+    // Find "core" or "std" in the path and take from there
+    for (i, seg) in segments.iter().enumerate() {
+        if *seg == "core" || *seg == "std" {
+            let mut result = Vec::new();
+            for j in i..segments.len() {
+                let s = segments[j];
+                if s.ends_with(".u") {
+                    result.push(s[..s.len() - 2].to_string());
+                } else {
+                    result.push(s.to_string());
+                }
+            }
+            return result;
+        }
+    }
+    Vec::new()
+}
+
+/// Get the word prefix at a given byte offset (what the user has typed so far).
+fn get_word_prefix_at_offset(tokens: &[(Token, Span)], source: &str, offset: usize) -> String {
+    for (tok, span) in tokens {
+        if span.lo <= offset && offset <= span.hi {
+            if let Token::Ident(_name) = tok {
+                let byte_end = offset.min(span.hi).min(source.len());
+                let byte_start = span.lo.min(source.len());
+                if byte_end >= byte_start {
+                    return source[byte_start..byte_end].to_string();
+                }
+            }
+            return String::new();
+        }
+    }
+    String::new()
+}
+
+/// Get the path prefix at a given byte offset (segments before `::`).
+fn get_path_prefix_at_offset(tokens: &[(Token, Span)], offset: usize) -> Vec<String> {
+    // Find the token that contains the cursor, or the last token before cursor
+    let mut cursor_idx = tokens.len();
+    for (i, (_, span)) in tokens.iter().enumerate() {
+        if span.lo <= offset && offset <= span.hi {
+            cursor_idx = i;
+            break;
+        }
+        if span.lo > offset {
+            cursor_idx = i;
+            break;
+        }
+    }
+    if cursor_idx == 0 {
+        return Vec::new();
+    }
+
+    // Check if the token just before cursor is `::` (path separator)
+    let before_cursor = if cursor_idx >= tokens.len() {
+        tokens.last().map(|_| tokens.len() - 1)
+    } else if cursor_idx > 0 {
+        Some(cursor_idx - 1)
+    } else {
+        None
+    };
+
+    // Determine the last identifier index in the path
+    let ident_idx = match before_cursor {
+        Some(i) if tokens[i].0 == Token::DoubleColon && i > 0 => {
+            // Cursor is after `::`, the path includes the segment before `::`
+            match &tokens[i - 1].0 {
+                Token::Ident(_) | Token::SelfType | Token::Self_ => i - 1,
+                _ => return Vec::new(),
+            }
+        }
+        Some(i)
+            if matches!(
+                &tokens[i].0,
+                Token::Ident(_) | Token::SelfType | Token::Self_
+            ) =>
+        {
+            // Check if there's a `::` before this ident
+            if i > 0 && tokens[i - 1].0 == Token::DoubleColon {
+                i
+            } else {
+                return Vec::new();
+            }
+        }
+        _ => return Vec::new(),
+    };
+
+    // Walk backward collecting path segments, including the ident at ident_idx
+    let mut segments = Vec::new();
+    let mut i = ident_idx;
+    loop {
+        match &tokens[i].0 {
+            Token::Ident(name) => segments.push(name.clone()),
+            Token::SelfType => segments.push("Self".to_string()),
+            Token::Self_ => segments.push("self".to_string()),
+            _ => break,
+        }
+        if i >= 2 && tokens[i - 1].0 == Token::DoubleColon {
+            i -= 2;
+        } else {
+            break;
+        }
+    }
+    segments.reverse();
+    segments
+}
+
+/// Find the position to insert a `use` statement in a document.
+/// Returns a Position (0-indexed line/col) where the `use` should be inserted.
+fn find_use_insertion_position(doc: &DocumentState) -> Position {
+    if let Some(ref prog) = doc.last_valid_program
+        && let Some(last_use) = prog.uses.last()
+    {
+        // Insert after the newline following the last use statement
+        let mut offset = last_use.span.hi;
+        let source_bytes = doc.source.as_bytes();
+        while offset < source_bytes.len() && source_bytes[offset] == b'\n' {
+            offset += 1;
+        }
+        return offset_to_position(&doc.source, offset);
+    }
+    // No uses: insert at the beginning of the file
+    Position::new(0, 0)
+}
+
+/// Check if a symbol is already imported via `use` declarations.
+fn is_already_imported(
+    uses: &[crate::ast::Use],
+    module_path: &[String],
+    symbol_name: &str,
+) -> bool {
+    for u in uses {
+        if u.path.last().map(|s| s.as_str()) == Some(symbol_name) {
+            // For simple imports like `use std::option::Option;`, the path
+            // includes the symbol name. Check that the module path matches.
+            if u.path.len() >= 2 {
+                let import_module = &u.path[..u.path.len() - 1];
+                if import_module == module_path {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Check if a core module is re-exported by `std`.
+fn is_core_reexported_by_std(stdlib_cache: &StdlibCache, core_name: &str) -> bool {
+    for (url, entry) in &stdlib_cache.entries {
+        if url.path().ends_with("/std/mod.u") {
+            for u in &entry.program.uses {
+                if u.path.len() == 2 && u.path[0] == "core" && u.path[1] == core_name {
+                    return true;
+                }
+            }
+            return false;
+        }
+    }
+    false
+}
+
+/// Build a CompletionItem for a symbol from the stdlib or project cache.
+fn build_imported_completion_item(
+    name: &str,
+    kind: CompletionItemKind,
+    detail: String,
+    sort_prefix: &str,
+    insert_use: bool,
+    use_text: &str,
+) -> CompletionItem {
+    let mut item = CompletionItem {
+        label: name.to_string(),
+        kind: Some(kind),
+        detail: Some(detail),
+        sort_text: Some(format!("{}{}", sort_prefix, name)),
+        filter_text: Some(name.to_string()),
+        ..Default::default()
+    };
+    if insert_use {
+        item.additional_text_edits = Some(vec![TextEdit {
+            range: Range::new(Position::new(0, 0), Position::new(0, 0)), // placeholder, replaced later
+            new_text: use_text.to_string(),
+        }]);
+    }
+    item
+}
+
+fn collect_local_symbols(
+    items: &mut Vec<CompletionItem>,
+    doc: &DocumentState,
+    word_prefix: &str,
+    cursor_offset: usize,
+) {
+    let Some(ref prog) = doc.last_valid_program else {
+        return;
+    };
+
+    let prefix_lower = word_prefix.to_lowercase();
+
+    // Lex the source for variable/param scanning
+    let mut tokens = Vec::new();
+    let mut lexer = Lexer::new(&doc.source);
+    loop {
+        match lexer.next_token() {
+            Ok((token, span)) => {
+                tokens.push((token, span));
+                if let Token::Eof = tokens.last().unwrap().0 {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+
+    // 1. Functions (top-level and methods)
+    let mut seen_funcs = std::collections::HashSet::new();
+    for func in &prog.funcs {
+        if func.name.to_lowercase().starts_with(&prefix_lower)
+            && seen_funcs.insert(&func.name)
+        {
+            let params: Vec<String> = func
+                .params
+                .iter()
+                .map(|p| format!("{}: {}", p.name, type_to_string(&p.ty)))
+                .collect();
+            let ret = match &func.return_type {
+                Some(ty) => format!(" -> {}", type_to_string(ty)),
+                None => String::new(),
+            };
+            items.push(CompletionItem {
+                label: func.name.clone(),
+                kind: Some(CompletionItemKind::FUNCTION),
+                detail: Some(format!("fn({}){}", params.join(", "), ret)),
+                sort_text: Some(format!("1_{}", func.name)),
+                insert_text: Some(format!("{}()", func.name)),
+                insert_text_format: Some(InsertTextFormat::SNIPPET),
+                ..Default::default()
+            });
+        }
+    }
+
+    // Methods from impl blocks
+    let mut seen_methods = std::collections::HashSet::new();
+    for imp in &prog.impls {
+        for method in &imp.methods {
+            if method.name.to_lowercase().starts_with(&prefix_lower)
+                && seen_methods.insert(&method.name)
+            {
+                let params: Vec<String> = method
+                    .params
+                    .iter()
+                    .map(|p| format!("{}: {}", p.name, type_to_string(&p.ty)))
+                    .collect();
+                let ret = match &method.return_type {
+                    Some(ty) => format!(" -> {}", type_to_string(ty)),
+                    None => String::new(),
+                };
+                items.push(CompletionItem {
+                    label: method.name.clone(),
+                    kind: Some(CompletionItemKind::METHOD),
+                    detail: Some(format!("fn({}){}", params.join(", "), ret)),
+                    sort_text: Some(format!("1_{}", method.name)),
+                    ..Default::default()
+                });
+            }
+        }
+    }
+
+    // 2. Structs
+    for st in &prog.structs {
+        if st.name.to_lowercase().starts_with(&prefix_lower) {
+            items.push(CompletionItem {
+                label: st.name.clone(),
+                kind: Some(CompletionItemKind::STRUCT),
+                detail: Some(format!("struct {}", st.name)),
+                sort_text: Some(format!("1_{}", st.name)),
+                ..Default::default()
+            });
+        }
+    }
+
+    // 3. Enums
+    for en in &prog.enums {
+        if en.name.to_lowercase().starts_with(&prefix_lower) {
+            items.push(CompletionItem {
+                label: en.name.clone(),
+                kind: Some(CompletionItemKind::ENUM),
+                detail: Some(format!("enum {}", en.name)),
+                sort_text: Some(format!("1_{}", en.name)),
+                ..Default::default()
+            });
+        }
+    }
+
+    // 4. Traits
+    for tr in &prog.traits {
+        if tr.name.to_lowercase().starts_with(&prefix_lower) {
+            items.push(CompletionItem {
+                label: tr.name.clone(),
+                kind: Some(CompletionItemKind::INTERFACE),
+                detail: Some(format!("trait {}", tr.name)),
+                sort_text: Some(format!("1_{}", tr.name)),
+                ..Default::default()
+            });
+        }
+    }
+
+    // 5. Type aliases
+    for ta in &prog.type_aliases {
+        if ta.name.to_lowercase().starts_with(&prefix_lower) {
+            items.push(CompletionItem {
+                label: ta.name.clone(),
+                kind: Some(CompletionItemKind::TYPE_PARAMETER),
+                detail: Some(format!(
+                    "type {} = {}",
+                    ta.name,
+                    type_to_string(&ta.aliased_type)
+                )),
+                sort_text: Some(format!("1_{}", ta.name)),
+                ..Default::default()
+            });
+        }
+    }
+
+    // 6. Modules
+    for m in &prog.modules {
+        if m.name.to_lowercase().starts_with(&prefix_lower) {
+            items.push(CompletionItem {
+                label: m.name.clone(),
+                kind: Some(CompletionItemKind::MODULE),
+                detail: Some(format!("mod {}", m.name)),
+                sort_text: Some(format!("1_{}", m.name)),
+                ..Default::default()
+            });
+        }
+    }
+
+    // 7. Let/Const bindings and function params in scope
+    // Scan backward from cursor to find variables in scope
+    let cursor_idx = tokens
+        .iter()
+        .position(|(_, span)| span.lo <= cursor_offset && cursor_offset < span.hi)
+        .or_else(|| {
+            // If cursor is not on a token, find the last token before cursor
+            tokens
+                .iter()
+                .rposition(|(_, span)| span.hi <= cursor_offset)
+        });
+
+    if let Some(end_idx) = cursor_idx {
+        let mut seen = std::collections::HashSet::new();
+        let mut i = end_idx;
+
+        while i > 0 {
+            i -= 1;
+            match &tokens[i].0 {
+                Token::Let | Token::Const => {
+                    // Find the name after Let/Const (skip `mut` if present)
+                    let mut j = i + 1;
+                    while j < tokens.len() && j <= end_idx {
+                        match &tokens[j].0 {
+                            Token::Mut => {
+                                j += 1;
+                                continue;
+                            }
+                            Token::Ident(name) => {
+                                if name != "_"
+                                    && name.to_lowercase().starts_with(&prefix_lower)
+                                    && seen.insert(name.clone())
+                                {
+                                    items.push(CompletionItem {
+                                        label: name.clone(),
+                                        kind: Some(CompletionItemKind::VARIABLE),
+                                        detail: Some(format!("let {}", name)),
+                                        sort_text: Some(format!("1_{}", name)),
+                                        ..Default::default()
+                                    });
+                                }
+                                break;
+                            }
+                            Token::Underscore => break,
+                            _ => break,
+                        }
+                    }
+                }
+                Token::Fn => {
+                    // Collect function parameters
+                    let mut j = i + 1;
+                    let mut in_params = false;
+                    while j < tokens.len() && j <= end_idx {
+                        match &tokens[j].0 {
+                            Token::LParen => in_params = true,
+                            Token::RParen => break,
+                            Token::Ident(name)
+                                if in_params
+                                    && name != "self"
+                                    && name.to_lowercase().starts_with(&prefix_lower)
+                                    && seen.insert(name.clone()) =>
+                            {
+                                items.push(CompletionItem {
+                                    label: name.clone(),
+                                    kind: Some(CompletionItemKind::VARIABLE),
+                                    detail: Some(format!("param {}", name)),
+                                    sort_text: Some(format!("1_{}", name)),
+                                    ..Default::default()
+                                });
+                            }
+                            _ => {}
+                        }
+                        j += 1;
+                    }
+                    break; // Stop at function boundary
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn collect_project_symbols(
+    items: &mut Vec<CompletionItem>,
+    project_cache: &ProjectCache,
+    uses: &[crate::ast::Use],
+    workspace_root: &std::path::Path,
+    word_prefix: &str,
+    path_prefix: &[String],
+) {
+    let prefix_lower = word_prefix.to_lowercase();
+
+    for (url, entry) in &project_cache.entries {
+        let module_path = project_file_module_path(workspace_root, url);
+        if module_path.is_empty() {
+            continue;
+        }
+
+        // If path_prefix is non-empty, only process entries whose module path
+        // starts with the resolved prefix.
+        if !path_prefix.is_empty()
+            && (module_path.len() < path_prefix.len()
+                || module_path[..path_prefix.len()] != *path_prefix)
+        {
+            continue;
+        }
+
+        // Collect pub symbols
+        let mut seen_funcs = std::collections::HashSet::new();
+        for func in &entry.program.funcs {
+            if !func.is_pub
+                || !func.name.to_lowercase().starts_with(&prefix_lower)
+                || !seen_funcs.insert(&func.name)
+            {
+                continue;
+            }
+            let already_imported = is_already_imported(uses, &module_path, &func.name);
+            let use_decl = format!("use {}::{};\n", module_path.join("::"), func.name);
+            items.push(build_imported_completion_item(
+                &func.name,
+                CompletionItemKind::FUNCTION,
+                module_path.join("::"),
+                "2_",
+                !already_imported,
+                &use_decl,
+            ));
+        }
+
+        let mut seen_structs = std::collections::HashSet::new();
+        for st in &entry.program.structs {
+            if !st.is_pub
+                || !st.name.to_lowercase().starts_with(&prefix_lower)
+                || !seen_structs.insert(&st.name)
+            {
+                continue;
+            }
+            let already_imported = is_already_imported(uses, &module_path, &st.name);
+            let use_decl = format!("use {}::{};\n", module_path.join("::"), st.name);
+            items.push(build_imported_completion_item(
+                &st.name,
+                CompletionItemKind::STRUCT,
+                module_path.join("::"),
+                "2_",
+                !already_imported,
+                &use_decl,
+            ));
+        }
+
+        let mut seen_enums = std::collections::HashSet::new();
+        for en in &entry.program.enums {
+            if !en.is_pub
+                || !en.name.to_lowercase().starts_with(&prefix_lower)
+                || !seen_enums.insert(&en.name)
+            {
+                continue;
+            }
+            let already_imported = is_already_imported(uses, &module_path, &en.name);
+            let use_decl = format!("use {}::{};\n", module_path.join("::"), en.name);
+            items.push(build_imported_completion_item(
+                &en.name,
+                CompletionItemKind::ENUM,
+                module_path.join("::"),
+                "2_",
+                !already_imported,
+                &use_decl,
+            ));
+        }
+
+        let mut seen_traits = std::collections::HashSet::new();
+        for tr in &entry.program.traits {
+            if !tr.is_pub
+                || !tr.name.to_lowercase().starts_with(&prefix_lower)
+                || !seen_traits.insert(&tr.name)
+            {
+                continue;
+            }
+            let already_imported = is_already_imported(uses, &module_path, &tr.name);
+            let use_decl = format!("use {}::{};\n", module_path.join("::"), tr.name);
+            items.push(build_imported_completion_item(
+                &tr.name,
+                CompletionItemKind::INTERFACE,
+                module_path.join("::"),
+                "2_",
+                !already_imported,
+                &use_decl,
+            ));
+        }
+
+        let mut seen_aliases = std::collections::HashSet::new();
+        for ta in &entry.program.type_aliases {
+            if !ta.is_pub
+                || !ta.name.to_lowercase().starts_with(&prefix_lower)
+                || !seen_aliases.insert(&ta.name)
+            {
+                continue;
+            }
+            let already_imported = is_already_imported(uses, &module_path, &ta.name);
+            let use_decl = format!("use {}::{};\n", module_path.join("::"), ta.name);
+            items.push(build_imported_completion_item(
+                &ta.name,
+                CompletionItemKind::TYPE_PARAMETER,
+                module_path.join("::"),
+                "2_",
+                !already_imported,
+                &use_decl,
+            ));
+        }
+    }
+}
+
+fn collect_stdlib_symbols(
+    items: &mut Vec<CompletionItem>,
+    stdlib_cache: &StdlibCache,
+    uses: &[crate::ast::Use],
+    word_prefix: &str,
+    path_prefix: &[String],
+) {
+    let prefix_lower = word_prefix.to_lowercase();
+
+    for (url, entry) in &stdlib_cache.entries {
+        // Skip mod.u files (module index files)
+        if url.path().ends_with("/mod.u") {
+            continue;
+        }
+
+        let module_path = stdlib_module_path(url);
+        if module_path.len() < 2 {
+            continue;
+        }
+
+        // If path_prefix is non-empty, only process entries whose module path starts with it
+        if !path_prefix.is_empty()
+            && (module_path.len() < path_prefix.len()
+                || module_path[..path_prefix.len()] != *path_prefix)
+        {
+            continue;
+        }
+
+        // Determine the `use` prefix: for core modules re-exported by std, use `std::`
+        let use_prefix = if module_path[0] == "core"
+            && is_core_reexported_by_std(stdlib_cache, &module_path[1])
+        {
+            let mut p = vec!["std".to_string()];
+            p.extend_from_slice(&module_path[1..]);
+            p
+        } else {
+            module_path.clone()
+        };
+
+        // Collect pub symbols
+        let mut seen_funcs = std::collections::HashSet::new();
+        for func in &entry.program.funcs {
+            if !func.is_pub
+                || !func.name.to_lowercase().starts_with(&prefix_lower)
+                || !seen_funcs.insert(&func.name)
+            {
+                continue;
+            }
+            let already_imported = is_already_imported(uses, &use_prefix, &func.name);
+            let use_decl = format!("use {}::{};\n", use_prefix.join("::"), func.name);
+            items.push(build_imported_completion_item(
+                &func.name,
+                CompletionItemKind::FUNCTION,
+                use_prefix.join("::"),
+                "3_",
+                !already_imported,
+                &use_decl,
+            ));
+        }
+
+        let mut seen_structs = std::collections::HashSet::new();
+        for st in &entry.program.structs {
+            if !st.is_pub
+                || !st.name.to_lowercase().starts_with(&prefix_lower)
+                || !seen_structs.insert(&st.name)
+            {
+                continue;
+            }
+            let already_imported = is_already_imported(uses, &use_prefix, &st.name);
+            let use_decl = format!("use {}::{};\n", use_prefix.join("::"), st.name);
+            items.push(build_imported_completion_item(
+                &st.name,
+                CompletionItemKind::STRUCT,
+                use_prefix.join("::"),
+                "3_",
+                !already_imported,
+                &use_decl,
+            ));
+        }
+
+        let mut seen_enums = std::collections::HashSet::new();
+        for en in &entry.program.enums {
+            if !en.is_pub
+                || !en.name.to_lowercase().starts_with(&prefix_lower)
+                || !seen_enums.insert(&en.name)
+            {
+                continue;
+            }
+            let already_imported = is_already_imported(uses, &use_prefix, &en.name);
+            let use_decl = format!("use {}::{};\n", use_prefix.join("::"), en.name);
+            items.push(build_imported_completion_item(
+                &en.name,
+                CompletionItemKind::ENUM,
+                use_prefix.join("::"),
+                "3_",
+                !already_imported,
+                &use_decl,
+            ));
+        }
+
+        let mut seen_traits = std::collections::HashSet::new();
+        for tr in &entry.program.traits {
+            if !tr.is_pub
+                || !tr.name.to_lowercase().starts_with(&prefix_lower)
+                || !seen_traits.insert(&tr.name)
+            {
+                continue;
+            }
+            let already_imported = is_already_imported(uses, &use_prefix, &tr.name);
+            let use_decl = format!("use {}::{};\n", use_prefix.join("::"), tr.name);
+            items.push(build_imported_completion_item(
+                &tr.name,
+                CompletionItemKind::INTERFACE,
+                use_prefix.join("::"),
+                "3_",
+                !already_imported,
+                &use_decl,
+            ));
+        }
+
+        let mut seen_aliases = std::collections::HashSet::new();
+        for ta in &entry.program.type_aliases {
+            if !ta.is_pub
+                || !ta.name.to_lowercase().starts_with(&prefix_lower)
+                || !seen_aliases.insert(&ta.name)
+            {
+                continue;
+            }
+            let already_imported = is_already_imported(uses, &use_prefix, &ta.name);
+            let use_decl = format!("use {}::{};\n", use_prefix.join("::"), ta.name);
+            items.push(build_imported_completion_item(
+                &ta.name,
+                CompletionItemKind::TYPE_PARAMETER,
+                use_prefix.join("::"),
+                "3_",
+                !already_imported,
+                &use_decl,
+            ));
+        }
+    }
+}
+
+fn handle_completion(
+    documents: &HashMap<Url, DocumentState>,
+    stdlib_cache: &StdlibCache,
+    workspace_root: &Option<std::path::PathBuf>,
+    params: CompletionParams,
+) -> Option<CompletionResponse> {
+    let uri = params.text_document_position.text_document.uri;
+    let url = Url::parse(uri.as_str()).ok()?;
+    let doc = documents.get(&url)?;
+    let position = params.text_document_position.position;
+
+    let offset = position_to_offset(&doc.source, position);
+
+    let mut tokens = Vec::new();
+    let mut lexer = Lexer::new(&doc.source);
+    loop {
+        match lexer.next_token() {
+            Ok((token, span)) => {
+                tokens.push((token, span));
+                if let Token::Eof = tokens.last().unwrap().0 {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+
+    let word_prefix = get_word_prefix_at_offset(&tokens, &doc.source, offset);
+    let path_prefix = get_path_prefix_at_offset(&tokens, offset);
+
+    // Lazy project cache build
+    let project_cache: Option<ProjectCache> = workspace_root
+        .as_ref()
+        .map(|root| build_project_cache(root, documents));
+
+    // If path prefix, attempt to resolve it
+    let resolved_prefix = if !path_prefix.is_empty() {
+        if let Some(ref prog) = doc.last_valid_program {
+            resolve_prefix_to_full_path(&prog.uses, &path_prefix)
+        } else {
+            path_prefix.clone()
+        }
+    } else {
+        Vec::new()
+    };
+
+    let mut items: Vec<CompletionItem> = Vec::new();
+
+    if resolved_prefix.is_empty() && path_prefix.is_empty() {
+        // No path prefix: collect from all sources
+        collect_local_symbols(&mut items, doc, &word_prefix, offset);
+
+        let uses: &[crate::ast::Use] = doc
+            .last_valid_program
+            .as_ref()
+            .map(|p| p.uses.as_slice())
+            .unwrap_or(&[]);
+
+        if let Some(ref pc) = project_cache {
+            collect_project_symbols(
+                &mut items,
+                pc,
+                uses,
+                workspace_root.as_ref().unwrap(),
+                &word_prefix,
+                &[],
+            );
+        }
+
+        collect_stdlib_symbols(&mut items, stdlib_cache, uses, &word_prefix, &[]);
+    } else {
+        let uses: &[crate::ast::Use] = doc
+            .last_valid_program
+            .as_ref()
+            .map(|p| p.uses.as_slice())
+            .unwrap_or(&[]);
+
+        // Path prefix: only collect from matching modules
+        if let Some(ref pc) = project_cache {
+            collect_project_symbols(
+                &mut items,
+                pc,
+                uses,
+                workspace_root.as_ref().unwrap(),
+                &word_prefix,
+                &resolved_prefix,
+            );
+        }
+
+        collect_stdlib_symbols(
+            &mut items,
+            stdlib_cache,
+            uses,
+            &word_prefix,
+            &resolved_prefix,
+        );
+    }
+
+    // Filter by word prefix (case-insensitive) — already done in collectors,
+    // but ensure it's applied for any edge cases
+    items.retain(|item| {
+        item.label
+            .to_lowercase()
+            .starts_with(&word_prefix.to_lowercase())
+    });
+
+    // Sort: local first (1_), project (2_), stdlib (3_), alphabetically within each
+    items.sort_by(|a, b| {
+        let sa = a.sort_text.as_deref().unwrap_or("9_");
+        let sb = b.sort_text.as_deref().unwrap_or("9_");
+        sa.cmp(sb)
+    });
+
+    // Populate additional_text_edits with correct insertion positions
+    let insertion_pos = find_use_insertion_position(doc);
+    for item in &mut items {
+        if let Some(ref mut edits) = item.additional_text_edits {
+            for edit in edits {
+                edit.range = Range::new(insertion_pos, insertion_pos);
+            }
+        }
+    }
+
+    // Append `()` for function and method completions
+    for item in &mut items {
+        if matches!(item.kind, Some(CompletionItemKind::FUNCTION) | Some(CompletionItemKind::METHOD)) {
+            let name = item.label.clone();
+            item.insert_text = Some(format!("{}($0)", name));
+            item.insert_text_format = Some(InsertTextFormat::SNIPPET);
+        }
+    }
+
+    if items.is_empty() {
+        None
+    } else {
+        Some(CompletionResponse::Array(items))
+    }
+}
+
 fn main_loop(
     connection: Connection,
     stdlib_cache: StdlibCache,
+    workspace_root: Option<std::path::PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut documents: HashMap<Url, DocumentState> = HashMap::new();
 
@@ -1367,6 +2323,15 @@ fn main_loop(
                     "textDocument/definition" => {
                         let (id, params) = cast_request::<lsp_types::request::GotoDefinition>(req)?;
                         let response = handle_definition(&documents, &stdlib_cache, params);
+                        let result = serde_json::to_value(&response)?;
+                        connection
+                            .sender
+                            .send(Message::Response(Response::new_ok(id, result)))?;
+                    }
+                    "textDocument/completion" => {
+                        let (id, params) = cast_request::<Completion>(req)?;
+                        let response =
+                            handle_completion(&documents, &stdlib_cache, &workspace_root, params);
                         let result = serde_json::to_value(&response)?;
                         connection
                             .sender
@@ -1419,11 +2384,37 @@ pub fn run_server() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
         hover_provider: Some(HoverProviderCapability::Simple(true)),
         definition_provider: Some(OneOf::Left(true)),
+        completion_provider: Some(CompletionOptions {
+            resolve_provider: None,
+            trigger_characters: None,
+            work_done_progress_options: Default::default(),
+            all_commit_characters: None,
+            completion_item: None,
+        }),
         ..Default::default()
     })?;
 
     let initialization_params = connection.initialize(server_capabilities)?;
-    let _params: InitializeParams = serde_json::from_value(initialization_params)?;
+    let init_params: InitializeParams = serde_json::from_value(initialization_params)?;
+
+    let workspace_root = init_params
+        .workspace_folders
+        .as_ref()
+        .and_then(|f| {
+            let first_uri = f.first()?.uri.clone();
+            Url::parse(first_uri.as_str()).ok()
+        })
+        .or_else(|| {
+            #[allow(deprecated)]
+            init_params
+                .root_uri
+                .as_ref()
+                .and_then(|uri| Url::parse(uri.as_str()).ok())
+        })
+        .and_then(|url| url.to_file_path().ok());
+    if let Some(ref root) = workspace_root {
+        eprintln!("ulang lsp workspace root: {}", root.display());
+    }
 
     let stdlib_cache = load_stdlib_cache();
     eprintln!(
@@ -1431,7 +2422,7 @@ pub fn run_server() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         stdlib_cache.entries.len()
     );
 
-    main_loop(connection, stdlib_cache)?;
+    main_loop(connection, stdlib_cache, workspace_root)?;
     io_threads.join()?;
 
     eprintln!("ulang lsp server stopped successfully");
@@ -1495,7 +2486,7 @@ mod tests {
         let mut lexer = Lexer::new(src);
         loop {
             let (t, s) = lexer.next_token().unwrap();
-            tokens.push((t, s));
+            tokens.push((t.clone(), s));
             if tokens.last().unwrap().0 == Token::Eof {
                 break;
             }
@@ -1529,7 +2520,7 @@ mod tests {
         let mut lexer = Lexer::new(src);
         loop {
             let (t, s) = lexer.next_token().unwrap();
-            tokens.push((t, s));
+            tokens.push((t.clone(), s));
             if tokens.last().unwrap().0 == Token::Eof {
                 break;
             }
@@ -1562,7 +2553,7 @@ mod tests {
         let mut lexer = Lexer::new(src);
         loop {
             let (t, s) = lexer.next_token().unwrap();
-            tokens.push((t, s));
+            tokens.push((t.clone(), s));
             if tokens.last().unwrap().0 == Token::Eof {
                 break;
             }
@@ -1595,7 +2586,7 @@ mod tests {
         let mut lexer = Lexer::new(src);
         loop {
             let (t, s) = lexer.next_token().unwrap();
-            tokens.push((t, s));
+            tokens.push((t.clone(), s));
             if tokens.last().unwrap().0 == Token::Eof {
                 break;
             }
@@ -1768,7 +2759,7 @@ mod tests {
         let mut lexer = Lexer::new(src);
         loop {
             let (t, s) = lexer.next_token().unwrap();
-            tokens.push((t, s));
+            tokens.push((t.clone(), s));
             if tokens.last().unwrap().0 == Token::Eof {
                 break;
             }
@@ -2231,5 +3222,318 @@ mod tests {
         } else {
             panic!("Expected Scalar response for const generic L");
         }
+    }
+
+    // ---- Completion tests ----
+
+    #[test]
+    fn test_completion_word_prefix_at_offset() {
+        let src = "fn main() { let hello_world = 42; hel";
+        let mut tokens = Vec::new();
+        let mut lexer = Lexer::new(src);
+        loop {
+            let (t, s) = lexer.next_token().unwrap();
+            tokens.push((t.clone(), s));
+            if matches!(t, Token::Eof) {
+                break;
+            }
+        }
+        // Cursor on 'hel' inside the partial identifier
+        let hel_span = tokens
+            .iter()
+            .find(|(t, _)| matches!(t, Token::Ident(id) if id == "hel"))
+            .unwrap()
+            .1;
+        // Place cursor at the end of "hel" (full prefix)
+        let prefix = get_word_prefix_at_offset(&tokens, src, hel_span.hi);
+        assert_eq!(prefix, "hel");
+
+        // Cursor after whitespace, nothing
+        let prefix_empty = get_word_prefix_at_offset(&tokens, src, 0);
+        assert_eq!(prefix_empty, "");
+    }
+
+    #[test]
+    fn test_completion_path_prefix_at_offset() {
+        let src = "std::vec::Vec";
+        let mut tokens = Vec::new();
+        let mut lexer = Lexer::new(src);
+        loop {
+            let (t, s) = lexer.next_token().unwrap();
+            tokens.push((t.clone(), s));
+            if matches!(t, Token::Eof) {
+                break;
+            }
+        }
+        // Cursor at the end (after Vec)
+        let offset = src.len();
+        let prefix = get_path_prefix_at_offset(&tokens, offset);
+        assert_eq!(prefix, vec!["std".to_string(), "vec".to_string()]);
+
+        // Cursor in the middle (no path prefix)
+        let prefix_none = get_path_prefix_at_offset(&tokens, 0);
+        assert!(prefix_none.is_empty());
+    }
+
+    #[test]
+    fn test_completion_use_insertion_position_no_uses() {
+        let doc = DocumentState {
+            source: "fn main() {}\n".to_string(),
+            last_valid_program: {
+                let mut lexer = Lexer::new("fn main() {}");
+                let mut tokens = Vec::new();
+                loop {
+                    let (t, s) = lexer.next_token().unwrap();
+                    tokens.push((t.clone(), s));
+                    if matches!(t, Token::Eof) {
+                        break;
+                    }
+                }
+                let mut parser = Parser::new(&tokens);
+                parser.parse_program().ok()
+            },
+        };
+        let pos = find_use_insertion_position(&doc);
+        assert_eq!(pos.line, 0);
+        assert_eq!(pos.character, 0);
+    }
+
+    #[test]
+    fn test_completion_use_insertion_position_with_uses() {
+        let src = "use std::io::print;\nfn main() {}\n";
+        let doc = DocumentState {
+            source: src.to_string(),
+            last_valid_program: {
+                let mut lexer = Lexer::new(src);
+                let mut tokens = Vec::new();
+                loop {
+                    let (t, s) = lexer.next_token().unwrap();
+                    tokens.push((t.clone(), s));
+                    if matches!(t, Token::Eof) {
+                        break;
+                    }
+                }
+                let mut parser = Parser::new(&tokens);
+                parser.parse_program().ok()
+            },
+        };
+        let pos = find_use_insertion_position(&doc);
+        // Should be after the first \n (line 1, col 0)
+        assert_eq!(pos.line, 1);
+        assert_eq!(pos.character, 0);
+    }
+
+    #[test]
+    fn test_completion_rexported_by_std() {
+        let cache = load_stdlib_cache();
+        // option is re-exported by std
+        assert!(is_core_reexported_by_std(&cache, "option"));
+        // alloc is NOT re-exported by std (it's a direct std module)
+        assert!(!is_core_reexported_by_std(&cache, "alloc"));
+    }
+
+    #[test]
+    fn test_completion_stdlib_module_path() {
+        let url = Url::parse("file:///usr/share/ulang/stdlib/core/option.u").unwrap();
+        let path = stdlib_module_path(&url);
+        assert_eq!(path, vec!["core".to_string(), "option".to_string()]);
+
+        let url2 = Url::parse("file:///usr/share/ulang/stdlib/std/vec.u").unwrap();
+        let path2 = stdlib_module_path(&url2);
+        assert_eq!(path2, vec!["std".to_string(), "vec".to_string()]);
+    }
+
+    #[test]
+    fn test_completion_project_file_module_path() {
+        let root = std::path::PathBuf::from("/home/user/project");
+        let url = Url::parse("file:///home/user/project/src/foo.u").unwrap();
+        let path = project_file_module_path(&root, &url);
+        assert_eq!(path, vec!["src".to_string(), "foo".to_string()]);
+
+        let url2 = Url::parse("file:///home/user/project/src/sub/bar.u").unwrap();
+        let path2 = project_file_module_path(&root, &url2);
+        assert_eq!(
+            path2,
+            vec!["src".to_string(), "sub".to_string(), "bar".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_completion_already_imported_detection() {
+        let uses = vec![crate::ast::Use {
+            path: vec![
+                "std".to_string(),
+                "option".to_string(),
+                "Option".to_string(),
+            ],
+            is_pub: false,
+            module_path: Vec::new(),
+            span: Span::new(0, 0),
+        }];
+        assert!(is_already_imported(
+            &uses,
+            &["std".to_string(), "option".to_string()],
+            "Option"
+        ));
+        assert!(!is_already_imported(
+            &uses,
+            &["std".to_string(), "option".to_string()],
+            "None"
+        ));
+        assert!(!is_already_imported(
+            &uses,
+            &["std".to_string(), "result".to_string()],
+            "Option"
+        ));
+    }
+
+    #[test]
+    fn test_completion_collect_local_symbols() {
+        let src = r#"
+            struct Foo { x: i32 }
+            enum Bar { A, B }
+            trait Baz { fn method(&self); }
+            type MyInt = i32;
+            mod mymod {}
+            fn my_func(a: i32) -> i32 { a }
+        "#;
+        let doc = DocumentState {
+            source: src.to_string(),
+            last_valid_program: {
+                let mut tokens = Vec::new();
+                let mut lexer = Lexer::new(src);
+                loop {
+                    let (t, s) = lexer.next_token().unwrap();
+                    tokens.push((t.clone(), s));
+                    if matches!(t, Token::Eof) {
+                        break;
+                    }
+                }
+                let mut parser = Parser::new(&tokens);
+                parser.parse_program().ok()
+            },
+        };
+
+        let mut items = Vec::new();
+        let offset = src.len(); // cursor at end
+        collect_local_symbols(&mut items, &doc, "", offset);
+
+        // Should have Foo, Bar, Baz, MyInt, mymod, my_func
+        let names: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert!(names.contains(&"Foo"));
+        assert!(names.contains(&"Bar"));
+        assert!(names.contains(&"Baz"));
+        assert!(names.contains(&"MyInt"));
+        assert!(names.contains(&"mymod"));
+        assert!(names.contains(&"my_func"));
+    }
+
+    #[test]
+    fn test_completion_collect_local_variables_in_scope() {
+        let src = "fn main() { let x = 1; let mut y = 2; let z = x; }";
+        let doc = DocumentState {
+            source: src.to_string(),
+            last_valid_program: {
+                let mut tokens = Vec::new();
+                let mut lexer = Lexer::new(src);
+                loop {
+                    let (t, s) = lexer.next_token().unwrap();
+                    tokens.push((t.clone(), s));
+                    if matches!(t, Token::Eof) {
+                        break;
+                    }
+                }
+                let mut parser = Parser::new(&tokens);
+                parser.parse_program().ok()
+            },
+        };
+
+        let mut items = Vec::new();
+        let offset = src.len(); // cursor at end
+        collect_local_symbols(&mut items, &doc, "", offset);
+
+        let names: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert!(names.contains(&"x"));
+        assert!(names.contains(&"y"));
+        assert!(names.contains(&"z"));
+    }
+
+    #[test]
+    fn test_completion_collect_stdlib_symbols() {
+        let cache = load_stdlib_cache();
+        let uses: Vec<crate::ast::Use> = Vec::new();
+
+        let mut items = Vec::new();
+        collect_stdlib_symbols(&mut items, &cache, &uses, "Option", &[]);
+        assert!(!items.is_empty(), "Should find Option in stdlib");
+        assert!(
+            items.iter().any(|i| i.label == "Option"),
+            "Option should be in completions"
+        );
+
+        // Option should have additionalTextEdits since nothing is imported
+        let option_item = items.iter().find(|i| i.label == "Option").unwrap();
+        assert!(
+            option_item.additional_text_edits.is_some(),
+            "Option should have use insertion"
+        );
+    }
+
+    #[test]
+    fn test_completion_existing_import_no_use_insertion() {
+        let cache = load_stdlib_cache();
+        let src = "use std::option::Option;\nfn main() {}";
+        let doc = DocumentState {
+            source: src.to_string(),
+            last_valid_program: {
+                let mut tokens = Vec::new();
+                let mut lexer = Lexer::new(src);
+                loop {
+                    let (t, s) = lexer.next_token().unwrap();
+                    tokens.push((t.clone(), s));
+                    if matches!(t, Token::Eof) {
+                        break;
+                    }
+                }
+                let mut parser = Parser::new(&tokens);
+                parser.parse_program().ok()
+            },
+        };
+
+        let mut items = Vec::new();
+        let uses: &[crate::ast::Use] = doc
+            .last_valid_program
+            .as_ref()
+            .map(|p| p.uses.as_slice())
+            .unwrap_or(&[]);
+        collect_stdlib_symbols(&mut items, &cache, uses, "Option", &[]);
+
+        let option_item = items.iter().find(|i| i.label == "Option");
+        assert!(option_item.is_some(), "Option should appear in completions");
+        assert!(
+            option_item.unwrap().additional_text_edits.is_none(),
+            "Option should NOT have use insertion (already imported)"
+        );
+    }
+
+    #[test]
+    fn test_completion_path_prefix_stdlib() {
+        let cache = load_stdlib_cache();
+        let uses: Vec<crate::ast::Use> = Vec::new();
+
+        let mut items = Vec::new();
+        collect_stdlib_symbols(
+            &mut items,
+            &cache,
+            &uses,
+            "",
+            &["std".to_string(), "vec".to_string()],
+        );
+        assert!(!items.is_empty(), "Should find vec symbols");
+        // Vec is defined in std/vec.u
+        assert!(
+            items.iter().any(|i| i.label == "Vec"),
+            "Vec should be in vec module completions"
+        );
     }
 }

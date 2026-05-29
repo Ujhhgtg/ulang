@@ -1828,10 +1828,10 @@ impl<'ctx> CodeGen<'ctx> {
                 Self::m_substitute_types_in_expr(lhs, params, args);
                 Self::m_substitute_types_in_expr(rhs, params, args);
             }
-            Expr::UnaryNot(inner) => {
+            Expr::UnaryNot(inner, ..) => {
                 Self::m_substitute_types_in_expr(inner, params, args);
             }
-            Expr::UnaryMinus(inner) => {
+            Expr::UnaryMinus(inner, ..) => {
                 Self::m_substitute_types_in_expr(inner, params, args);
             }
             Expr::If {
@@ -1839,6 +1839,7 @@ impl<'ctx> CodeGen<'ctx> {
                 then_block,
                 else_ifs,
                 else_block,
+                ..
             } => {
                 let mut cond_box = Box::new((**cond).clone());
                 Self::m_substitute_types_in_expr(&mut cond_box, params, args);
@@ -1854,10 +1855,10 @@ impl<'ctx> CodeGen<'ctx> {
                     Self::m_substitute_block(eb, params, args);
                 }
             }
-            Expr::Loop { body } => {
+            Expr::Loop { body, .. } => {
                 Self::m_substitute_block(body, params, args);
             }
-            Expr::While { cond, body } => {
+            Expr::While { cond, body, .. } => {
                 let mut cond_box = Box::new((**cond).clone());
                 Self::m_substitute_types_in_expr(&mut cond_box, params, args);
                 *cond = cond_box;
@@ -1867,6 +1868,7 @@ impl<'ctx> CodeGen<'ctx> {
                 pattern: _,
                 container,
                 body,
+                ..
             } => {
                 let mut container_box = Box::new((**container).clone());
                 Self::m_substitute_types_in_expr(&mut container_box, params, args);
@@ -1885,7 +1887,9 @@ impl<'ctx> CodeGen<'ctx> {
                     Self::m_substitute_block(eb, params, args);
                 }
             }
-            Expr::Match { scrutinee, arms } => {
+            Expr::Match {
+                scrutinee, arms, ..
+            } => {
                 Self::m_substitute_types_in_expr(scrutinee, params, args);
                 for arm in arms.iter_mut() {
                     if let Some(ref mut guard) = arm.guard {
@@ -1894,17 +1898,17 @@ impl<'ctx> CodeGen<'ctx> {
                     Self::m_substitute_block(&mut arm.body, params, args);
                 }
             }
-            Expr::Block(block) => {
+            Expr::Block(block, ..) => {
                 Self::m_substitute_block(block, params, args);
             }
-            Expr::Assign { target, value } => {
+            Expr::Assign { target, value, .. } => {
                 Self::m_substitute_types_in_expr(target, params, args);
                 Self::m_substitute_types_in_expr(value, params, args);
             }
             Expr::Ref { expr: inner, .. } => {
                 Self::m_substitute_types_in_expr(inner, params, args);
             }
-            Expr::Deref(inner) => {
+            Expr::Deref(inner, ..) => {
                 Self::m_substitute_types_in_expr(inner, params, args);
             }
             Expr::Member { expr: inner, .. } => {
@@ -1922,7 +1926,7 @@ impl<'ctx> CodeGen<'ctx> {
                     *arg = *inner;
                 }
             }
-            Expr::Tuple(elems) => {
+            Expr::Tuple(elems, ..) => {
                 for elem in elems.iter_mut() {
                     let mut inner = Box::new(elem.clone());
                     Self::m_substitute_types_in_expr(&mut inner, params, args);
@@ -1949,17 +1953,17 @@ impl<'ctx> CodeGen<'ctx> {
                     *expr = *inner;
                 }
             }
-            Expr::Array(elems) => {
+            Expr::Array(elems, ..) => {
                 for elem in elems.iter_mut() {
                     let mut inner = Box::new(elem.clone());
                     Self::m_substitute_types_in_expr(&mut inner, params, args);
                     *elem = *inner;
                 }
             }
-            Expr::Repeat(expr, _) => {
+            Expr::Repeat(expr, ..) => {
                 Self::m_substitute_types_in_expr(expr, params, args);
             }
-            Expr::Index { array, index } => {
+            Expr::Index { array, index, .. } => {
                 Self::m_substitute_types_in_expr(array, params, args);
                 Self::m_substitute_types_in_expr(index, params, args);
             }
@@ -2020,7 +2024,7 @@ impl<'ctx> CodeGen<'ctx> {
     /// E.g., `Expr::Ident("L")` → `Expr::IntLit(5)` when `const_params = ["L"], values = [5]`.
     fn m_substitute_const_in_expr(expr: &mut Expr, const_params: &[String], values: &[i64]) {
         match expr {
-            Expr::Ident(name) => {
+            Expr::Ident(name, ..) => {
                 if let Some(pos) = const_params.iter().position(|p| p == name)
                     && let Some(&val) = values.get(pos)
                 {
@@ -2031,7 +2035,7 @@ impl<'ctx> CodeGen<'ctx> {
                 Self::m_substitute_const_in_expr(lhs, const_params, values);
                 Self::m_substitute_const_in_expr(rhs, const_params, values);
             }
-            Expr::UnaryNot(inner) | Expr::UnaryMinus(inner) => {
+            Expr::UnaryNot(inner, ..) | Expr::UnaryMinus(inner, ..) => {
                 Self::m_substitute_const_in_expr(inner, const_params, values);
             }
             Expr::Cast { expr: inner, .. } => {
@@ -2052,26 +2056,26 @@ impl<'ctx> CodeGen<'ctx> {
                     Self::m_substitute_const_in_expr(arg, const_params, values);
                 }
             }
-            Expr::Assign { target, value } => {
+            Expr::Assign { target, value, .. } => {
                 Self::m_substitute_const_in_expr(target, const_params, values);
                 Self::m_substitute_const_in_expr(value, const_params, values);
             }
-            Expr::Ref { expr: inner, .. } | Expr::Deref(inner) => {
+            Expr::Ref { expr: inner, .. } | Expr::Deref(inner, ..) => {
                 Self::m_substitute_const_in_expr(inner, const_params, values);
             }
             Expr::Member { expr: inner, .. } => {
                 Self::m_substitute_const_in_expr(inner, const_params, values);
             }
-            Expr::Index { array, index } => {
+            Expr::Index { array, index, .. } => {
                 Self::m_substitute_const_in_expr(array, const_params, values);
                 Self::m_substitute_const_in_expr(index, const_params, values);
             }
-            Expr::Array(elems) => {
+            Expr::Array(elems, ..) => {
                 for elem in elems.iter_mut() {
                     Self::m_substitute_const_in_expr(elem, const_params, values);
                 }
             }
-            Expr::Repeat(inner, _) => {
+            Expr::Repeat(inner, .., _) => {
                 Self::m_substitute_const_in_expr(inner, const_params, values);
             }
             Expr::If {
@@ -2079,6 +2083,7 @@ impl<'ctx> CodeGen<'ctx> {
                 then_block,
                 else_ifs,
                 else_block,
+                ..
             } => {
                 Self::m_substitute_const_in_expr(cond, const_params, values);
                 Self::m_substitute_const_block(then_block, const_params, values);
@@ -2090,10 +2095,10 @@ impl<'ctx> CodeGen<'ctx> {
                     Self::m_substitute_const_block(block, const_params, values);
                 }
             }
-            Expr::Loop { body } => {
+            Expr::Loop { body, .. } => {
                 Self::m_substitute_const_block(body, const_params, values);
             }
-            Expr::While { cond, body } => {
+            Expr::While { cond, body, .. } => {
                 Self::m_substitute_const_in_expr(cond, const_params, values);
                 Self::m_substitute_const_block(body, const_params, values);
             }
@@ -2124,7 +2129,7 @@ impl<'ctx> CodeGen<'ctx> {
                     Self::m_substitute_const_block(&mut arm.body, const_params, values);
                 }
             }
-            Expr::Block(block) => {
+            Expr::Block(block, ..) => {
                 Self::m_substitute_const_block(block, const_params, values);
             }
             // Tuple, StructLit, EnumLit, BoolLit, IntLit, FloatLit, StrLit, Unit — no substitution needed
@@ -2721,6 +2726,7 @@ impl<'ctx> CodeGen<'ctx> {
                 then_block,
                 else_ifs,
                 else_block,
+                ..
             } => {
                 Self::collect_enum_lits_from_expr(cond, instances, seen, one_param_enums);
                 Self::collect_enum_lits_from_block(then_block, instances, seen, one_param_enums);
@@ -2744,7 +2750,9 @@ impl<'ctx> CodeGen<'ctx> {
                     Self::collect_enum_lits_from_block(eb, instances, seen, one_param_enums);
                 }
             }
-            Expr::Match { scrutinee, arms } => {
+            Expr::Match {
+                scrutinee, arms, ..
+            } => {
                 Self::collect_enum_lits_from_expr(scrutinee, instances, seen, one_param_enums);
                 for arm in arms {
                     if let Some(guard) = &arm.guard {
@@ -2753,11 +2761,11 @@ impl<'ctx> CodeGen<'ctx> {
                     Self::collect_enum_lits_from_block(&arm.body, instances, seen, one_param_enums);
                 }
             }
-            Expr::While { cond, body } => {
+            Expr::While { cond, body, .. } => {
                 Self::collect_enum_lits_from_expr(cond, instances, seen, one_param_enums);
                 Self::collect_enum_lits_from_block(body, instances, seen, one_param_enums);
             }
-            Expr::Loop { body } => {
+            Expr::Loop { body, .. } => {
                 Self::collect_enum_lits_from_block(body, instances, seen, one_param_enums);
             }
             Expr::For {
@@ -2766,7 +2774,7 @@ impl<'ctx> CodeGen<'ctx> {
                 Self::collect_enum_lits_from_expr(container, instances, seen, one_param_enums);
                 Self::collect_enum_lits_from_block(body, instances, seen, one_param_enums);
             }
-            Expr::Block(block) => {
+            Expr::Block(block, ..) => {
                 Self::collect_enum_lits_from_block(block, instances, seen, one_param_enums);
             }
             _ => {}
@@ -3658,7 +3666,7 @@ impl<'ctx> CodeGen<'ctx> {
         let mut candidate = None;
         for arm in arms {
             let ty = if let Some(ref e) = arm.body.tail_expr {
-                if let Expr::Ident(name) = e.as_ref() {
+                if let Expr::Ident(name, ..) = e.as_ref() {
                     if self.consts.contains_key(name.as_str())
                         || self.symbols.contains_key(name.as_str())
                     {
@@ -3716,6 +3724,7 @@ impl<'ctx> CodeGen<'ctx> {
                 expr: receiver,
                 method,
                 args,
+                ..
             } => {
                 // Try to determine return type from method definition
                 let receiver_type = self.expr_type(receiver);
@@ -3825,7 +3834,7 @@ impl<'ctx> CodeGen<'ctx> {
                 }
                 Self::literal_type(expr)
             }
-            Expr::Ident(name) => {
+            Expr::Ident(name, ..) => {
                 if self.consts.contains_key(name) {
                     return Type::I32;
                 }
@@ -3838,6 +3847,7 @@ impl<'ctx> CodeGen<'ctx> {
                 expr: inner,
                 index,
                 field,
+                ..
             } => {
                 let parent_ty = self.expr_type(inner);
                 // Resolve struct types to their inner type for field access
@@ -3988,6 +3998,7 @@ impl<'ctx> CodeGen<'ctx> {
                 module,
                 callee,
                 args,
+                ..
             } => {
                 let qualified_name = format!("{}::{}", module, callee);
                 let mangled_name = format!("{}::{}/{}", module, callee, args.len());
@@ -4089,7 +4100,7 @@ impl<'ctx> CodeGen<'ctx> {
                     _ => Type::I32,
                 }
             }
-            Expr::Array(elems) => {
+            Expr::Array(elems, ..) => {
                 if elems.is_empty() {
                     Type::I32
                 } else {
@@ -4100,11 +4111,11 @@ impl<'ctx> CodeGen<'ctx> {
                     }
                 }
             }
-            Expr::Repeat(expr, count) => Type::Array {
+            Expr::Repeat(expr, count, ..) => Type::Array {
                 inner: Box::new(self.expr_type(expr)),
                 len: *count,
             },
-            Expr::Deref(inner) => {
+            Expr::Deref(inner, ..) => {
                 let inner_ty = self.expr_type(inner);
                 match inner_ty {
                     Type::Ptr { inner: pointee, .. } => *pointee,
@@ -4115,14 +4126,17 @@ impl<'ctx> CodeGen<'ctx> {
             Expr::Ref {
                 expr: inner,
                 is_mut,
+                ..
             } => Type::Ref {
                 inner: Box::new(self.expr_type(inner)),
                 is_mut: *is_mut,
             },
-            Expr::UnaryNot(inner) => self.expr_type(inner),
-            Expr::UnaryMinus(inner) => self.expr_type(inner),
-            Expr::Tuple(elems) => Type::Tuple(elems.iter().map(|e| self.expr_type(e)).collect()),
-            Expr::Loop { body } => {
+            Expr::UnaryNot(inner, ..) => self.expr_type(inner),
+            Expr::UnaryMinus(inner, ..) => self.expr_type(inner),
+            Expr::Tuple(elems, ..) => {
+                Type::Tuple(elems.iter().map(|e| self.expr_type(e)).collect())
+            }
+            Expr::Loop { body, .. } => {
                 let mut breaks = Vec::new();
                 Self::find_loop_breaks(body, &mut breaks);
                 if breaks.is_empty() {
@@ -4146,14 +4160,14 @@ impl<'ctx> CodeGen<'ctx> {
 
     fn literal_type(expr: &Expr) -> Type {
         match expr {
-            Expr::BoolLit(_) => Type::Bool,
-            Expr::IntLit(_) => Type::I32,
-            Expr::FloatLit(_) => Type::F64,
-            Expr::StrLit(_) => Type::Ref {
+            Expr::BoolLit(..) => Type::Bool,
+            Expr::IntLit(..) => Type::I32,
+            Expr::FloatLit(..) => Type::F64,
+            Expr::StrLit(..) => Type::Ref {
                 inner: Box::new(Type::Str),
                 is_mut: false,
             },
-            Expr::Ref { expr, is_mut } => Type::Ref {
+            Expr::Ref { expr, is_mut, .. } => Type::Ref {
                 inner: Box::new(Self::literal_type(expr)),
                 is_mut: *is_mut,
             },
@@ -4165,12 +4179,12 @@ impl<'ctx> CodeGen<'ctx> {
                     _ => Type::I32,
                 }
             }
-            Expr::UnaryMinus(expr) => Self::literal_type(expr),
-            Expr::UnaryNot(expr) => Self::literal_type(expr),
+            Expr::UnaryMinus(expr, ..) => Self::literal_type(expr),
+            Expr::UnaryNot(expr, ..) => Self::literal_type(expr),
             Expr::Assign { value, .. } => Self::literal_type(value),
             Expr::Cast { to_type, .. } => to_type.clone(),
-            Expr::Tuple(elems) => Type::Tuple(elems.iter().map(Self::literal_type).collect()),
-            Expr::Unit => Type::Unit,
+            Expr::Tuple(elems, ..) => Type::Tuple(elems.iter().map(Self::literal_type).collect()),
+            Expr::Unit(_) => Type::Unit,
             Expr::MethodCall { expr, method, .. } => {
                 let receiver_ty = Self::literal_type(expr);
                 // clone() returns Self
@@ -4205,7 +4219,7 @@ impl<'ctx> CodeGen<'ctx> {
                     | BinOp::Or,
                 ..
             } => Type::Bool,
-            Expr::Array(elems) => {
+            Expr::Array(elems, ..) => {
                 if elems.is_empty() {
                     Type::I32 // fallback; empty arrays are rejected by parser
                 } else {
@@ -4232,7 +4246,7 @@ impl<'ctx> CodeGen<'ctx> {
                     _ => Type::I32,
                 }
             }
-            Expr::Loop { body } => {
+            Expr::Loop { body, .. } => {
                 let mut breaks = Vec::new();
                 Self::find_loop_breaks(body, &mut breaks);
                 if breaks.is_empty() {
@@ -4251,7 +4265,7 @@ impl<'ctx> CodeGen<'ctx> {
                 }
             }
             Expr::While { .. } | Expr::For { .. } => Type::Unit,
-            Expr::Block(block) => {
+            Expr::Block(block, ..) => {
                 if let Some(ref tail) = block.tail_expr {
                     Self::literal_type(tail)
                 } else {
@@ -4296,6 +4310,7 @@ impl<'ctx> CodeGen<'ctx> {
                 then_block,
                 else_ifs,
                 else_block,
+                ..
             } => {
                 Self::find_expr_breaks(cond, breaks);
                 Self::find_loop_breaks(then_block, breaks);
@@ -4319,7 +4334,9 @@ impl<'ctx> CodeGen<'ctx> {
                     Self::find_loop_breaks(else_blk, breaks);
                 }
             }
-            Expr::Match { scrutinee, arms } => {
+            Expr::Match {
+                scrutinee, arms, ..
+            } => {
                 Self::find_expr_breaks(scrutinee, breaks);
                 for arm in arms {
                     if let Some(guard) = &arm.guard {
@@ -4328,19 +4345,19 @@ impl<'ctx> CodeGen<'ctx> {
                     Self::find_loop_breaks(&arm.body, breaks);
                 }
             }
-            Expr::Block(block) => {
+            Expr::Block(block, ..) => {
                 Self::find_loop_breaks(block, breaks);
             }
             Expr::Binary { lhs, rhs, .. } => {
                 Self::find_expr_breaks(lhs, breaks);
                 Self::find_expr_breaks(rhs, breaks);
             }
-            Expr::Assign { target, value } => {
+            Expr::Assign { target, value, .. } => {
                 Self::find_expr_breaks(target, breaks);
                 Self::find_expr_breaks(value, breaks);
             }
             Expr::Ref { expr, .. } => Self::find_expr_breaks(expr, breaks),
-            Expr::UnaryNot(expr) | Expr::UnaryMinus(expr) | Expr::Deref(expr) => {
+            Expr::UnaryNot(expr, ..) | Expr::UnaryMinus(expr, ..) | Expr::Deref(expr, ..) => {
                 Self::find_expr_breaks(expr, breaks);
             }
             Expr::Cast { expr, .. } => Self::find_expr_breaks(expr, breaks),
@@ -4354,7 +4371,7 @@ impl<'ctx> CodeGen<'ctx> {
                     Self::find_expr_breaks(arg, breaks);
                 }
             }
-            Expr::Tuple(exprs) | Expr::Array(exprs) => {
+            Expr::Tuple(exprs, ..) | Expr::Array(exprs, ..) => {
                 for expr in exprs {
                     Self::find_expr_breaks(expr, breaks);
                 }
@@ -4376,17 +4393,17 @@ impl<'ctx> CodeGen<'ctx> {
                     Self::find_expr_breaks(payload_expr, breaks);
                 }
             }
-            Expr::Repeat(expr, _) => Self::find_expr_breaks(expr, breaks),
-            Expr::Index { array, index } => {
+            Expr::Repeat(expr, ..) => Self::find_expr_breaks(expr, breaks),
+            Expr::Index { array, index, .. } => {
                 Self::find_expr_breaks(array, breaks);
                 Self::find_expr_breaks(index, breaks);
             }
-            Expr::BoolLit(_)
-            | Expr::IntLit(_)
-            | Expr::FloatLit(_)
-            | Expr::StrLit(_)
-            | Expr::Ident(_)
-            | Expr::Unit => {}
+            Expr::BoolLit(..)
+            | Expr::IntLit(..)
+            | Expr::FloatLit(..)
+            | Expr::StrLit(..)
+            | Expr::Ident(..)
+            | Expr::Unit(_) => {}
         }
     }
 
@@ -5383,13 +5400,13 @@ impl<'ctx> CodeGen<'ctx> {
 
     fn compile_expr(&mut self, expr: &Expr) -> Result<BasicValueEnum<'ctx>, String> {
         match expr {
-            Expr::BoolLit(val) => Ok(self
+            Expr::BoolLit(val, ..) => Ok(self
                 .bool_type
                 .const_int(if *val { 1 } else { 0 }, false)
                 .into()),
-            Expr::IntLit(val) => Ok(self.i32_type.const_int(*val as u64, true).into()),
-            Expr::FloatLit(val) => Ok(self.f64_type.const_float(*val).into()),
-            Expr::StrLit(s) => {
+            Expr::IntLit(val, ..) => Ok(self.i32_type.const_int(*val as u64, true).into()),
+            Expr::FloatLit(val, ..) => Ok(self.f64_type.const_float(*val).into()),
+            Expr::StrLit(s, ..) => {
                 let ptr = self
                     .builder
                     .build_global_string_ptr(s, "str")
@@ -5414,7 +5431,7 @@ impl<'ctx> CodeGen<'ctx> {
                     .map_err(|e| format!("failed to build str len insert: {}", e))?;
                 Ok(str_struct.into_struct_value().into())
             }
-            Expr::Ident(name) => {
+            Expr::Ident(name, ..) => {
                 // Use-after-move check
                 if self.moved_vars.contains(name) {
                     return Err(format!("cannot use moved variable '{}'", name));
@@ -5433,8 +5450,8 @@ impl<'ctx> CodeGen<'ctx> {
                     Err(format!("undefined variable '{}'", name))
                 }
             }
-            Expr::Assign { target, value } => match target.as_ref() {
-                Expr::Ident(name) => {
+            Expr::Assign { target, value, .. } => match target.as_ref() {
+                Expr::Ident(name, ..) => {
                     if self.consts.contains_key(name) {
                         return Err(format!("cannot assign to constant '{}'", name));
                     }
@@ -5452,7 +5469,7 @@ impl<'ctx> CodeGen<'ctx> {
                         .map_err(|e| format!("failed to build store: {}", e))?;
                     Ok(val)
                 }
-                Expr::Deref(inner) => {
+                Expr::Deref(inner, ..) => {
                     let ptr = self.compile_expr(inner)?;
                     let ptr = ptr.into_pointer_value();
                     let val = self.compile_expr(value)?;
@@ -5465,12 +5482,13 @@ impl<'ctx> CodeGen<'ctx> {
                     expr: member_expr,
                     index,
                     field,
+                    ..
                 } => {
                     let parent_ptr_val = self.compile_expr(member_expr)?;
                     let parent_ptr = match parent_ptr_val {
                         BasicValueEnum::PointerValue(p) => p,
                         _ => {
-                            if let Expr::Ident(name) = member_expr.as_ref() {
+                            if let Expr::Ident(name, ..) = member_expr.as_ref() {
                                 if let Some((ptr, _, _)) = self.symbols.get(name) {
                                     *ptr
                                 } else {
@@ -5576,7 +5594,7 @@ impl<'ctx> CodeGen<'ctx> {
                         .map_err(|e| format!("failed to store field value: {}", e))?;
                     Ok(val)
                 }
-                Expr::Index { array, index } => {
+                Expr::Index { array, index, .. } => {
                     let array_ty = self.expr_type(array);
                     // Handle slice/slice-ref indexing write (fat pointer → GEP → store)
                     let is_slice = matches!(&array_ty, Type::Slice { .. })
@@ -5643,7 +5661,7 @@ impl<'ctx> CodeGen<'ctx> {
                         format!("internal: index_mut function '{}' not found", fn_name)
                     })?;
                     // Compile array to a pointer — use original alloca if it's a variable
-                    let array_ptr = if let Expr::Ident(name) = array.as_ref() {
+                    let array_ptr = if let Expr::Ident(name, ..) = array.as_ref() {
                         if let Some((ptr, _, _)) = self.symbols.get(name) {
                             *ptr
                         } else {
@@ -5686,13 +5704,13 @@ impl<'ctx> CodeGen<'ctx> {
                 _ => Err("invalid assignment target".to_string()),
             },
             Expr::Ref { expr, .. } => {
-                if let Expr::Ident(name) = expr.as_ref() {
+                if let Expr::Ident(name, ..) = expr.as_ref() {
                     if let Some((ptr, _, _)) = self.symbols.get(name) {
                         Ok((*ptr).into())
                     } else {
                         Err(format!("undefined variable '{}'", name))
                     }
-                } else if let Expr::Deref(inner) = expr.as_ref() {
+                } else if let Expr::Deref(inner, ..) = expr.as_ref() {
                     self.compile_expr(inner)
                 } else {
                     let ty = Self::literal_type(expr);
@@ -5708,7 +5726,7 @@ impl<'ctx> CodeGen<'ctx> {
                     Ok(alloca.into())
                 }
             }
-            Expr::Deref(expr) => {
+            Expr::Deref(expr, ..) => {
                 let ptr_val = self.compile_expr(expr)?;
                 let ptr = ptr_val.into_pointer_value();
                 // Determine pointee type
@@ -5724,7 +5742,7 @@ impl<'ctx> CodeGen<'ctx> {
                     .map_err(|e| format!("failed to build deref load: {}", e))?;
                 Ok(val)
             }
-            Expr::Call { callee, args } => {
+            Expr::Call { callee, args, .. } => {
                 if callee != "__builtin_size_of" && !callee.starts_with("__builtin_slice_") {
                     self.check_visibility_of_path(&self.current_module_path, callee)?;
                 }
@@ -5836,7 +5854,7 @@ impl<'ctx> CodeGen<'ctx> {
                 // Move detection: mark by-value args as moved if not Copy
                 let param_tys = self.fn_param_types.get(&param_tys_key);
                 for (i, arg) in args.iter().enumerate() {
-                    if let Expr::Ident(arg_name) = arg
+                    if let Expr::Ident(arg_name, ..) = arg
                         && let Some(param_tys) = param_tys
                         && let Some(param_ty) = param_tys.get(i)
                     {
@@ -5853,6 +5871,7 @@ impl<'ctx> CodeGen<'ctx> {
                 module,
                 callee,
                 args,
+                ..
             } => {
                 let qualified_name = format!("{}::{}", module, callee);
                 self.check_visibility_of_path(&self.current_module_path, &qualified_name)?;
@@ -5929,7 +5948,7 @@ impl<'ctx> CodeGen<'ctx> {
                     .map_err(|e| format!("failed to build call to '{}': {}", qualified_name, e))?;
                 // Move detection: mark by-value args as moved if not Copy
                 for (i, arg) in args.iter().enumerate() {
-                    if let Expr::Ident(arg_name) = arg
+                    if let Expr::Ident(arg_name, ..) = arg
                         && let Some(param_tys) = self.fn_param_types.get(&resolved_name)
                         && let Some(param_ty) = param_tys.get(i)
                     {
@@ -5941,7 +5960,7 @@ impl<'ctx> CodeGen<'ctx> {
                 }
                 Ok(self.try_extract_result(result))
             }
-            Expr::Binary { op, lhs, rhs } => {
+            Expr::Binary { op, lhs, rhs, .. } => {
                 if *op == BinOp::And {
                     let parent_fn = self
                         .builder
@@ -6167,7 +6186,7 @@ impl<'ctx> CodeGen<'ctx> {
                 };
                 Ok(result)
             }
-            Expr::Tuple(elems) => {
+            Expr::Tuple(elems, ..) => {
                 let compiled: Vec<BasicValueEnum<'ctx>> = elems
                     .iter()
                     .map(|e| self.compile_expr(e))
@@ -6186,7 +6205,7 @@ impl<'ctx> CodeGen<'ctx> {
                 }
                 Ok(result.into_struct_value().into())
             }
-            Expr::Unit => {
+            Expr::Unit(_) => {
                 let unit_ty = self.context.struct_type(&[], false);
                 Ok(unit_ty.get_undef().into())
             }
@@ -6296,6 +6315,7 @@ impl<'ctx> CodeGen<'ctx> {
                 expr: receiver,
                 method,
                 args,
+                ..
             } => {
                 // Reject direct .drop() calls
                 if method == "drop" {
@@ -6468,7 +6488,7 @@ impl<'ctx> CodeGen<'ctx> {
                 let receiver_ptr = match receiver_val {
                     BasicValueEnum::PointerValue(p) => p,
                     _ => {
-                        if let Expr::Ident(name) = receiver.as_ref() {
+                        if let Expr::Ident(name, ..) = receiver.as_ref() {
                             if let Some((ptr, _, _)) = self.symbols.get(name) {
                                 *ptr
                             } else {
@@ -6668,7 +6688,7 @@ impl<'ctx> CodeGen<'ctx> {
                     _ => Err(format!("expected struct value for '{}'", struct_name)),
                 }
             }
-            Expr::Array(elems) => {
+            Expr::Array(elems, ..) => {
                 if elems.is_empty() {
                     return Err("empty array literals are not supported".to_string());
                 }
@@ -6714,7 +6734,7 @@ impl<'ctx> CodeGen<'ctx> {
                     .map_err(|e| format!("failed to load array: {}", e))?;
                 Ok(result)
             }
-            Expr::Repeat(expr, count) => {
+            Expr::Repeat(expr, count, ..) => {
                 let elem_ty = self.expr_type(expr);
                 let elem_llvm = self.type_to_llvm(&elem_ty);
                 let len = *count as u32;
@@ -6757,7 +6777,7 @@ impl<'ctx> CodeGen<'ctx> {
                     .map_err(|e| format!("failed to load array: {}", e))?;
                 Ok(result)
             }
-            Expr::Index { array, index } => {
+            Expr::Index { array, index, .. } => {
                 let array_ty = self.expr_type(array);
                 // Handle slice/slice-ref indexing (fat pointer → GEP → load)
                 let is_slice = matches!(&array_ty, Type::Slice { .. })
@@ -6822,7 +6842,7 @@ impl<'ctx> CodeGen<'ctx> {
                     .get_function(&fn_name)
                     .ok_or_else(|| format!("internal: index function '{}' not found", fn_name))?;
                 // Compile array to a pointer — use original alloca if it's a variable
-                let array_ptr = if let Expr::Ident(name) = array.as_ref() {
+                let array_ptr = if let Expr::Ident(name, ..) = array.as_ref() {
                     if let Some((ptr, _, _)) = self.symbols.get(name) {
                         *ptr
                     } else {
@@ -6860,7 +6880,7 @@ impl<'ctx> CodeGen<'ctx> {
                     .map_err(|e| format!("failed to load index result: {}", e))?;
                 Ok(loaded)
             }
-            Expr::Cast { expr, to_type } => {
+            Expr::Cast { expr, to_type, .. } => {
                 self.check_visibility_of_type(&self.current_module_path, to_type)?;
                 let val = self.compile_expr(expr)?;
                 let expr_ty = self.expr_type(expr);
@@ -6871,6 +6891,7 @@ impl<'ctx> CodeGen<'ctx> {
                 then_block,
                 else_ifs,
                 else_block,
+                ..
             } => {
                 let parent_fn = self
                     .builder
@@ -6970,7 +6991,7 @@ impl<'ctx> CodeGen<'ctx> {
                     .map_err(|e| format!("failed to load if result: {}", e))?;
                 Ok(result)
             }
-            Expr::Loop { body } => {
+            Expr::Loop { body, .. } => {
                 let parent_fn = self
                     .builder
                     .get_insert_block()
@@ -7036,7 +7057,7 @@ impl<'ctx> CodeGen<'ctx> {
                     .map_err(|e| format!("failed to load loop result: {}", e))?;
                 Ok(result)
             }
-            Expr::While { cond, body } => {
+            Expr::While { cond, body, .. } => {
                 let parent_fn = self
                     .builder
                     .get_insert_block()
@@ -7105,7 +7126,7 @@ impl<'ctx> CodeGen<'ctx> {
                 let unit_ty = self.context.struct_type(&[], false);
                 Ok(unit_ty.get_undef().into())
             }
-            Expr::UnaryNot(inner_expr) => {
+            Expr::UnaryNot(inner_expr, ..) => {
                 let val = self.compile_expr(inner_expr)?;
                 match val {
                     BasicValueEnum::IntValue(v) => Ok(self
@@ -7116,7 +7137,7 @@ impl<'ctx> CodeGen<'ctx> {
                     _ => Err("unary ! requires integer operand".to_string()),
                 }
             }
-            Expr::UnaryMinus(inner_expr) => {
+            Expr::UnaryMinus(inner_expr, ..) => {
                 let val = self.compile_expr(inner_expr)?;
                 match val {
                     BasicValueEnum::IntValue(v) => Ok(self
@@ -7136,6 +7157,7 @@ impl<'ctx> CodeGen<'ctx> {
                 enum_name,
                 variant,
                 payload,
+                ..
             } => {
                 // Compute the actual type name. For generic enums with a payload,
                 // derive from the payload type (e.g., Option::Some(42) → Option__i32).
@@ -7233,15 +7255,19 @@ impl<'ctx> CodeGen<'ctx> {
                 pattern,
                 container,
                 body,
+                ..
             } => self.compile_for(pattern, container, body),
             Expr::IfLet {
                 pattern,
                 scrutinee,
                 then_block,
                 else_block,
+                ..
             } => self.compile_if_let(pattern, scrutinee, then_block, else_block),
-            Expr::Match { scrutinee, arms } => self.compile_match(scrutinee, arms),
-            Expr::Block(block) => {
+            Expr::Match {
+                scrutinee, arms, ..
+            } => self.compile_match(scrutinee, arms),
+            Expr::Block(block, ..) => {
                 let saved_symbols = self.symbols.clone();
                 let saved_moved_vars = self.moved_vars.clone();
                 self.enter_scope();
@@ -8080,20 +8106,20 @@ impl<'ctx> CodeGen<'ctx> {
 
     fn const_eval(&self, expr: &Expr) -> Result<i64, String> {
         match expr {
-            Expr::BoolLit(val) => Ok(if *val { 1 } else { 0 }),
-            Expr::IntLit(val) => Ok(*val),
-            Expr::FloatLit(_) => {
+            Expr::BoolLit(val, ..) => Ok(if *val { 1 } else { 0 }),
+            Expr::IntLit(val, ..) => Ok(*val),
+            Expr::FloatLit(..) => {
                 Err("float literals are not supported in const initializers".to_string())
             }
-            Expr::StrLit(_) => {
+            Expr::StrLit(..) => {
                 Err("string literals are not supported in const initializers".to_string())
             }
-            Expr::Ident(name) => self
+            Expr::Ident(name, ..) => self
                 .consts
                 .get(name)
                 .copied()
                 .ok_or_else(|| format!("undefined constant '{}'", name)),
-            Expr::Binary { op, lhs, rhs } => {
+            Expr::Binary { op, lhs, rhs, .. } => {
                 let lhs = self.const_eval(lhs)?;
                 let rhs = self.const_eval(rhs)?;
                 match op {
@@ -8120,19 +8146,21 @@ impl<'ctx> CodeGen<'ctx> {
             Expr::Ref { .. } => {
                 Err("reference expressions are not supported in const initializers".to_string())
             }
-            Expr::UnaryMinus(expr) => {
+            Expr::UnaryMinus(expr, ..) => {
                 let val = self.const_eval(expr)?;
                 Ok(-val)
             }
-            Expr::Deref(_) => {
+            Expr::Deref(..) => {
                 Err("dereference expressions are not supported in const initializers".to_string())
             }
             Expr::Assign { .. } => {
                 Err("assignment is not supported in const initializers".to_string())
             }
-            Expr::MethodCall { expr, method, args } => {
+            Expr::MethodCall {
+                expr, method, args, ..
+            } => {
                 if method == "len" && args.is_empty() {
-                    if let Expr::StrLit(s) = expr.as_ref() {
+                    if let Expr::StrLit(s, ..) = expr.as_ref() {
                         Ok(s.len() as i64)
                     } else {
                         Err("non-constant receiver for method call in const initializer"

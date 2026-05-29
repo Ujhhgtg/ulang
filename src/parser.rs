@@ -558,6 +558,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_extern_fn(&mut self) -> Result<Function, ParseError> {
+        let lo = self.current_span_lo();
         self.expect(&Token::Fn)?;
         let name = match self.peek_token() {
             Token::Ident(s) => {
@@ -599,6 +600,7 @@ impl<'a> Parser<'a> {
             tail_expr: None,
             span: Span::empty(0),
         };
+        let hi = self.last_span_end();
         Ok(Function {
             name,
             params,
@@ -609,6 +611,7 @@ impl<'a> Parser<'a> {
             is_method: false,
             is_pub: false,
             attribs: Vec::new(),
+            span: Span::new(lo, hi),
         })
     }
 
@@ -1075,6 +1078,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_function(&mut self, attribs: Vec<Attribute>) -> Result<Function, ParseError> {
+        let lo = self.current_span_lo();
         self.expect(&Token::Fn)?;
         let name = match self.peek_token() {
             Token::Ident(s) => {
@@ -1107,6 +1111,7 @@ impl<'a> Parser<'a> {
             None
         };
         let body = self.parse_block()?;
+        let hi = self.last_span_end();
         Ok(Function {
             name,
             params,
@@ -1117,6 +1122,7 @@ impl<'a> Parser<'a> {
             is_method: false,
             is_pub: false,
             attribs,
+            span: Span::new(lo, hi),
         })
     }
 
@@ -1394,12 +1400,14 @@ impl<'a> Parser<'a> {
         let lhs = self.parse_logical_or()?;
         if *self.peek_token() == Token::Eq {
             match &lhs {
-                Expr::Ident(_) | Expr::Deref(_) | Expr::Member { .. } | Expr::Index { .. } => {
+                Expr::Ident(..) | Expr::Deref(..) | Expr::Member { .. } | Expr::Index { .. } => {
                     self.advance(); // consume '='
                     let value = self.parse_assign()?; // right-associative
+                    let span = Span::new(lhs.span().lo, value.span().hi);
                     Ok(Expr::Assign {
                         target: Box::new(lhs),
                         value: Box::new(value),
+                        span,
                     })
                 }
                 _ => {
@@ -1424,10 +1432,12 @@ impl<'a> Parser<'a> {
             if *self.peek_token() == Token::OrOr {
                 self.advance();
                 let rhs = self.parse_logical_and()?;
+                let span = Span::new(lhs.span().lo, rhs.span().hi);
                 lhs = Expr::Binary {
                     op: BinOp::Or,
                     lhs: Box::new(lhs),
                     rhs: Box::new(rhs),
+                    span,
                 };
             } else {
                 break;
@@ -1442,10 +1452,12 @@ impl<'a> Parser<'a> {
             if *self.peek_token() == Token::AndAnd {
                 self.advance();
                 let rhs = self.parse_comparison()?;
+                let span = Span::new(lhs.span().lo, rhs.span().hi);
                 lhs = Expr::Binary {
                     op: BinOp::And,
                     lhs: Box::new(lhs),
                     rhs: Box::new(rhs),
+                    span,
                 };
             } else {
                 break;
@@ -1468,10 +1480,12 @@ impl<'a> Parser<'a> {
             };
             self.advance();
             let rhs = self.parse_additive()?;
+            let span = Span::new(lhs.span().lo, rhs.span().hi);
             lhs = Expr::Binary {
                 op,
                 lhs: Box::new(lhs),
                 rhs: Box::new(rhs),
+                span,
             };
         }
         Ok(lhs)
@@ -1484,19 +1498,23 @@ impl<'a> Parser<'a> {
                 Token::Plus => {
                     self.advance();
                     let rhs = self.parse_term()?;
+                    let span = Span::new(lhs.span().lo, rhs.span().hi);
                     lhs = Expr::Binary {
                         op: BinOp::Add,
                         lhs: Box::new(lhs),
                         rhs: Box::new(rhs),
+                        span,
                     };
                 }
                 Token::Minus => {
                     self.advance();
                     let rhs = self.parse_term()?;
+                    let span = Span::new(lhs.span().lo, rhs.span().hi);
                     lhs = Expr::Binary {
                         op: BinOp::Sub,
                         lhs: Box::new(lhs),
                         rhs: Box::new(rhs),
+                        span,
                     };
                 }
                 _ => break,
@@ -1518,9 +1536,11 @@ impl<'a> Parser<'a> {
                     self.advance(); // consume [
                     let index_expr = self.parse_expr()?;
                     self.expect(&Token::RBracket)?;
+                    let span = Span::new(expr.span().lo, self.last_span_end());
                     expr = Expr::Index {
                         array: Box::new(expr),
                         index: Box::new(index_expr),
+                        span,
                     };
                 }
                 Token::Dot => {
@@ -1537,10 +1557,12 @@ impl<'a> Parser<'a> {
                                 });
                             }
                             self.advance();
+                            let span = Span::new(expr.span().lo, self.last_span_end());
                             expr = Expr::Member {
                                 expr: Box::new(expr),
                                 index: idx as usize,
                                 field: None,
+                                span,
                             };
                         }
                         Token::Ident(name) => {
@@ -1548,18 +1570,22 @@ impl<'a> Parser<'a> {
                             self.advance(); // consume field/method name
                             if *self.peek_token() == Token::LParen {
                                 let args = self.parse_call_args()?;
+                                let span = Span::new(expr.span().lo, self.last_span_end());
                                 expr = Expr::MethodCall {
                                     expr: Box::new(expr),
                                     method: field,
                                     args,
+                                    span,
                                 };
                             } else {
                                 // Named field access: resolve field index here
                                 // or defer to codegen with the field name
+                                let span = Span::new(expr.span().lo, self.last_span_end());
                                 expr = Expr::Member {
                                     expr: Box::new(expr),
                                     index: 0,
                                     field: Some(field),
+                                    span,
                                 };
                             }
                         }
@@ -1584,6 +1610,7 @@ impl<'a> Parser<'a> {
     /// This binds tighter than binary operators: `a * b as i32` → `a * (b as i32)`
     fn parse_prefix(&mut self) -> Result<Expr, ParseError> {
         if *self.peek_token() == Token::Ampersand {
+            let lo = self.current_span_lo();
             self.advance(); // consume &
             let is_mut = if *self.peek_token() == Token::Mut {
                 self.advance();
@@ -1592,25 +1619,33 @@ impl<'a> Parser<'a> {
                 false
             };
             let expr = self.parse_prefix()?;
+            let hi = expr.span().hi;
             return Ok(Expr::Ref {
                 expr: Box::new(expr),
                 is_mut,
+                span: Span::new(lo, hi),
             });
         }
         if *self.peek_token() == Token::Star {
+            let lo = self.current_span_lo();
             self.advance(); // consume *
             let expr = self.parse_prefix()?;
-            return Ok(Expr::Deref(Box::new(expr)));
+            let hi = expr.span().hi;
+            return Ok(Expr::Deref(Box::new(expr), Span::new(lo, hi)));
         }
         if *self.peek_token() == Token::Bang {
+            let lo = self.current_span_lo();
             self.advance(); // consume !
             let expr = self.parse_prefix()?;
-            return Ok(Expr::UnaryNot(Box::new(expr)));
+            let hi = expr.span().hi;
+            return Ok(Expr::UnaryNot(Box::new(expr), Span::new(lo, hi)));
         }
         if *self.peek_token() == Token::Minus {
+            let lo = self.current_span_lo();
             self.advance(); // consume -
             let expr = self.parse_prefix()?;
-            return Ok(Expr::UnaryMinus(Box::new(expr)));
+            let hi = expr.span().hi;
+            return Ok(Expr::UnaryMinus(Box::new(expr), Span::new(lo, hi)));
         }
         self.parse_postfix()
     }
@@ -1622,9 +1657,11 @@ impl<'a> Parser<'a> {
         while *self.peek_token() == Token::As {
             self.advance();
             let to_type = self.parse_type()?;
+            let span = Span::new(expr.span().lo, self.last_span_end());
             expr = Expr::Cast {
                 expr: Box::new(expr),
                 to_type,
+                span,
             };
         }
         Ok(expr)
@@ -1637,19 +1674,23 @@ impl<'a> Parser<'a> {
                 Token::Star => {
                     self.advance();
                     let rhs = self.parse_primary_as()?;
+                    let span = Span::new(lhs.span().lo, rhs.span().hi);
                     lhs = Expr::Binary {
                         op: BinOp::Mul,
                         lhs: Box::new(lhs),
                         rhs: Box::new(rhs),
+                        span,
                     };
                 }
                 Token::Slash => {
                     self.advance();
                     let rhs = self.parse_primary_as()?;
+                    let span = Span::new(lhs.span().lo, rhs.span().hi);
                     lhs = Expr::Binary {
                         op: BinOp::Div,
                         lhs: Box::new(lhs),
                         rhs: Box::new(rhs),
+                        span,
                     };
                 }
                 _ => break,
@@ -1938,15 +1979,16 @@ impl<'a> Parser<'a> {
         Ok(args)
     }
 
-    fn parse_struct_lit(&mut self, struct_name: &str) -> Result<Expr, ParseError> {
+    fn parse_struct_lit(&mut self, struct_name: &str, start_lo: usize) -> Result<Expr, ParseError> {
         self.expect(&Token::LBrace)?;
         let mut fields = Vec::new();
         while *self.peek_token() != Token::RBrace && *self.peek_token() != Token::Eof {
             let field_name = match self.peek_token() {
                 Token::Ident(s) => {
                     let s = s.clone();
+                    let span = self.current().unwrap().1;
                     self.advance();
-                    s
+                    (s, span)
                 }
                 _ => {
                     let (_, span) = self.current().unwrap();
@@ -1959,10 +2001,13 @@ impl<'a> Parser<'a> {
             if *self.peek_token() == Token::Colon {
                 self.advance();
                 let value = self.parse_expr()?;
-                fields.push((field_name, value));
+                fields.push((field_name.0, value));
             } else {
                 // Shorthand: field_name expands to field_name: field_name
-                fields.push((field_name.clone(), Expr::Ident(field_name)));
+                fields.push((
+                    field_name.0.clone(),
+                    Expr::Ident(field_name.0, field_name.1),
+                ));
             }
             if *self.peek_token() == Token::Comma {
                 self.advance();
@@ -1972,6 +2017,7 @@ impl<'a> Parser<'a> {
         Ok(Expr::StructLit {
             struct_name: struct_name.to_string(),
             fields,
+            span: Span::new(start_lo, self.last_span_end()),
         })
     }
 
@@ -1996,6 +2042,7 @@ impl<'a> Parser<'a> {
         if is_primitive_type
             && self.tokens.get(self.pos + 1).map(|(t, _)| t) == Some(&Token::DoubleColon)
         {
+            let lo_qual = self.current_span_lo();
             let type_token = self.peek_token().clone();
             self.advance(); // consume the type keyword (e.g. i32)
             self.advance(); // consume ::
@@ -2035,27 +2082,33 @@ impl<'a> Parser<'a> {
 
             if *self.peek_token() == Token::LParen {
                 let args = self.parse_call_args()?;
+                let hi = self.last_span_end();
                 return Ok(Expr::QualifiedCall {
                     module: type_str,
                     callee,
                     args,
+                    span: Span::new(lo_qual, hi),
                 });
             } else {
+                let hi = self.last_span_end();
                 return Ok(Expr::QualifiedCall {
                     module: type_str,
                     callee,
                     args: vec![],
+                    span: Span::new(lo_qual, hi),
                 });
             }
         }
         match self.peek_token() {
             Token::IntLit(val) => {
                 let val = *val;
+                let span = self.current().unwrap().1;
                 self.advance();
-                Ok(Expr::IntLit(val))
+                Ok(Expr::IntLit(val, span))
             }
             Token::IntSuffixLit(val, suffix) => {
                 let val = *val;
+                let lit_span = self.current().unwrap().1;
                 let to_type = Self::token_to_type(suffix).ok_or_else(|| {
                     let default = (Token::Eof, Span::empty(0));
                     let (_, span) = self.current().unwrap_or(&default);
@@ -2065,18 +2118,22 @@ impl<'a> Parser<'a> {
                     }
                 })?;
                 self.advance();
+                let hi = self.last_span_end();
                 Ok(Expr::Cast {
-                    expr: Box::new(Expr::IntLit(val)),
+                    expr: Box::new(Expr::IntLit(val, lit_span)),
                     to_type,
+                    span: Span::new(lit_span.lo, hi),
                 })
             }
             Token::FloatLit(val) => {
                 let val = *val;
+                let span = self.current().unwrap().1;
                 self.advance();
-                Ok(Expr::FloatLit(val))
+                Ok(Expr::FloatLit(val, span))
             }
             Token::FloatSuffixLit(val, suffix) => {
                 let val = *val;
+                let lit_span = self.current().unwrap().1;
                 let to_type = Self::token_to_type(suffix).ok_or_else(|| {
                     let default = (Token::Eof, Span::empty(0));
                     let (_, span) = self.current().unwrap_or(&default);
@@ -2086,30 +2143,37 @@ impl<'a> Parser<'a> {
                     }
                 })?;
                 self.advance();
+                let hi = self.last_span_end();
                 Ok(Expr::Cast {
-                    expr: Box::new(Expr::FloatLit(val)),
+                    expr: Box::new(Expr::FloatLit(val, lit_span)),
                     to_type,
+                    span: Span::new(lit_span.lo, hi),
                 })
             }
             Token::StrLit(s) => {
                 let s = s.clone();
+                let span = self.current().unwrap().1;
                 self.advance();
-                Ok(Expr::StrLit(s))
+                Ok(Expr::StrLit(s, span))
             }
             Token::True => {
+                let span = self.current().unwrap().1;
                 self.advance();
-                Ok(Expr::BoolLit(true))
+                Ok(Expr::BoolLit(true, span))
             }
             Token::False => {
+                let span = self.current().unwrap().1;
                 self.advance();
-                Ok(Expr::BoolLit(false))
+                Ok(Expr::BoolLit(false, span))
             }
             Token::Self_ => {
+                let span = self.current().unwrap().1;
                 self.advance();
-                Ok(Expr::Ident("self".to_string()))
+                Ok(Expr::Ident("self".to_string(), span))
             }
             Token::Ident(name) => {
                 let name = name.clone();
+                let ident_span = self.current().unwrap().1;
                 self.advance();
                 let mut path = vec![name];
                 while *self.peek_token() == Token::DoubleColon {
@@ -2144,7 +2208,7 @@ impl<'a> Parser<'a> {
                     // Check for qualified struct literal: prefix::Struct { ... }
                     if *self.peek_token() == Token::LBrace && !self.suppress_struct_lit {
                         let full_struct_name = path.join("::");
-                        return self.parse_struct_lit(&full_struct_name);
+                        return self.parse_struct_lit(&full_struct_name, ident_span.lo);
                     }
 
                     if *self.peek_token() == Token::LParen {
@@ -2152,25 +2216,31 @@ impl<'a> Parser<'a> {
                             self.advance(); // consume '('
                             if *self.peek_token() == Token::RParen {
                                 self.advance(); // consume ')'
+                                let hi = self.last_span_end();
                                 return Ok(Expr::EnumLit {
                                     enum_name: prefix_str,
                                     variant: last_segment,
                                     payload: None,
+                                    span: Span::new(ident_span.lo, hi),
                                 });
                             }
                             let inner = self.parse_expr()?;
                             self.expect(&Token::RParen)?;
+                            let hi = self.last_span_end();
                             Ok(Expr::EnumLit {
                                 enum_name: prefix_str,
                                 variant: last_segment,
                                 payload: Some(Box::new(inner)),
+                                span: Span::new(ident_span.lo, hi),
                             })
                         } else {
                             let args = self.parse_call_args()?;
+                            let hi = self.last_span_end();
                             Ok(Expr::QualifiedCall {
                                 module: prefix_str,
                                 callee: last_segment,
                                 args,
+                                span: Span::new(ident_span.lo, hi),
                             })
                         }
                     } else {
@@ -2179,12 +2249,14 @@ impl<'a> Parser<'a> {
                                 enum_name: prefix_str,
                                 variant: last_segment,
                                 payload: None,
+                                span: Span::new(ident_span.lo, self.last_span_end()),
                             })
                         } else {
                             Ok(Expr::QualifiedCall {
                                 module: prefix_str,
                                 callee: last_segment,
                                 args: vec![],
+                                span: Span::new(ident_span.lo, self.last_span_end()),
                             })
                         }
                     }
@@ -2192,13 +2264,15 @@ impl<'a> Parser<'a> {
                     // path.len() == 1
                     let single_name = path[0].clone();
                     if *self.peek_token() == Token::LBrace && !self.suppress_struct_lit {
-                        return self.parse_struct_lit(&single_name);
+                        return self.parse_struct_lit(&single_name, ident_span.lo);
                     }
                     if *self.peek_token() == Token::LParen {
                         let args = self.parse_call_args()?;
+                        let hi = self.last_span_end();
                         return Ok(Expr::Call {
                             callee: single_name,
                             args,
+                            span: Span::new(ident_span.lo, hi),
                         });
                     }
                     if self.struct_names.contains(&single_name)
@@ -2208,15 +2282,18 @@ impl<'a> Parser<'a> {
                             .map(|f| f.is_empty())
                             .unwrap_or(false)
                     {
+                        let hi = self.last_span_end();
                         return Ok(Expr::StructLit {
                             struct_name: single_name,
                             fields: vec![],
+                            span: Span::new(ident_span.lo, hi),
                         });
                     }
-                    Ok(Expr::Ident(single_name))
+                    Ok(Expr::Ident(single_name, ident_span))
                 }
             }
             Token::LBracket => {
+                let lo = self.current_span_lo();
                 self.advance(); // consume [
                 // Check for empty array → error (ulang doesn't support zero-length arrays)
                 if *self.peek_token() == Token::RBracket {
@@ -2246,7 +2323,8 @@ impl<'a> Parser<'a> {
                         }
                     };
                     self.expect(&Token::RBracket)?;
-                    return Ok(Expr::Repeat(Box::new(first), count));
+                    let hi = self.last_span_end();
+                    return Ok(Expr::Repeat(Box::new(first), count, Span::new(lo, hi)));
                 }
                 // Comma → array literal
                 if *self.peek_token() == Token::Comma {
@@ -2261,18 +2339,22 @@ impl<'a> Parser<'a> {
                         }
                     }
                     self.expect(&Token::RBracket)?;
-                    return Ok(Expr::Array(exprs));
+                    let hi = self.last_span_end();
+                    return Ok(Expr::Array(exprs, Span::new(lo, hi)));
                 }
                 // [expr] — single element array
                 self.expect(&Token::RBracket)?;
-                Ok(Expr::Array(vec![first]))
+                let hi = self.last_span_end();
+                Ok(Expr::Array(vec![first], Span::new(lo, hi)))
             }
             Token::LParen => {
+                let lo = self.current_span_lo();
                 self.advance();
                 // Check for empty parens → unit
                 if *self.peek_token() == Token::RParen {
                     self.advance();
-                    return Ok(Expr::Unit);
+                    let hi = self.last_span_end();
+                    return Ok(Expr::Unit(Span::new(lo, hi)));
                 }
                 let first = self.parse_expr()?;
                 // Comma → tuple
@@ -2288,7 +2370,8 @@ impl<'a> Parser<'a> {
                         }
                     }
                     self.expect(&Token::RParen)?;
-                    return Ok(Expr::Tuple(exprs));
+                    let hi = self.last_span_end();
+                    return Ok(Expr::Tuple(exprs, Span::new(lo, hi)));
                 }
                 // (expr) — parenthesized expression
                 self.expect(&Token::RParen)?;
@@ -2301,7 +2384,8 @@ impl<'a> Parser<'a> {
             Token::Match => self.parse_match_expr(),
             Token::LBrace => {
                 let block = self.parse_block()?;
-                Ok(Expr::Block(block))
+                let span = block.span;
+                Ok(Expr::Block(block, span))
             }
             _ => {
                 let default = (Token::Eof, Span::empty(0));
@@ -2315,6 +2399,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_if_expr(&mut self) -> Result<Expr, ParseError> {
+        let lo = self.current_span_lo();
         self.expect(&Token::If)?;
 
         // Check for `if let` pattern matching
@@ -2341,11 +2426,13 @@ impl<'a> Parser<'a> {
                     else_block = Some(self.parse_block()?);
                 }
             }
+            let hi = self.last_span_end();
             return Ok(Expr::IfLet {
                 pattern,
                 scrutinee: Box::new(scrutinee),
                 then_block,
                 else_block,
+                span: Span::new(lo, hi),
             });
         }
 
@@ -2369,6 +2456,7 @@ impl<'a> Parser<'a> {
                     then_block: elif_then,
                     else_ifs: elif_else_ifs,
                     else_block: elif_else,
+                    ..
                 } = elif
                 {
                     else_ifs.push((*elif_cond, elif_then));
@@ -2379,33 +2467,44 @@ impl<'a> Parser<'a> {
                 else_block = Some(self.parse_block()?);
             }
         }
+        let hi = self.last_span_end();
         Ok(Expr::If {
             cond: Box::new(cond),
             then_block,
             else_ifs,
             else_block,
+            span: Span::new(lo, hi),
         })
     }
 
     fn parse_loop_expr(&mut self) -> Result<Expr, ParseError> {
+        let lo = self.current_span_lo();
         self.expect(&Token::Loop)?;
         let body = self.parse_block()?;
-        Ok(Expr::Loop { body })
+        let hi = self.last_span_end();
+        Ok(Expr::Loop {
+            body,
+            span: Span::new(lo, hi),
+        })
     }
 
     fn parse_while_expr(&mut self) -> Result<Expr, ParseError> {
+        let lo = self.current_span_lo();
         self.expect(&Token::While)?;
         self.suppress_struct_lit = true;
         let cond = self.parse_expr()?;
         self.suppress_struct_lit = false;
         let body = self.parse_block()?;
+        let hi = self.last_span_end();
         Ok(Expr::While {
             cond: Box::new(cond),
             body,
+            span: Span::new(lo, hi),
         })
     }
 
     fn parse_for_expr(&mut self) -> Result<Expr, ParseError> {
+        let lo = self.current_span_lo();
         self.expect(&Token::For)?;
         let pattern = self.parse_pattern()?;
         self.expect(&Token::In)?;
@@ -2413,15 +2512,18 @@ impl<'a> Parser<'a> {
         let container = self.parse_expr()?;
         self.suppress_struct_lit = false;
         let body = self.parse_block()?;
+        let hi = self.last_span_end();
         Ok(Expr::For {
             pattern,
             container: Box::new(container),
             body,
+            span: Span::new(lo, hi),
         })
     }
 
     /// Parse a `match` expression: `match expr { arm, ... }`
     fn parse_match_expr(&mut self) -> Result<Expr, ParseError> {
+        let lo = self.current_span_lo();
         self.expect(&Token::Match)?;
         self.suppress_struct_lit = true;
         let scrutinee = self.parse_expr()?;
@@ -2436,9 +2538,11 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect(&Token::RBrace)?;
+        let hi = self.last_span_end();
         Ok(Expr::Match {
             scrutinee: Box::new(scrutinee),
             arms,
+            span: Span::new(lo, hi),
         })
     }
 
@@ -2917,7 +3021,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(pattern, &Pattern::Binding("x".to_string()));
-                assert!(matches!(init, Expr::IntLit(42)));
+                assert!(matches!(init, Expr::IntLit(42, ..)));
             }
             _ => panic!("expected Let with is_mut=true"),
         }
@@ -2939,7 +3043,7 @@ mod tests {
         match &prog.funcs[0].body.stmts[0] {
             Stmt::Const { name, init, .. } => {
                 assert_eq!(name, "X");
-                assert!(matches!(init, Expr::IntLit(100)));
+                assert!(matches!(init, Expr::IntLit(100, ..)));
             }
             _ => panic!("expected Const stmt"),
         }
@@ -2951,9 +3055,9 @@ mod tests {
         let stmts = &prog.funcs[0].body.stmts;
         assert_eq!(stmts.len(), 2);
         match &stmts[1] {
-            Stmt::Expr(Expr::Assign { target, value }) => {
-                assert!(matches!(target.as_ref(), Expr::Ident(name) if name == "x"));
-                assert!(matches!(value.as_ref(), Expr::IntLit(2)));
+            Stmt::Expr(Expr::Assign { target, value, .. }) => {
+                assert!(matches!(target.as_ref(), Expr::Ident(name, ..) if name == "x"));
+                assert!(matches!(value.as_ref(), Expr::IntLit(2, ..)));
             }
             _ => panic!("expected Expr(Assign(x, 2))"),
         }
@@ -2980,8 +3084,9 @@ mod tests {
                 Expr::Ref {
                     expr,
                     is_mut: false,
+                    ..
                 } => {
-                    assert!(matches!(expr.as_ref(), Expr::Ident(name) if name == "x"));
+                    assert!(matches!(expr.as_ref(), Expr::Ident(name, ..) if name == "x"));
                 }
                 _ => panic!("expected Ref {{ expr: Ident, is_mut: false }}"),
             },
@@ -2994,8 +3099,10 @@ mod tests {
         let prog = parse("fn main() { let mut x = 42; let r = &mut x; }").unwrap();
         match &prog.funcs[0].body.stmts[1] {
             Stmt::Let { init, .. } => match init {
-                Expr::Ref { expr, is_mut: true } => {
-                    assert!(matches!(expr.as_ref(), Expr::Ident(name) if name == "x"));
+                Expr::Ref {
+                    expr, is_mut: true, ..
+                } => {
+                    assert!(matches!(expr.as_ref(), Expr::Ident(name, ..) if name == "x"));
                 }
                 _ => panic!("expected Ref {{ expr: Ident, is_mut: true }}"),
             },
@@ -3008,8 +3115,8 @@ mod tests {
         let prog = parse("fn main() { let x = 42; let r = &x; let v = *r; }").unwrap();
         match &prog.funcs[0].body.stmts[2] {
             Stmt::Let { init, .. } => match init {
-                Expr::Deref(expr) => {
-                    assert!(matches!(expr.as_ref(), Expr::Ident(name) if name == "r"));
+                Expr::Deref(expr, ..) => {
+                    assert!(matches!(expr.as_ref(), Expr::Ident(name, ..) if name == "r"));
                 }
                 _ => panic!("expected Deref(Ident(r))"),
             },
@@ -3061,9 +3168,9 @@ mod tests {
         let stmts = &prog.funcs[0].body.stmts;
         assert_eq!(stmts.len(), 3);
         match &stmts[2] {
-            Stmt::Expr(Expr::Assign { target, value }) => {
-                assert!(matches!(target.as_ref(), Expr::Deref(_)));
-                assert!(matches!(value.as_ref(), Expr::IntLit(99)));
+            Stmt::Expr(Expr::Assign { target, value, .. }) => {
+                assert!(matches!(target.as_ref(), Expr::Deref(..)));
+                assert!(matches!(value.as_ref(), Expr::IntLit(99, ..)));
             }
             _ => panic!("expected Expr(Assign(*r, 99))"),
         }
@@ -3099,9 +3206,10 @@ mod tests {
                     op: BinOp::Add,
                     lhs,
                     rhs,
+                    ..
                 } => {
-                    assert!(matches!(lhs.as_ref(), Expr::IntLit(10)));
-                    assert!(matches!(rhs.as_ref(), Expr::IntLit(20)));
+                    assert!(matches!(lhs.as_ref(), Expr::IntLit(10, ..)));
+                    assert!(matches!(rhs.as_ref(), Expr::IntLit(20, ..)));
                 }
                 _ => panic!("expected Binary(Add, 10, 20)"),
             },
@@ -3118,7 +3226,7 @@ mod tests {
         match &prog.funcs[0].body.stmts[0] {
             Stmt::Let { pattern, init, .. } => {
                 assert_eq!(pattern, &Pattern::Binding("x".to_string()));
-                assert!(matches!(init, Expr::IntLit(42)));
+                assert!(matches!(init, Expr::IntLit(42, ..)));
             }
             _ => panic!("expected Let stmt"),
         }
@@ -3129,7 +3237,7 @@ mod tests {
         let prog = parse("fn main() { 42; }").unwrap();
         assert_eq!(prog.funcs[0].body.stmts.len(), 1);
         match &prog.funcs[0].body.stmts[0] {
-            Stmt::Expr(Expr::IntLit(42)) => {}
+            Stmt::Expr(Expr::IntLit(42, ..)) => {}
             _ => panic!("expected Expr(IntLit(42))"),
         }
     }
@@ -3142,9 +3250,10 @@ mod tests {
                 op: BinOp::Add,
                 lhs,
                 rhs,
+                ..
             }) => {
-                assert!(matches!(lhs.as_ref(), Expr::IntLit(1)));
-                assert!(matches!(rhs.as_ref(), Expr::IntLit(2)));
+                assert!(matches!(lhs.as_ref(), Expr::IntLit(1, ..)));
+                assert!(matches!(rhs.as_ref(), Expr::IntLit(2, ..)));
             }
             _ => panic!("expected Binary(Add, 1, 2)"),
         }
@@ -3186,16 +3295,18 @@ mod tests {
                 op: BinOp::Add,
                 lhs,
                 rhs,
+                ..
             }) => {
-                assert!(matches!(lhs.as_ref(), Expr::IntLit(1)));
+                assert!(matches!(lhs.as_ref(), Expr::IntLit(1, ..)));
                 match rhs.as_ref() {
                     Expr::Binary {
                         op: BinOp::Mul,
                         lhs: inner_lhs,
                         rhs: inner_rhs,
+                        ..
                     } => {
-                        assert!(matches!(inner_lhs.as_ref(), Expr::IntLit(2)));
-                        assert!(matches!(inner_rhs.as_ref(), Expr::IntLit(3)));
+                        assert!(matches!(inner_lhs.as_ref(), Expr::IntLit(2, ..)));
+                        assert!(matches!(inner_rhs.as_ref(), Expr::IntLit(3, ..)));
                     }
                     _ => panic!("expected Mul as rhs of Add"),
                 }
@@ -3214,12 +3325,14 @@ mod tests {
                 op: BinOp::Or,
                 lhs,
                 rhs,
+                ..
             }) => {
                 match lhs.as_ref() {
                     Expr::Binary {
                         op: BinOp::And,
                         lhs: inner_lhs,
                         rhs: inner_rhs,
+                        ..
                     } => {
                         assert!(matches!(
                             inner_lhs.as_ref(),
@@ -3247,19 +3360,21 @@ mod tests {
                 op: BinOp::Mul,
                 lhs,
                 rhs,
+                ..
             }) => {
                 match lhs.as_ref() {
                     Expr::Binary {
                         op: BinOp::Add,
                         lhs: inner_lhs,
                         rhs: inner_rhs,
+                        ..
                     } => {
-                        assert!(matches!(inner_lhs.as_ref(), Expr::IntLit(1)));
-                        assert!(matches!(inner_rhs.as_ref(), Expr::IntLit(2)));
+                        assert!(matches!(inner_lhs.as_ref(), Expr::IntLit(1, ..)));
+                        assert!(matches!(inner_rhs.as_ref(), Expr::IntLit(2, ..)));
                     }
                     _ => panic!("expected Add as lhs of Mul"),
                 }
-                assert!(matches!(rhs.as_ref(), Expr::IntLit(3)));
+                assert!(matches!(rhs.as_ref(), Expr::IntLit(3, ..)));
             }
             _ => panic!("expected Binary(Mul, ..)"),
         }
@@ -3269,10 +3384,10 @@ mod tests {
     fn test_call_print() {
         let prog = parse("fn f() { print(42); }").unwrap();
         match &prog.funcs[0].body.stmts[0] {
-            Stmt::Expr(Expr::Call { callee, args }) => {
+            Stmt::Expr(Expr::Call { callee, args, .. }) => {
                 assert_eq!(callee, "print");
                 assert_eq!(args.len(), 1);
-                assert!(matches!(&args[0], Expr::IntLit(42)));
+                assert!(matches!(&args[0], Expr::IntLit(42, ..)));
             }
             _ => panic!("expected Call(print, [42])"),
         }
@@ -3282,10 +3397,10 @@ mod tests {
     fn test_call_println() {
         let prog = parse("fn f() { println(42); }").unwrap();
         match &prog.funcs[0].body.stmts[0] {
-            Stmt::Expr(Expr::Call { callee, args }) => {
+            Stmt::Expr(Expr::Call { callee, args, .. }) => {
                 assert_eq!(callee, "println");
                 assert_eq!(args.len(), 1);
-                assert!(matches!(&args[0], Expr::IntLit(42)));
+                assert!(matches!(&args[0], Expr::IntLit(42, ..)));
             }
             _ => panic!("expected Call(println, [42])"),
         }
@@ -3295,12 +3410,12 @@ mod tests {
     fn test_multi_arg_call() {
         let prog = parse("fn f() { foo(1, 2, 3); }").unwrap();
         match &prog.funcs[0].body.stmts[0] {
-            Stmt::Expr(Expr::Call { callee, args }) => {
+            Stmt::Expr(Expr::Call { callee, args, .. }) => {
                 assert_eq!(callee, "foo");
                 assert_eq!(args.len(), 3);
-                assert!(matches!(&args[0], Expr::IntLit(1)));
-                assert!(matches!(&args[1], Expr::IntLit(2)));
-                assert!(matches!(&args[2], Expr::IntLit(3)));
+                assert!(matches!(&args[0], Expr::IntLit(1, ..)));
+                assert!(matches!(&args[1], Expr::IntLit(2, ..)));
+                assert!(matches!(&args[2], Expr::IntLit(3, ..)));
             }
             _ => panic!("expected multi-arg Call"),
         }
@@ -3310,7 +3425,7 @@ mod tests {
     fn test_empty_call_args() {
         let prog = parse("fn f() { foo(); }").unwrap();
         match &prog.funcs[0].body.stmts[0] {
-            Stmt::Expr(Expr::Call { callee, args }) => {
+            Stmt::Expr(Expr::Call { callee, args, .. }) => {
                 assert_eq!(callee, "foo");
                 assert!(args.is_empty());
             }
@@ -3459,7 +3574,7 @@ mod tests {
     fn test_string_literal() {
         let prog = parse(r#"fn f() { "hello"; }"#).unwrap();
         match &prog.funcs[0].body.stmts[0] {
-            Stmt::Expr(Expr::StrLit(s)) => {
+            Stmt::Expr(Expr::StrLit(s, ..)) => {
                 assert_eq!(s, "hello");
             }
             _ => panic!("expected StrLit"),
@@ -3475,12 +3590,13 @@ mod tests {
                 module,
                 callee,
                 args,
+                ..
             }) => {
                 assert_eq!(module, "io");
                 assert_eq!(callee, "println");
                 assert_eq!(args.len(), 2);
-                assert!(matches!(&args[0], Expr::IntLit(42)));
-                assert!(matches!(&args[1], Expr::IntLit(43)));
+                assert!(matches!(&args[0], Expr::IntLit(42, ..)));
+                assert!(matches!(&args[1], Expr::IntLit(43, ..)));
             }
             _ => panic!("expected QualifiedCall"),
         }
@@ -3496,10 +3612,11 @@ mod tests {
                     enum_name,
                     variant,
                     payload,
+                    ..
                 } => {
                     assert_eq!(enum_name, "Option");
                     assert_eq!(variant, "Some");
-                    assert!(matches!(payload, Some(p) if matches!(**p, Expr::IntLit(42))));
+                    assert!(matches!(payload, Some(p) if matches!(**p, Expr::IntLit(42, ..))));
                 }
                 _ => panic!("expected EnumLit"),
             },
@@ -3517,6 +3634,7 @@ mod tests {
                     enum_name,
                     variant,
                     payload,
+                    ..
                 } => {
                     assert_eq!(enum_name, "Option");
                     assert_eq!(variant, "None");
@@ -3542,7 +3660,7 @@ mod tests {
         assert!(prog.funcs[0].body.tail_expr.is_some());
         assert!(matches!(
             prog.funcs[0].body.tail_expr.as_ref().unwrap().as_ref(),
-            Expr::IntLit(42)
+            Expr::IntLit(42, ..)
         ));
     }
 
@@ -3592,7 +3710,7 @@ mod tests {
             } => {
                 assert_eq!(pattern, &Pattern::Binding("x".to_string()));
                 assert_eq!(*ty, Type::I32);
-                assert!(matches!(init, Expr::IntLit(42)));
+                assert!(matches!(init, Expr::IntLit(42, ..)));
             }
             _ => panic!("expected Let with type annotation"),
         }
@@ -3610,7 +3728,7 @@ mod tests {
             } => {
                 assert_eq!(pattern, &Pattern::Binding("x".to_string()));
                 assert_eq!(*ty, Type::F64);
-                assert!(matches!(init, Expr::FloatLit(v) if (*v - 3.14).abs() < 1e-10));
+                assert!(matches!(init, Expr::FloatLit(v, ..) if (*v - 3.14).abs() < 1e-10));
             }
             _ => panic!("expected Let with f64 annotation"),
         }
@@ -3645,7 +3763,7 @@ mod tests {
     fn test_float_literal_expr() {
         let prog = parse("fn main() { 3.14; }").unwrap();
         match &prog.funcs[0].body.stmts[0] {
-            Stmt::Expr(Expr::FloatLit(v)) => {
+            Stmt::Expr(Expr::FloatLit(v, ..)) => {
                 assert!((*v - 3.14).abs() < 1e-10);
             }
             _ => panic!("expected FloatLit"),
@@ -3664,7 +3782,7 @@ mod tests {
             } => {
                 assert_eq!(pattern, &Pattern::Binding("x".to_string()));
                 assert_eq!(*ty, Type::Bool);
-                assert!(matches!(init, Expr::BoolLit(true)));
+                assert!(matches!(init, Expr::BoolLit(true, ..)));
             }
             _ => panic!("expected Let with bool type"),
         }
@@ -3675,11 +3793,11 @@ mod tests {
         let prog = parse("fn main() { let a = true; let b = false; }").unwrap();
         let stmts = &prog.funcs[0].body.stmts;
         match &stmts[0] {
-            Stmt::Let { init, .. } => assert!(matches!(init, Expr::BoolLit(true))),
+            Stmt::Let { init, .. } => assert!(matches!(init, Expr::BoolLit(true, ..))),
             _ => panic!("expected BoolLit(true)"),
         }
         match &stmts[1] {
-            Stmt::Let { init, .. } => assert!(matches!(init, Expr::BoolLit(false))),
+            Stmt::Let { init, .. } => assert!(matches!(init, Expr::BoolLit(false, ..))),
             _ => panic!("expected BoolLit(false)"),
         }
     }
@@ -3689,8 +3807,8 @@ mod tests {
         let prog = parse("fn main() { let x = 42 as i64; }").unwrap();
         match &prog.funcs[0].body.stmts[0] {
             Stmt::Let { init, .. } => match init {
-                Expr::Cast { expr, to_type } => {
-                    assert!(matches!(expr.as_ref(), Expr::IntLit(42)));
+                Expr::Cast { expr, to_type, .. } => {
+                    assert!(matches!(expr.as_ref(), Expr::IntLit(42, ..)));
                     assert_eq!(*to_type, Type::I64);
                 }
                 _ => panic!("expected Cast"),
@@ -3707,15 +3825,17 @@ mod tests {
                 Expr::Cast {
                     expr,
                     to_type: outer_ty,
+                    ..
                 } => {
                     assert_eq!(*outer_ty, Type::U8);
                     match expr.as_ref() {
                         Expr::Cast {
                             expr: inner_expr,
                             to_type: inner_ty,
+                            ..
                         } => {
                             assert_eq!(*inner_ty, Type::I64);
-                            assert!(matches!(inner_expr.as_ref(), Expr::IntLit(42)));
+                            assert!(matches!(inner_expr.as_ref(), Expr::IntLit(42, ..)));
                         }
                         _ => panic!("expected inner Cast"),
                     }
@@ -3735,14 +3855,16 @@ mod tests {
                 op: BinOp::Add,
                 lhs,
                 rhs,
+                ..
             }) => {
-                assert!(matches!(lhs.as_ref(), Expr::IntLit(1)));
+                assert!(matches!(lhs.as_ref(), Expr::IntLit(1, ..)));
                 match rhs.as_ref() {
                     Expr::Cast {
                         expr,
                         to_type: Type::I32,
+                        ..
                     } => {
-                        assert!(matches!(expr.as_ref(), Expr::IntLit(2)));
+                        assert!(matches!(expr.as_ref(), Expr::IntLit(2, ..)));
                     }
                     _ => panic!("expected Cast(rhs, I32)"),
                 }
@@ -3760,14 +3882,16 @@ mod tests {
                 op: BinOp::Mul,
                 lhs,
                 rhs,
+                ..
             }) => {
-                assert!(matches!(lhs.as_ref(), Expr::IntLit(3)));
+                assert!(matches!(lhs.as_ref(), Expr::IntLit(3, ..)));
                 match rhs.as_ref() {
                     Expr::Cast {
                         expr,
                         to_type: Type::I64,
+                        ..
                     } => {
-                        assert!(matches!(expr.as_ref(), Expr::IntLit(4)));
+                        assert!(matches!(expr.as_ref(), Expr::IntLit(4, ..)));
                     }
                     _ => panic!("expected Cast(rhs, I64)"),
                 }
@@ -3784,6 +3908,7 @@ mod tests {
             Stmt::Expr(Expr::Cast {
                 expr,
                 to_type: Type::F64,
+                ..
             }) => match expr.as_ref() {
                 Expr::Binary { op: BinOp::Add, .. } => {}
                 _ => panic!("expected Binary(Add, ..) inside Cast"),
@@ -3811,8 +3936,8 @@ mod tests {
         let prog = parse("fn main() { let x = 42i32; }").unwrap();
         match &prog.funcs[0].body.stmts[0] {
             Stmt::Let { init, .. } => match init {
-                Expr::Cast { expr, to_type } => {
-                    assert!(matches!(expr.as_ref(), Expr::IntLit(42)));
+                Expr::Cast { expr, to_type, .. } => {
+                    assert!(matches!(expr.as_ref(), Expr::IntLit(42, ..)));
                     assert_eq!(*to_type, Type::I32);
                 }
                 _ => panic!("expected Cast"),
@@ -3826,8 +3951,8 @@ mod tests {
         let prog = parse("fn main() { let x = 255u8; }").unwrap();
         match &prog.funcs[0].body.stmts[0] {
             Stmt::Let { init, .. } => match init {
-                Expr::Cast { expr, to_type } => {
-                    assert!(matches!(expr.as_ref(), Expr::IntLit(255)));
+                Expr::Cast { expr, to_type, .. } => {
+                    assert!(matches!(expr.as_ref(), Expr::IntLit(255, ..)));
                     assert_eq!(*to_type, Type::U8);
                 }
                 _ => panic!("expected Cast"),
@@ -3841,9 +3966,9 @@ mod tests {
         let prog = parse("fn main() { let x = 3.14f64; }").unwrap();
         match &prog.funcs[0].body.stmts[0] {
             Stmt::Let { init, .. } => match init {
-                Expr::Cast { expr, to_type } => {
+                Expr::Cast { expr, to_type, .. } => {
                     assert!(
-                        matches!(expr.as_ref(), Expr::FloatLit(v) if (*v - 3.14).abs() < 1e-10)
+                        matches!(expr.as_ref(), Expr::FloatLit(v, ..) if (*v - 3.14).abs() < 1e-10)
                     );
                     assert_eq!(*to_type, Type::F64);
                 }
@@ -3862,19 +3987,22 @@ mod tests {
                     op: BinOp::Add,
                     lhs,
                     rhs,
+                    ..
                 } => {
                     match lhs.as_ref() {
                         Expr::Cast {
                             expr,
                             to_type: Type::I64,
-                        } => assert!(matches!(expr.as_ref(), Expr::IntLit(10))),
+                            ..
+                        } => assert!(matches!(expr.as_ref(), Expr::IntLit(10, ..))),
                         _ => panic!("expected Cast lhs"),
                     }
                     match rhs.as_ref() {
                         Expr::Cast {
                             expr,
                             to_type: Type::I32,
-                        } => assert!(matches!(expr.as_ref(), Expr::IntLit(20))),
+                            ..
+                        } => assert!(matches!(expr.as_ref(), Expr::IntLit(20, ..))),
                         _ => panic!("expected Cast rhs"),
                     }
                 }
@@ -3888,10 +4016,12 @@ mod tests {
     fn test_method_call_len() {
         let prog = parse("fn f() { \"hello\".len(); }").unwrap();
         match &prog.funcs[0].body.stmts[0] {
-            Stmt::Expr(Expr::MethodCall { expr, method, args }) => {
+            Stmt::Expr(Expr::MethodCall {
+                expr, method, args, ..
+            }) => {
                 assert_eq!(method, "len");
                 assert!(args.is_empty());
-                assert!(matches!(expr.as_ref(), Expr::StrLit(s) if s == "hello"));
+                assert!(matches!(expr.as_ref(), Expr::StrLit(s, ..) if s == "hello"));
             }
             _ => panic!("expected MethodCall(StrLit(hello), len, [])"),
         }
@@ -3901,10 +4031,12 @@ mod tests {
     fn test_method_call_on_ident() {
         let prog = parse("fn f() { let s = \"hello\"; s.len(); }").unwrap();
         match &prog.funcs[0].body.stmts[1] {
-            Stmt::Expr(Expr::MethodCall { expr, method, args }) => {
+            Stmt::Expr(Expr::MethodCall {
+                expr, method, args, ..
+            }) => {
                 assert_eq!(method, "len");
                 assert!(args.is_empty());
-                assert!(matches!(expr.as_ref(), Expr::Ident(name) if name == "s"));
+                assert!(matches!(expr.as_ref(), Expr::Ident(name, ..) if name == "s"));
             }
             _ => panic!("expected MethodCall"),
         }
@@ -3959,6 +4091,7 @@ mod tests {
                 Expr::StructLit {
                     struct_name,
                     fields,
+                    ..
                 } => {
                     assert_eq!(struct_name, "Empty");
                     assert!(fields.is_empty());
@@ -3981,13 +4114,14 @@ mod tests {
                 Expr::StructLit {
                     struct_name,
                     fields,
+                    ..
                 } => {
                     assert_eq!(struct_name, "Point");
                     assert_eq!(fields.len(), 2);
                     assert_eq!(fields[0].0, "x");
-                    assert!(matches!(fields[0].1, Expr::IntLit(10)));
+                    assert!(matches!(fields[0].1, Expr::IntLit(10, ..)));
                     assert_eq!(fields[1].0, "y");
-                    assert!(matches!(fields[1].1, Expr::IntLit(20)));
+                    assert!(matches!(fields[1].1, Expr::IntLit(20, ..)));
                 }
                 _ => panic!("expected StructLit"),
             },
@@ -4006,9 +4140,9 @@ mod tests {
                 Expr::StructLit { fields, .. } => {
                     assert_eq!(fields.len(), 2);
                     assert_eq!(fields[0].0, "x");
-                    assert!(matches!(&fields[0].1, Expr::Ident(name) if name == "x"));
+                    assert!(matches!(&fields[0].1, Expr::Ident(name, ..) if name == "x"));
                     assert_eq!(fields[1].0, "y");
-                    assert!(matches!(fields[1].1, Expr::IntLit(20)));
+                    assert!(matches!(fields[1].1, Expr::IntLit(20, ..)));
                 }
                 _ => panic!("expected StructLit"),
             },
@@ -4145,7 +4279,7 @@ mod tests {
             Expr::If {
                 cond, then_block, ..
             } => {
-                assert!(matches!(cond.as_ref(), Expr::IntLit(1)));
+                assert!(matches!(cond.as_ref(), Expr::IntLit(1, ..)));
                 assert!(then_block.tail_expr.is_some());
                 assert!(then_block.stmts.is_empty());
             }
@@ -4165,7 +4299,7 @@ mod tests {
                 else_block,
                 ..
             } => {
-                assert!(matches!(cond.as_ref(), Expr::IntLit(1)));
+                assert!(matches!(cond.as_ref(), Expr::IntLit(1, ..)));
                 assert!(then_block.tail_expr.is_some());
                 assert!(else_ifs.is_empty());
                 assert!(else_block.is_some());
@@ -4188,7 +4322,7 @@ mod tests {
                 else_block,
                 ..
             } => {
-                assert!(matches!(cond.as_ref(), Expr::IntLit(1)));
+                assert!(matches!(cond.as_ref(), Expr::IntLit(1, ..)));
                 assert_eq!(else_ifs.len(), 1);
                 assert!(else_block.is_some());
             }
@@ -4201,7 +4335,7 @@ mod tests {
         let prog = parse("fn main() { loop { 1 } }").unwrap();
         assert!(prog.funcs[0].body.tail_expr.is_some());
         match prog.funcs[0].body.tail_expr.as_ref().unwrap().as_ref() {
-            Expr::Loop { body } => {
+            Expr::Loop { body, .. } => {
                 assert!(body.tail_expr.is_some());
             }
             _ => panic!("expected Loop expr"),
@@ -4213,8 +4347,8 @@ mod tests {
         let prog = parse("fn main() { while 1 { 2 } }").unwrap();
         assert!(prog.funcs[0].body.tail_expr.is_some());
         match prog.funcs[0].body.tail_expr.as_ref().unwrap().as_ref() {
-            Expr::While { cond, body } => {
-                assert!(matches!(cond.as_ref(), Expr::IntLit(1)));
+            Expr::While { cond, body, .. } => {
+                assert!(matches!(cond.as_ref(), Expr::IntLit(1, ..)));
                 assert!(body.tail_expr.is_some());
             }
             _ => panic!("expected While expr"),
@@ -4230,9 +4364,10 @@ mod tests {
                 pattern,
                 container,
                 body,
+                ..
             } => {
                 assert!(matches!(pattern, Pattern::Binding(_)));
-                assert!(matches!(container.as_ref(), Expr::Ident(_)));
+                assert!(matches!(container.as_ref(), Expr::Ident(..)));
                 assert!(body.tail_expr.is_some());
             }
             _ => panic!("expected For expr"),
@@ -4245,7 +4380,10 @@ mod tests {
         match &prog.funcs[0].body.stmts[0] {
             Stmt::Return { value, .. } => {
                 assert!(value.is_some());
-                assert!(matches!(value.as_ref().unwrap().as_ref(), Expr::IntLit(42)));
+                assert!(matches!(
+                    value.as_ref().unwrap().as_ref(),
+                    Expr::IntLit(42, ..)
+                ));
             }
             _ => panic!("expected Return stmt"),
         }
@@ -4266,7 +4404,7 @@ mod tests {
     fn test_continue_stmt() {
         let prog = parse("fn main() { loop { continue; } }").unwrap();
         match &prog.funcs[0].body.tail_expr.as_ref().unwrap().as_ref() {
-            Expr::Loop { body } => match &body.stmts[0] {
+            Expr::Loop { body, .. } => match &body.stmts[0] {
                 Stmt::Continue { .. } => {}
                 _ => panic!("expected Continue stmt"),
             },
@@ -4278,7 +4416,7 @@ mod tests {
     fn test_break_stmt() {
         let prog = parse("fn main() { loop { break; } }").unwrap();
         match &prog.funcs[0].body.tail_expr.as_ref().unwrap().as_ref() {
-            Expr::Loop { body } => match &body.stmts[0] {
+            Expr::Loop { body, .. } => match &body.stmts[0] {
                 Stmt::Break { .. } => {}
                 _ => panic!("expected Break stmt"),
             },
@@ -4314,8 +4452,10 @@ mod tests {
     fn test_nested_loop_break() {
         let prog = parse("fn main() { loop { loop { break; } } }").unwrap();
         match &prog.funcs[0].body.tail_expr.as_ref().unwrap().as_ref() {
-            Expr::Loop { body } => match &body.tail_expr.as_ref().unwrap().as_ref() {
-                Expr::Loop { body: inner_body } => match &inner_body.stmts[0] {
+            Expr::Loop { body, .. } => match &body.tail_expr.as_ref().unwrap().as_ref() {
+                Expr::Loop {
+                    body: inner_body, ..
+                } => match &inner_body.stmts[0] {
                     Stmt::Break { .. } => {}
                     _ => panic!("expected Break stmt"),
                 },
@@ -4331,7 +4471,7 @@ mod tests {
         assert!(prog.funcs[0].body.tail_expr.is_some());
         assert!(matches!(
             prog.funcs[0].body.tail_expr.as_ref().unwrap().as_ref(),
-            Expr::IntLit(42)
+            Expr::IntLit(42, ..)
         ));
     }
 
@@ -4368,8 +4508,9 @@ mod tests {
                 op: BinOp::Gt,
                 lhs,
                 rhs,
+                ..
             }) => {
-                assert!(matches!(rhs.as_ref(), Expr::IntLit(4)));
+                assert!(matches!(rhs.as_ref(), Expr::IntLit(4, ..)));
                 assert!(matches!(lhs.as_ref(), Expr::Binary { op: BinOp::Eq, .. }));
             }
             _ => panic!("expected Gt as top-level"),
@@ -4384,7 +4525,7 @@ mod tests {
             Expr::If { then_block, .. } => {
                 assert!(then_block.tail_expr.is_some());
                 match then_block.tail_expr.as_ref().unwrap().as_ref() {
-                    Expr::Loop { body } => {
+                    Expr::Loop { body, .. } => {
                         assert!(body.tail_expr.is_some());
                         match body.tail_expr.as_ref().unwrap().as_ref() {
                             Expr::If { .. } => {}
@@ -4522,11 +4663,11 @@ mod tests {
         let prog = parse("fn main() { let a = [1, 2, 3]; }").unwrap();
         match &prog.funcs[0].body.stmts[0] {
             Stmt::Let { init, .. } => match init {
-                Expr::Array(elems) => {
+                Expr::Array(elems, ..) => {
                     assert_eq!(elems.len(), 3);
-                    assert!(matches!(elems[0], Expr::IntLit(1)));
-                    assert!(matches!(elems[1], Expr::IntLit(2)));
-                    assert!(matches!(elems[2], Expr::IntLit(3)));
+                    assert!(matches!(elems[0], Expr::IntLit(1, ..)));
+                    assert!(matches!(elems[1], Expr::IntLit(2, ..)));
+                    assert!(matches!(elems[2], Expr::IntLit(3, ..)));
                 }
                 _ => panic!("expected Array expression"),
             },
@@ -4539,9 +4680,9 @@ mod tests {
         let prog = parse("fn main() { let a = [0; 4]; }").unwrap();
         match &prog.funcs[0].body.stmts[0] {
             Stmt::Let { init, .. } => match init {
-                Expr::Repeat(expr, count) => {
+                Expr::Repeat(expr, count, ..) => {
                     assert_eq!(*count, 4);
-                    assert!(matches!(expr.as_ref(), Expr::IntLit(0)));
+                    assert!(matches!(expr.as_ref(), Expr::IntLit(0, ..)));
                 }
                 _ => panic!("expected Repeat expression"),
             },
@@ -4554,9 +4695,9 @@ mod tests {
         let prog = parse("fn main() { let a = [1, 2]; a[0]; }").unwrap();
         match &prog.funcs[0].body.stmts[1] {
             Stmt::Expr(expr) => match expr {
-                Expr::Index { array, index } => {
-                    assert!(matches!(array.as_ref(), Expr::Ident(_)));
-                    assert!(matches!(index.as_ref(), Expr::IntLit(0)));
+                Expr::Index { array, index, .. } => {
+                    assert!(matches!(array.as_ref(), Expr::Ident(..)));
+                    assert!(matches!(index.as_ref(), Expr::IntLit(0, ..)));
                 }
                 _ => panic!("expected Index expression"),
             },
@@ -4569,9 +4710,9 @@ mod tests {
         let prog = parse("fn main() { let mut a = [1, 2]; a[0] = 99; }").unwrap();
         match &prog.funcs[0].body.stmts[1] {
             Stmt::Expr(expr) => match expr {
-                Expr::Assign { target, value } => {
+                Expr::Assign { target, value, .. } => {
                     assert!(matches!(target.as_ref(), Expr::Index { .. }));
-                    assert!(matches!(value.as_ref(), Expr::IntLit(99)));
+                    assert!(matches!(value.as_ref(), Expr::IntLit(99, ..)));
                 }
                 _ => panic!("expected Assign expression"),
             },
@@ -4584,8 +4725,8 @@ mod tests {
         let prog = parse("fn main() { let a = [[1, 2], [3, 4]]; a[0][1]; }").unwrap();
         match &prog.funcs[0].body.stmts[1] {
             Stmt::Expr(expr) => match expr {
-                Expr::Index { array, index } => {
-                    assert!(matches!(index.as_ref(), Expr::IntLit(1)));
+                Expr::Index { array, index, .. } => {
+                    assert!(matches!(index.as_ref(), Expr::IntLit(1, ..)));
                     assert!(matches!(array.as_ref(), Expr::Index { .. }));
                 }
                 _ => panic!("expected nested Index expression"),

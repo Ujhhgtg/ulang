@@ -568,7 +568,11 @@ struct GenericParamDecl {
     span: Span,
 }
 
-fn find_matching_brace_or_semicolon(tokens: &[(Token, Span)], start_idx: usize, allow_semicolon: bool) -> usize {
+fn find_matching_brace_or_semicolon(
+    tokens: &[(Token, Span)],
+    start_idx: usize,
+    allow_semicolon: bool,
+) -> usize {
     let mut i = start_idx;
     let mut brace_depth = 0;
     let mut has_braces = false;
@@ -2139,7 +2143,10 @@ mod tests {
         };
 
         let response_enum = handle_definition(&documents, &cache, params_enum);
-        assert!(response_enum.is_some(), "Should find definition for generic T in enum");
+        assert!(
+            response_enum.is_some(),
+            "Should find definition for generic T in enum"
+        );
         if let Some(GotoDefinitionResponse::Scalar(location)) = response_enum {
             assert_eq!(location.range.start.line, 1); // pub enum Option<T>
             assert_eq!(location.range.start.character, 28); // generic T is at character index 28 (12 spaces + `pub enum Option<` is 28)
@@ -2162,7 +2169,10 @@ mod tests {
         };
 
         let response_impl = handle_definition(&documents, &cache, params_impl);
-        assert!(response_impl.is_some(), "Should find definition for generic T in impl block");
+        assert!(
+            response_impl.is_some(),
+            "Should find definition for generic T in impl block"
+        );
         if let Some(GotoDefinitionResponse::Scalar(location)) = response_impl {
             assert_eq!(location.range.start.line, 5); // impl<T> Option<T>
             assert_eq!(location.range.start.character, 17); // generic T is at character index 17 (12 spaces + `impl<` is 17)
@@ -2209,7 +2219,12 @@ mod tests {
         }
         let scopes = collect_generic_scopes(&tokens);
         let response = handle_definition(&documents, &cache, params);
-        assert!(response.is_some(), "Should find definition for const generic L\nTokens: {:#?}\nScopes: {:#?}", tokens, scopes);
+        assert!(
+            response.is_some(),
+            "Should find definition for const generic L\nTokens: {:#?}\nScopes: {:#?}",
+            tokens,
+            scopes
+        );
         if let Some(GotoDefinitionResponse::Scalar(location)) = response {
             assert_eq!(location.range.start.line, 1); // impl<T, const L: usize>
             assert_eq!(location.range.start.character, 26); // L is at character index 26 (12 spaces + `impl<T, const ` is 26)

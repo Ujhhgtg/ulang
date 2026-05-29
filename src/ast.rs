@@ -51,6 +51,7 @@ pub struct Function {
     pub is_method: bool,
     pub is_pub: bool,
     pub attribs: Vec<Attribute>,
+    pub span: Span,
 }
 
 #[allow(dead_code)]
@@ -150,96 +151,151 @@ pub struct GenericParam {
 
 #[derive(Debug, Clone)]
 pub enum Expr {
-    BoolLit(bool),
-    IntLit(i64),
-    FloatLit(f64),
-    StrLit(String),
-    Ident(String),
+    BoolLit(bool, Span),
+    IntLit(i64, Span),
+    FloatLit(f64, Span),
+    StrLit(String, Span),
+    Ident(String, Span),
     Call {
         callee: String,
         args: Vec<Expr>,
+        span: Span,
     },
     QualifiedCall {
         module: String,
         callee: String,
         args: Vec<Expr>,
+        span: Span,
     },
     Binary {
         op: BinOp,
         lhs: Box<Expr>,
         rhs: Box<Expr>,
+        span: Span,
     },
     Assign {
         target: Box<Expr>,
         value: Box<Expr>,
+        span: Span,
     },
     Ref {
         expr: Box<Expr>,
         is_mut: bool,
+        span: Span,
     },
-    UnaryNot(Box<Expr>),
-    UnaryMinus(Box<Expr>),
-    Deref(Box<Expr>),
+    UnaryNot(Box<Expr>, Span),
+    UnaryMinus(Box<Expr>, Span),
+    Deref(Box<Expr>, Span),
     Cast {
         expr: Box<Expr>,
         to_type: Type,
+        span: Span,
     },
-    Tuple(Vec<Expr>),
-    Unit,
+    Tuple(Vec<Expr>, Span),
+    Unit(Span),
     Member {
         expr: Box<Expr>,
         index: usize,
         field: Option<String>,
+        span: Span,
     },
     MethodCall {
         expr: Box<Expr>,
         method: String,
         args: Vec<Expr>,
+        span: Span,
     },
     StructLit {
         struct_name: String,
         fields: Vec<(String, Expr)>,
+        span: Span,
     },
     EnumLit {
         enum_name: String,
         variant: String,
         payload: Option<Box<Expr>>,
+        span: Span,
     },
     If {
         cond: Box<Expr>,
         then_block: Block,
         else_ifs: Vec<(Expr, Block)>,
         else_block: Option<Block>,
+        span: Span,
     },
     Loop {
         body: Block,
+        span: Span,
     },
     While {
         cond: Box<Expr>,
         body: Block,
+        span: Span,
     },
     For {
         pattern: Pattern,
         container: Box<Expr>,
         body: Block,
+        span: Span,
     },
-    Array(Vec<Expr>),
-    Repeat(Box<Expr>, usize),
+    Array(Vec<Expr>, Span),
+    Repeat(Box<Expr>, usize, Span),
     Index {
         array: Box<Expr>,
         index: Box<Expr>,
+        span: Span,
     },
     IfLet {
         pattern: Pattern,
         scrutinee: Box<Expr>,
         then_block: Block,
         else_block: Option<Block>,
+        span: Span,
     },
     Match {
         scrutinee: Box<Expr>,
         arms: Vec<MatchArm>,
+        span: Span,
     },
-    Block(Block),
+    Block(Block, Span),
+}
+
+impl Expr {
+    /// Returns the span of this expression.
+    pub fn span(&self) -> Span {
+        match self {
+            Expr::BoolLit(_, s)
+            | Expr::IntLit(_, s)
+            | Expr::FloatLit(_, s)
+            | Expr::StrLit(_, s)
+            | Expr::Ident(_, s)
+            | Expr::UnaryNot(_, s)
+            | Expr::UnaryMinus(_, s)
+            | Expr::Deref(_, s)
+            | Expr::Tuple(_, s)
+            | Expr::Unit(s)
+            | Expr::Array(_, s)
+            | Expr::Repeat(_, _, s)
+            | Expr::Block(_, s) => *s,
+            Expr::Call { span: s, .. }
+            | Expr::QualifiedCall { span: s, .. }
+            | Expr::Binary { span: s, .. }
+            | Expr::Assign { span: s, .. }
+            | Expr::Ref { span: s, .. }
+            | Expr::Cast { span: s, .. }
+            | Expr::Member { span: s, .. }
+            | Expr::MethodCall { span: s, .. }
+            | Expr::StructLit { span: s, .. }
+            | Expr::EnumLit { span: s, .. }
+            | Expr::If { span: s, .. }
+            | Expr::Loop { span: s, .. }
+            | Expr::While { span: s, .. }
+            | Expr::For { span: s, .. }
+            | Expr::Index { span: s, .. }
+            | Expr::IfLet { span: s, .. }
+            | Expr::Match { span: s, .. } => *s,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

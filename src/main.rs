@@ -473,7 +473,13 @@ fn do_build(codegen: &mut codegen::CodeGen<'_>, output: Option<String>, cc: Cc) 
                 &TargetTriple::create("x86_64-pc-linux-gnu"),
                 Path::new(&obj_path),
             ) {
-                eprintln!("codegen error: {}", msg);
+                error::emit_error_opt(
+                    &codegen.source,
+                    &codegen.path,
+                    msg.span,
+                    "codegen error",
+                    &msg.msg,
+                );
                 process::exit(1);
             }
 
@@ -491,7 +497,13 @@ fn do_build(codegen: &mut codegen::CodeGen<'_>, output: Option<String>, cc: Cc) 
                 &TargetTriple::create("aarch64-linux-gnu"),
                 &aarch64_obj,
             ) {
-                eprintln!("codegen error: {}", msg);
+                error::emit_error_opt(
+                    &codegen.source,
+                    &codegen.path,
+                    msg.span,
+                    "codegen error",
+                    &msg.msg,
+                );
                 let _ = std::fs::remove_dir_all(&aarch64_dir);
                 let _ = fs::remove_file(&obj_path);
                 process::exit(1);
@@ -503,7 +515,13 @@ fn do_build(codegen: &mut codegen::CodeGen<'_>, output: Option<String>, cc: Cc) 
                 Path::new(&obj_path),
                 Path::new(&exe_path),
             ) {
-                eprintln!("link error: {}", msg);
+                error::emit_error_opt(
+                    &codegen.source,
+                    &codegen.path,
+                    msg.span,
+                    "link error",
+                    &msg.msg,
+                );
                 let _ = std::fs::remove_dir_all(&aarch64_dir);
                 let _ = fs::remove_file(&obj_path);
                 process::exit(1);
@@ -514,7 +532,13 @@ fn do_build(codegen: &mut codegen::CodeGen<'_>, output: Option<String>, cc: Cc) 
         }
         _ => {
             if let Err(msg) = codegen.compile_to_object(Path::new(&obj_path)) {
-                eprintln!("codegen error: {}", msg);
+                error::emit_error_opt(
+                    &codegen.source,
+                    &codegen.path,
+                    msg.span,
+                    "codegen error",
+                    &msg.msg,
+                );
                 process::exit(1);
             }
 
@@ -528,7 +552,13 @@ fn do_build(codegen: &mut codegen::CodeGen<'_>, output: Option<String>, cc: Cc) 
                 Path::new(&obj_path),
                 Path::new(&exe_path),
             ) {
-                eprintln!("link error: {}", msg);
+                error::emit_error_opt(
+                    &codegen.source,
+                    &codegen.path,
+                    msg.span,
+                    "link error",
+                    &msg.msg,
+                );
                 let _ = fs::remove_file(&obj_path);
                 process::exit(1);
             }
@@ -1747,27 +1777,33 @@ fn main() {
     match mode {
         Mode::Run { opt } => {
             let opt_level: inkwell::OptimizationLevel = opt.into();
-            let mut codegen = match codegen::CodeGen::new_jit(&context, opt_level) {
+            let mut codegen = match codegen::CodeGen::new_jit(
+                &context,
+                opt_level,
+                source.clone(),
+                path.clone(),
+            ) {
                 Ok(cg) => cg,
-                Err(msg) => {
-                    eprintln!("codegen error: {}", msg);
+                Err(e) => {
+                    error::emit_error_opt(&source, &path, e.span, "codegen error", &e.msg);
                     process::exit(1);
                 }
             };
             codegen.overloads = overloads;
-            if let Err(msg) = codegen.jit_run(&program) {
-                eprintln!("runtime error: {}", msg);
+            if let Err(e) = codegen.jit_run(&program) {
+                error::emit_error_opt(&source, &path, e.span, "runtime error", &e.msg);
                 process::exit(1);
             }
             println!("program executed successfully");
         }
         Mode::Build { output, opt, cc } => {
             let opt_level: inkwell::OptimizationLevel = opt.into();
-            let mut codegen = codegen::CodeGen::new_native(&context, opt_level);
+            let mut codegen =
+                codegen::CodeGen::new_native(&context, opt_level, source.clone(), path.clone());
             codegen.overloads = overloads;
 
-            if let Err(msg) = codegen.compile_module(&program) {
-                eprintln!("codegen error: {}", msg);
+            if let Err(e) = codegen.compile_module(&program) {
+                error::emit_error_opt(&source, &path, e.span, "codegen error", &e.msg);
                 process::exit(1);
             }
 
@@ -1776,11 +1812,12 @@ fn main() {
         }
         Mode::BuildRun { output, opt, cc } => {
             let opt_level: inkwell::OptimizationLevel = opt.into();
-            let mut codegen = codegen::CodeGen::new_native(&context, opt_level);
+            let mut codegen =
+                codegen::CodeGen::new_native(&context, opt_level, source.clone(), path.clone());
             codegen.overloads = overloads;
 
-            if let Err(msg) = codegen.compile_module(&program) {
-                eprintln!("codegen error: {}", msg);
+            if let Err(e) = codegen.compile_module(&program) {
+                error::emit_error_opt(&source, &path, e.span, "codegen error", &e.msg);
                 process::exit(1);
             }
 
@@ -1805,11 +1842,12 @@ fn main() {
         }
         Mode::EmitIr { opt } => {
             let opt_level: inkwell::OptimizationLevel = opt.into();
-            let mut codegen = codegen::CodeGen::new_native(&context, opt_level);
+            let mut codegen =
+                codegen::CodeGen::new_native(&context, opt_level, source.clone(), path.clone());
             codegen.overloads = overloads;
 
-            if let Err(msg) = codegen.compile_module(&program) {
-                eprintln!("codegen error: {}", msg);
+            if let Err(e) = codegen.compile_module(&program) {
+                error::emit_error_opt(&source, &path, e.span, "codegen error", &e.msg);
                 process::exit(1);
             }
 
@@ -1956,7 +1994,7 @@ fn qualify_expr(
     top_level_modules: &HashSet<String>,
 ) {
     match expr {
-        crate::ast::Expr::Call { callee, args } => {
+        crate::ast::Expr::Call { callee, args, .. } => {
             if !prefix.is_empty() && local_funcs.contains(callee) {
                 *callee = format!("{}::{}", prefix, callee);
             }
@@ -1976,6 +2014,7 @@ fn qualify_expr(
             module,
             callee: _,
             args,
+            ..
         } => {
             let segments: Vec<String> = module.split("::").map(|s| s.to_string()).collect();
             if !segments.is_empty() {
@@ -2009,6 +2048,7 @@ fn qualify_expr(
         crate::ast::Expr::StructLit {
             struct_name,
             fields,
+            ..
         } => {
             if !prefix.is_empty() && local_types.contains(struct_name) {
                 *struct_name = format!("{}::{}", prefix, struct_name);
@@ -2093,7 +2133,7 @@ fn qualify_expr(
                 top_level_modules,
             );
         }
-        crate::ast::Expr::Assign { target, value } => {
+        crate::ast::Expr::Assign { target, value, .. } => {
             qualify_expr(
                 target,
                 local_funcs,
@@ -2124,7 +2164,7 @@ fn qualify_expr(
                 top_level_modules,
             );
         }
-        crate::ast::Expr::UnaryNot(expr) => {
+        crate::ast::Expr::UnaryNot(expr, ..) => {
             qualify_expr(
                 expr,
                 local_funcs,
@@ -2135,7 +2175,7 @@ fn qualify_expr(
                 top_level_modules,
             );
         }
-        crate::ast::Expr::UnaryMinus(expr) => {
+        crate::ast::Expr::UnaryMinus(expr, ..) => {
             qualify_expr(
                 expr,
                 local_funcs,
@@ -2146,7 +2186,7 @@ fn qualify_expr(
                 top_level_modules,
             );
         }
-        crate::ast::Expr::Deref(expr) => {
+        crate::ast::Expr::Deref(expr, ..) => {
             qualify_expr(
                 expr,
                 local_funcs,
@@ -2157,7 +2197,7 @@ fn qualify_expr(
                 top_level_modules,
             );
         }
-        crate::ast::Expr::Cast { expr, to_type } => {
+        crate::ast::Expr::Cast { expr, to_type, .. } => {
             qualify_expr(
                 expr,
                 local_funcs,
@@ -2169,7 +2209,7 @@ fn qualify_expr(
             );
             qualify_type(to_type, local_types, prefix);
         }
-        crate::ast::Expr::Tuple(elems) => {
+        crate::ast::Expr::Tuple(elems, ..) => {
             for elem in elems {
                 qualify_expr(
                     elem,
@@ -2220,6 +2260,7 @@ fn qualify_expr(
             then_block,
             else_ifs,
             else_block,
+            ..
         } => {
             qualify_expr(
                 cond,
@@ -2271,7 +2312,7 @@ fn qualify_expr(
                 );
             }
         }
-        crate::ast::Expr::Loop { body } => {
+        crate::ast::Expr::Loop { body, .. } => {
             qualify_block(
                 body,
                 local_funcs,
@@ -2282,7 +2323,7 @@ fn qualify_expr(
                 top_level_modules,
             );
         }
-        crate::ast::Expr::While { cond, body } => {
+        crate::ast::Expr::While { cond, body, .. } => {
             qualify_expr(
                 cond,
                 local_funcs,
@@ -2302,7 +2343,7 @@ fn qualify_expr(
                 top_level_modules,
             );
         }
-        crate::ast::Expr::Array(elems) => {
+        crate::ast::Expr::Array(elems, ..) => {
             for elem in elems {
                 qualify_expr(
                     elem,
@@ -2315,7 +2356,7 @@ fn qualify_expr(
                 );
             }
         }
-        crate::ast::Expr::Repeat(expr, _) => {
+        crate::ast::Expr::Repeat(expr, .., _) => {
             qualify_expr(
                 expr,
                 local_funcs,
@@ -2326,7 +2367,7 @@ fn qualify_expr(
                 top_level_modules,
             );
         }
-        crate::ast::Expr::Index { array, index } => {
+        crate::ast::Expr::Index { array, index, .. } => {
             qualify_expr(
                 array,
                 local_funcs,
@@ -2351,6 +2392,7 @@ fn qualify_expr(
             scrutinee,
             then_block,
             else_block,
+            ..
         } => {
             qualify_pattern(
                 pattern,
@@ -2390,7 +2432,9 @@ fn qualify_expr(
                 );
             }
         }
-        crate::ast::Expr::Match { scrutinee, arms } => {
+        crate::ast::Expr::Match {
+            scrutinee, arms, ..
+        } => {
             qualify_expr(
                 scrutinee,
                 local_funcs,

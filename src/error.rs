@@ -18,3 +18,12 @@ pub fn emit_error(source: &str, path: &str, span: Span, title: &str, label: &str
     let renderer = Renderer::styled().decor_style(DecorStyle::Unicode);
     eprintln!("{}", renderer.render(&[report]));
 }
+
+/// Emit an error with an optional span. If span is Some, uses annotate_snippets for
+/// pretty source-level diagnostics. If span is None, falls back to a plain eprintln.
+pub fn emit_error_opt(source: &str, path: &str, span: Option<Span>, title: &str, label: &str) {
+    match span {
+        Some(span) => emit_error(source, path, span, title, label),
+        None => eprintln!("{}: {}", title, label),
+    }
+}

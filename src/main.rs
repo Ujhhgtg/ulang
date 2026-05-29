@@ -553,7 +553,7 @@ fn lex_and_parse(source: &str, path: &str) -> Program {
                 }
             }
             Err(msg) => {
-                let pos = lexer.pos();
+                let pos: usize = lexer.pos();
                 error::emit_error(source, path, Span::new(pos, pos), "lex error", &msg);
                 process::exit(1);
             }

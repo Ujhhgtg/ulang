@@ -1687,9 +1687,7 @@ fn collect_local_symbols(
     // 1. Functions (top-level and methods)
     let mut seen_funcs = std::collections::HashSet::new();
     for func in &prog.funcs {
-        if func.name.to_lowercase().starts_with(&prefix_lower)
-            && seen_funcs.insert(&func.name)
-        {
+        if func.name.to_lowercase().starts_with(&prefix_lower) && seen_funcs.insert(&func.name) {
             let params: Vec<String> = func
                 .params
                 .iter()
@@ -2284,7 +2282,10 @@ fn handle_completion(
 
     // Append `()` for function and method completions
     for item in &mut items {
-        if matches!(item.kind, Some(CompletionItemKind::FUNCTION) | Some(CompletionItemKind::METHOD)) {
+        if matches!(
+            item.kind,
+            Some(CompletionItemKind::FUNCTION) | Some(CompletionItemKind::METHOD)
+        ) {
             let name = item.label.clone();
             item.insert_text = Some(format!("{}($0)", name));
             item.insert_text_format = Some(InsertTextFormat::SNIPPET);

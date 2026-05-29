@@ -1632,3 +1632,44 @@ fn test_match_single_expression_custom_enum() {
         "#
     ));
 }
+
+#[test]
+fn test_use_direct_import_blocks_qualified_call() {
+    // use std::io::println should NOT make io::println callable
+    assert!(run_test_expect_error(
+        "use_direct_import_blocks_qualified",
+        "use std::io::println; fn main() { io::println(42); }"
+    ));
+}
+
+#[test]
+fn test_use_overloaded_direct_import_blocks_qualified_call() {
+    // use std::io::print should NOT make io::print callable (overloaded case)
+    assert!(run_test_expect_error(
+        "use_overloaded_direct_import_blocks_qualified",
+        "use std::io::print; fn main() { io::print(42); }"
+    ));
+}
+
+#[test]
+fn test_use_namespace_import_allows_qualified_call() {
+    // use std::io should make io::println callable
+    assert!(run_test(
+        "use_namespace_import_allows_qualified",
+        "use std::io; fn main() { io::println(42); }"
+    ));
+}
+
+#[test]
+fn test_use_overloaded_namespace_import_allows_qualified_call() {
+    // use std::io should make io::print (overloaded) callable
+    assert!(run_test(
+        "use_overloaded_namespace_import_allows_qualified",
+        r#"use std::io;
+fn main() {
+    io::print(42);
+    io::print("hello");
+}
+        "#
+    ));
+}

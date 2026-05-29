@@ -941,7 +941,7 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
                     // Import all structs from the module
                     for decl in &stdlib_prog.structs {
                         let new_name = if prefix.is_empty() {
-                            decl.name.clone()
+                            format!("{}::{}", imported_module_name, decl.name)
                         } else {
                             format!("{}{}", prefix, decl.name)
                         };
@@ -953,7 +953,7 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
                     // Import all enums from the module
                     for decl in &stdlib_prog.enums {
                         let new_name = if prefix.is_empty() {
-                            decl.name.clone()
+                            format!("{}::{}", imported_module_name, decl.name)
                         } else {
                             format!("{}{}", prefix, decl.name)
                         };
@@ -979,7 +979,7 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
                     // Import all traits from the module
                     for decl in &stdlib_prog.traits {
                         let new_name = if prefix.is_empty() {
-                            decl.name.clone()
+                            format!("{}::{}", imported_module_name, decl.name)
                         } else {
                             format!("{}{}", prefix, decl.name)
                         };
@@ -1193,9 +1193,6 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
                                 new_func.name = mangled_name.clone();
                                 new_func.is_pub = use_decl.is_pub;
                                 all_funcs.insert(mangled_name, new_func);
-
-                                let qualified_mangled = format!("{}::{}", module_name, func.name);
-                                all_funcs.entry(qualified_mangled).or_insert(func.clone());
                             }
                             if func.is_extern {
                                 let en = func.name.clone();
@@ -1267,9 +1264,6 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
                                 new_func.name = new_name.clone();
                                 new_func.is_pub = use_decl.is_pub;
                                 all_funcs.insert(new_name, new_func);
-
-                                let qualified_name = format!("{}::{}", module_name, target_name);
-                                all_funcs.entry(qualified_name).or_insert(func.clone());
 
                                 for other in &module_funcs {
                                     if other.name != *target_name

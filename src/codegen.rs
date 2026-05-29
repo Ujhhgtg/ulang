@@ -6216,7 +6216,6 @@ impl<'ctx> CodeGen<'ctx> {
                             .and_then(|n| self.module.get_function(n))
                     })
                     .or_else(|| self.resolve_function(&qualified_name, &arg_types))
-                    .or_else(|| self.resolve_function(callee, &arg_types))
                     .or_else(|| self.resolve_function(&mangled_name, &arg_types));
 
                 // If not resolved directly, try looking up in impl_methods

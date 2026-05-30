@@ -27,7 +27,7 @@ pub fn slice_from_raw_parts<T>(ptr: *const T, len: usize) -> &[T];
 #[ulang_intrinsic]
 pub fn slice_from_raw_parts_mut<T>(ptr: *mut T, len: usize) -> &mut [T];
 
-/// Converts a byte slice to a string slice without checking UTF-8 validity.
-/// This is a no-op at runtime since &[u8] and &str have the same layout.
+/// Reinterprets the bits of a value of type `T` as type `U`.
+/// Both types must have the same size. This is a no-op at runtime.
 #[ulang_intrinsic]
-pub fn str_from_utf8_unchecked(v: &[u8]) -> &str;
+pub fn transmute<T, U>(x: T) -> U;

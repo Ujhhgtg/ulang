@@ -4250,6 +4250,10 @@ impl<'ctx> CodeGen<'ctx> {
                 if callee == "size_of" && args.len() == 1 {
                     return Type::Usize;
                 }
+                // Handle transmute intrinsic
+                if callee == "transmute" && args.len() == 1 && type_args.len() == 2 {
+                    return type_args[1].clone();
+                }
                 let arg_types: Vec<Type> = args.iter().map(|a| self.expr_type(a)).collect();
                 // Try direct lookup, then overloaded, then generic
                 let name = if self.module.get_function(callee).is_some() {
@@ -4348,8 +4352,7 @@ impl<'ctx> CodeGen<'ctx> {
                         }
                     }
                     // Infer any remaining (unmapped) type parameters from arguments
-                    let arg_types: Vec<Type> =
-                        args.iter().map(|a| self.expr_type(a)).collect();
+                    let arg_types: Vec<Type> = args.iter().map(|a| self.expr_type(a)).collect();
                     for (param, arg_ty) in gen_func.params.iter().zip(&arg_types) {
                         for name in &param_names {
                             if !mappings.contains_key(name) {
@@ -6241,6 +6244,11 @@ impl<'ctx> CodeGen<'ctx> {
                         _ => 4,
                     };
                     return Ok(self.ptr_int_type.const_int(size, false).into());
+                }
+                // Handle transmute intrinsic
+                if callee == "transmute" && args.len() == 1 {
+                    let v = self.compile_expr(&args[0])?;
+                    return Ok(v);
                 }
                 // Handle builtin slice intrinsics
                 if let Some(result) = self.compile_slice_intrinsic(callee, args)? {
@@ -8716,19 +8724,6 @@ impl<'ctx> CodeGen<'ctx> {
                 }
                 None
             }
-            "str_from_utf8_unchecked" if args.len() == 1 => {
-                let arg_ty = self.expr_type(&args[0]);
-                if let Type::Ref { inner, is_mut: _ } = &arg_ty
-                    && let Type::Slice { inner: elem_ty } = inner.as_ref()
-                    && **elem_ty == Type::U8
-                {
-                    return Some(Type::Ref {
-                        inner: Box::new(Type::Str),
-                        is_mut: false,
-                    });
-                }
-                None
-            }
             _ => None,
         }
     }
@@ -8869,10 +8864,6 @@ impl<'ctx> CodeGen<'ctx> {
                     .build_insert_value(fat_ptr, len_int, 1, "fat_len")
                     .map_err(|e| CodegenError::new(format!("failed to build fat len: {}", e)))?;
                 Ok(Some(fat_ptr.into_struct_value().into()))
-            }
-            "str_from_utf8_unchecked" if args.len() == 1 => {
-                let v = self.compile_expr(&args[0])?;
-                Ok(Some(v))
             }
             _ => Ok(None),
         }

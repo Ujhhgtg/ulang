@@ -1,5 +1,5 @@
 use std::vec::Vec;
-use std::intrinsics::str_from_utf8_unchecked;
+use std::intrinsics::transmute;
 use std::alloc::malloc;
 use std::alloc::realloc;
 use std::alloc::free;
@@ -67,7 +67,7 @@ impl String {
 
     pub fn as_str(&self) -> &str {
         let v = self.vec;
-        str_from_utf8_unchecked(v.as_slice())
+        transmute::<&[u8], &str>(v.as_slice())
     }
 
     pub fn drop(&mut self) {

@@ -18,10 +18,10 @@ pub fn println(s: &str) {
     printf("%.*s\n".0, s.1 as i32, s.0);
 }
 
-pub fn print(s: String) {
-    printf("%.*s".0, s.len() as i32, s.as_ptr());
+pub fn print(s: &String) {
+    print((*s).as_str());
 }
 
-pub fn println(s: String) {
-    printf("%.*s\n".0, s.len() as i32, s.as_ptr());
+pub fn println(s: &String) {
+    println((*s).as_str());
 }

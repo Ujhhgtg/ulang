@@ -576,7 +576,7 @@ fn test_print_str() {
 fn test_print_string() {
     assert!(run_test(
         "print_string",
-        "use std::io::println;\nuse std::string::String;\nfn main() { let mut s = String::new(); s.push_str(\"hello from String\"); println(s); }\n"
+        "use std::io::println;\nuse std::string::String;\nfn main() { let mut s = String::new(); s.push_str(\"hello from String\"); println(&s); }\n"
     ));
 }
 
@@ -584,7 +584,7 @@ fn test_print_string() {
 fn test_print_string_utf8() {
     assert!(run_test(
         "print_string_utf8",
-        "use std::io::println;\nuse std::string::String;\nfn main() { let mut s = String::new(); s.push_str(\"héllo wörld 🌍\"); println(s); }\n"
+        "use std::io::println;\nuse std::string::String;\nfn main() { let mut s = String::new(); s.push_str(\"héllo wörld 🌍\"); println(&s); }\n"
     ));
 }
 
@@ -1892,7 +1892,6 @@ fn main() {
         "#
     ));
 }
-
 
 #[test]
 fn test_vec_as_slice() {

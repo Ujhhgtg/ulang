@@ -6262,6 +6262,14 @@ impl<'ctx> CodeGen<'ctx> {
                 };
                 let fn_val = if let Some(val) = self.resolve_function(callee, &arg_types) {
                     val
+                } else if !callee.contains("::")
+                    && !self.current_module_path.is_empty()
+                    && let Some(val) = self.resolve_function(
+                        &format!("{}::{}", self.current_module_path.join("::"), callee),
+                        &arg_types,
+                    )
+                {
+                    val
                 } else if let Some(gen_func) = self.generic_funcs.get(callee).cloned() {
                     let mangled_name =
                         self.monomorphize_generic_function(&gen_func, args, explicit_type_args)?;

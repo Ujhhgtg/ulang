@@ -4,6 +4,7 @@ use std::alloc::malloc;
 use std::alloc::free;
 use std::alloc::memcpy;
 use std::libc::{_Exit, fork, execvp, waitpid};
+use std::intrinsics::size_of;
 
 pub fn exit() -> ! {
     _Exit(0);
@@ -60,16 +61,16 @@ impl Command {
         let pid = fork();
         if pid == 0 {
             let argc = self.args.len();
-            let argv_size = (argc + 1) * __builtin_size_of(0 as *mut u8);
+            let argv_size = (argc + 1) * size_of(0 as *mut u8);
             let argv = malloc(argv_size) as *mut *mut u8;
             let mut i = 0;
             while i < argc {
-                let elem_ptr = (self.args.as_ptr() as usize + i * __builtin_size_of(0 as *mut u8)) as *const *mut u8;
-                let dest = (argv as usize + i * __builtin_size_of(0 as *mut u8)) as *mut *mut u8;
+                let elem_ptr = (self.args.as_ptr() as usize + i * size_of(0 as *mut u8)) as *const *mut u8;
+                let dest = (argv as usize + i * size_of(0 as *mut u8)) as *mut *mut u8;
                 *dest = *elem_ptr;
                 i = i + 1;
             };
-            let dest_null = (argv as usize + argc * __builtin_size_of(0 as *mut u8)) as *mut *mut u8;
+            let dest_null = (argv as usize + argc * size_of(0 as *mut u8)) as *mut *mut u8;
             *dest_null = 0 as *mut u8;
 
             execvp(self.program, argv);
@@ -81,16 +82,16 @@ impl Command {
         let pid = fork();
         if pid == 0 {
             let argc = self.args.len();
-            let argv_size = (argc + 1) * __builtin_size_of(0 as *mut u8);
+            let argv_size = (argc + 1) * size_of(0 as *mut u8);
             let argv = malloc(argv_size) as *mut *mut u8;
             let mut i = 0;
             while i < argc {
-                let elem_ptr = (self.args.as_ptr() as usize + i * __builtin_size_of(0 as *mut u8)) as *const *mut u8;
-                let dest = (argv as usize + i * __builtin_size_of(0 as *mut u8)) as *mut *mut u8;
+                let elem_ptr = (self.args.as_ptr() as usize + i * size_of(0 as *mut u8)) as *const *mut u8;
+                let dest = (argv as usize + i * size_of(0 as *mut u8)) as *mut *mut u8;
                 *dest = *elem_ptr;
                 i = i + 1;
             };
-            let dest_null = (argv as usize + argc * __builtin_size_of(0 as *mut u8)) as *mut *mut u8;
+            let dest_null = (argv as usize + argc * size_of(0 as *mut u8)) as *mut *mut u8;
             *dest_null = 0 as *mut u8;
 
             execvp(self.program, argv);

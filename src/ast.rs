@@ -48,6 +48,7 @@ pub struct Function {
     pub type_params: Vec<GenericParam>,
     pub body: Block,
     pub is_extern: bool,
+    pub is_intrinsic: bool,
     pub is_method: bool,
     pub is_pub: bool,
     pub attribs: Vec<Attribute>,

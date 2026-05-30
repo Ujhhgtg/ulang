@@ -4,6 +4,7 @@ use std::iter::IntoIterator;
 use std::iter::IntoIteratorMut;
 use std::iter::Iter;
 use std::iter::IterMut;
+use std::intrinsics::{slice_index, slice_index_mut, slice_as_ptr, size_of};
 
 impl<T, const L: usize> [T; L] {
     fn len(&self) -> usize {
@@ -11,25 +12,25 @@ impl<T, const L: usize> [T; L] {
     }
 
     fn as_ptr(&self) -> *const T {
-        __builtin_slice_as_ptr(self)
+        slice_as_ptr(self)
     }
 }
 
 impl<T, const L: usize> Index<usize, T> for [T; L] {
     fn index(&self, idx: usize) -> &T {
-        __builtin_slice_index(self, idx)
+        slice_index(self, idx)
     }
 }
 
 impl<T, const L: usize> IndexMut<usize, T> for [T; L] {
     fn index_mut(&mut self, idx: usize) -> &mut T {
-        __builtin_slice_index_mut(self, idx)
+        slice_index_mut(self, idx)
     }
 }
 
 impl<T, const L: usize> IntoIterator<T> for [T; L] {
     fn iter(&self) -> Iter<T> {
-        let elem_size = __builtin_size_of(*(0 as *const T));
+        let elem_size = size_of(*(0 as *const T));
         let start = self.as_ptr() as *mut u8;
         let end = (start as usize + L * elem_size) as *mut u8;
         Iter { ptr: start, end: end }
@@ -38,7 +39,7 @@ impl<T, const L: usize> IntoIterator<T> for [T; L] {
 
 impl<T, const L: usize> IntoIteratorMut<T> for [T; L] {
     fn iter_mut(&mut self) -> IterMut<T> {
-        let elem_size = __builtin_size_of(*(0 as *const T));
+        let elem_size = size_of(*(0 as *const T));
         let start = self.as_ptr() as *mut u8;
         let end = (start as usize + L * elem_size) as *mut u8;
         IterMut { ptr: start, end: end }

@@ -647,7 +647,7 @@ fn resolve_module_uses(
 ) {
     for use_decl in &program.uses {
         let path = &use_decl.path;
-        if path.len() < 3 || path[0] != "std" {
+        if path.len() < 3 || !(path[0] == "std" || path[0] == "core") {
             continue;
         }
         let module_name = &path[1];

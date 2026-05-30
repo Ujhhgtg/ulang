@@ -128,6 +128,8 @@ pub struct CodeGen<'ctx> {
     // Types that need drop glue (direct impl Drop or transitively through fields)
     drop_types: HashSet<String>,
     /// Tracks active loops for `continue`/`break` compilation.
+    /// Set of function names declared with #[ulang_intrinsic].
+    intrinsic_funcs: HashSet<String>,
     loop_stack: Vec<LoopContext<'ctx>>,
 }
 
@@ -192,6 +194,7 @@ impl<'ctx> CodeGen<'ctx> {
             generic_funcs: HashMap::new(),
             moved_vars: HashSet::new(),
             scope_stack: Vec::new(),
+            intrinsic_funcs: HashSet::new(),
             copy_types: HashSet::new(),
             drop_types: HashSet::new(),
             loop_stack: Vec::new(),
@@ -244,6 +247,7 @@ impl<'ctx> CodeGen<'ctx> {
             field_visibility_map: HashMap::new(),
             current_module_path: Vec::new(),
             generic_methods: HashMap::new(),
+            intrinsic_funcs: HashSet::new(),
             generic_funcs: HashMap::new(),
             moved_vars: HashSet::new(),
             scope_stack: Vec::new(),
@@ -3388,6 +3392,7 @@ impl<'ctx> CodeGen<'ctx> {
                         type_params: vec![],
                         body: trait_method.body.clone().unwrap(),
                         is_extern: false,
+                        is_intrinsic: false,
                         is_method: !trait_method.params.is_empty()
                             && trait_method.params[0].name == "self",
                         is_pub: false,
@@ -3415,6 +3420,10 @@ impl<'ctx> CodeGen<'ctx> {
         for func in &program.funcs {
             if Self::has_impl_trait_param(func) {
                 self.generic_funcs.insert(func.name.clone(), func.clone());
+                continue;
+            }
+            if func.is_intrinsic {
+                self.intrinsic_funcs.insert(func.name.clone());
                 continue;
             }
             self.declare_function(func)?;
@@ -3507,6 +3516,9 @@ impl<'ctx> CodeGen<'ctx> {
 
         // Phase 2: Compile bodies for non-extern functions
         for func in &program.funcs {
+            if func.is_intrinsic {
+                continue;
+            }
             if Self::has_impl_trait_param(func) {
                 continue;
             }
@@ -3553,6 +3565,7 @@ impl<'ctx> CodeGen<'ctx> {
                         type_params: vec![],
                         body: trait_method.body.clone().unwrap(),
                         is_extern: false,
+                        is_intrinsic: false,
                         is_method: !trait_method.params.is_empty()
                             && trait_method.params[0].name == "self",
                         is_pub: false,
@@ -4180,8 +4193,8 @@ impl<'ctx> CodeGen<'ctx> {
                 if let Some(ret_ty) = self.slice_intrinsic_return_type(callee, args) {
                     return ret_ty;
                 }
-                // Handle __builtin_size_of intrinsic
-                if callee == "__builtin_size_of" && args.len() == 1 {
+                // Handle size_of intrinsic
+                if callee == "size_of" && args.len() == 1 {
                     return Type::Usize;
                 }
                 let arg_types: Vec<Type> = args.iter().map(|a| self.expr_type(a)).collect();
@@ -6067,11 +6080,9 @@ impl<'ctx> CodeGen<'ctx> {
                 Ok(val)
             }
             Expr::Call { callee, args, .. } => {
-                if callee != "__builtin_size_of" && !callee.starts_with("__builtin_slice_") {
-                    self.check_visibility_of_path(&self.current_module_path, callee)?;
-                }
-                // Handle __builtin_size_of intrinsic
-                if callee == "__builtin_size_of" && args.len() == 1 {
+                self.check_visibility_of_path(&self.current_module_path, callee)?;
+                // Handle size_of intrinsic
+                if callee == "size_of" && args.len() == 1 {
                     let arg_ty = self.expr_type(&args[0]);
                     let llvm_ty = self.type_to_llvm(&arg_ty);
                     let size = match llvm_ty {
@@ -8477,10 +8488,10 @@ impl<'ctx> CodeGen<'ctx> {
         None
     }
 
-    /// Determine return type of builtin slice intrinsics (__builtin_slice_*).
+    /// Determine return type of builtin slice intrinsics.
     fn slice_intrinsic_return_type(&self, callee: &str, args: &[Expr]) -> Option<Type> {
         match callee {
-            "__builtin_slice_index" if args.len() == 2 => {
+            "slice_index" if args.len() == 2 => {
                 let self_ty = self.expr_type(&args[0]);
                 if let Type::Ref { inner, .. } = &self_ty
                     && let Type::Array { inner: elem_ty, .. } = inner.as_ref()
@@ -8492,7 +8503,7 @@ impl<'ctx> CodeGen<'ctx> {
                 }
                 None
             }
-            "__builtin_slice_index_mut" if args.len() == 2 => {
+            "slice_index_mut" if args.len() == 2 => {
                 let self_ty = self.expr_type(&args[0]);
                 if let Type::Ref { inner, .. } = &self_ty
                     && let Type::Array { inner: elem_ty, .. } = inner.as_ref()
@@ -8504,7 +8515,7 @@ impl<'ctx> CodeGen<'ctx> {
                 }
                 None
             }
-            "__builtin_slice_as_ptr" if args.len() == 1 => {
+            "slice_as_ptr" if args.len() == 1 => {
                 let self_ty = self.expr_type(&args[0]);
                 if let Type::Ref { inner, .. } = &self_ty
                     && let Type::Array { inner: elem_ty, .. } = inner.as_ref()
@@ -8516,7 +8527,7 @@ impl<'ctx> CodeGen<'ctx> {
                 }
                 None
             }
-            "__builtin_slice_from_raw_parts" if args.len() == 2 => {
+            "slice_from_raw_parts" if args.len() == 2 => {
                 let ptr_ty = self.expr_type(&args[0]);
                 if let Type::Ptr {
                     inner: elem_ty,
@@ -8532,7 +8543,7 @@ impl<'ctx> CodeGen<'ctx> {
                 }
                 None
             }
-            "__builtin_slice_from_raw_parts_mut" if args.len() == 2 => {
+            "slice_from_raw_parts_mut" if args.len() == 2 => {
                 let ptr_ty = self.expr_type(&args[0]);
                 if let Type::Ptr {
                     inner: elem_ty,
@@ -8559,7 +8570,7 @@ impl<'ctx> CodeGen<'ctx> {
         args: &[Expr],
     ) -> Result<Option<BasicValueEnum<'ctx>>, CodegenError> {
         match callee {
-            "__builtin_slice_index" if args.len() == 2 => {
+            "slice_index" if args.len() == 2 => {
                 let self_val = self.compile_expr(&args[0])?;
                 let idx_val = self.compile_expr(&args[1])?;
                 let self_ptr = self_val.into_pointer_value();
@@ -8572,7 +8583,7 @@ impl<'ctx> CodeGen<'ctx> {
                         Type::Array { inner, len } => (*inner.clone(), *len),
                         _ => {
                             return Err(format!(
-                                "__builtin_slice_index: expected reference to array, got {:?}",
+                                "slice_index: expected reference to array, got {:?}",
                                 self_ty
                             )
                             .into());
@@ -8580,7 +8591,7 @@ impl<'ctx> CodeGen<'ctx> {
                     },
                     _ => {
                         return Err(format!(
-                            "__builtin_slice_index: expected reference to array, got {:?}",
+                            "slice_index: expected reference to array, got {:?}",
                             self_ty
                         )
                         .into());
@@ -8606,7 +8617,7 @@ impl<'ctx> CodeGen<'ctx> {
                 };
                 Ok(Some(elem_ptr.into()))
             }
-            "__builtin_slice_index_mut" if args.len() == 2 => {
+            "slice_index_mut" if args.len() == 2 => {
                 let self_val = self.compile_expr(&args[0])?;
                 let idx_val = self.compile_expr(&args[1])?;
                 let self_ptr = self_val.into_pointer_value();
@@ -8618,7 +8629,7 @@ impl<'ctx> CodeGen<'ctx> {
                         Type::Array { inner, len } => (*inner.clone(), *len),
                         _ => {
                             return Err(format!(
-                                "__builtin_slice_index_mut: expected reference to array, got {:?}",
+                                "slice_index_mut: expected reference to array, got {:?}",
                                 self_ty
                             )
                             .into());
@@ -8626,7 +8637,7 @@ impl<'ctx> CodeGen<'ctx> {
                     },
                     _ => {
                         return Err(format!(
-                            "__builtin_slice_index_mut: expected reference to array, got {:?}",
+                            "slice_index_mut: expected reference to array, got {:?}",
                             self_ty
                         )
                         .into());
@@ -8655,7 +8666,7 @@ impl<'ctx> CodeGen<'ctx> {
                 };
                 Ok(Some(elem_ptr.into()))
             }
-            "__builtin_slice_as_ptr" if args.len() == 1 => {
+            "slice_as_ptr" if args.len() == 1 => {
                 let self_val = self.compile_expr(&args[0])?;
                 let self_ptr = self_val.into_pointer_value();
                 let ptr_type = self.context.ptr_type(AddressSpace::default());
@@ -8667,9 +8678,7 @@ impl<'ctx> CodeGen<'ctx> {
                     })?;
                 Ok(Some(ptr))
             }
-            "__builtin_slice_from_raw_parts" | "__builtin_slice_from_raw_parts_mut"
-                if args.len() == 2 =>
-            {
+            "slice_from_raw_parts" | "slice_from_raw_parts_mut" if args.len() == 2 => {
                 let ptr_val = self.compile_expr(&args[0])?;
                 let len_val = self.compile_expr(&args[1])?;
                 let len_int = len_val.into_int_value();

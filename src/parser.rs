@@ -608,6 +608,7 @@ impl<'a> Parser<'a> {
             type_params: Vec::new(),
             body,
             is_extern: true,
+            is_intrinsic: false,
             is_method: false,
             is_pub: false,
             attribs: Vec::new(),
@@ -1110,7 +1111,17 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        let body = self.parse_block()?;
+        let is_intrinsic = attribs.iter().any(|a| a.name == "ulang_intrinsic");
+        let body = if is_intrinsic {
+            self.expect(&Token::Semicolon)?;
+            Block {
+                stmts: Vec::new(),
+                tail_expr: None,
+                span: Span::new(self.last_span_end(), self.last_span_end()),
+            }
+        } else {
+            self.parse_block()?
+        };
         let hi = self.last_span_end();
         Ok(Function {
             name,
@@ -1119,6 +1130,7 @@ impl<'a> Parser<'a> {
             type_params,
             body,
             is_extern: false,
+            is_intrinsic,
             is_method: false,
             is_pub: false,
             attribs,

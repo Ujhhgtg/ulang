@@ -1,0 +1,28 @@
+// Compiler intrinsics.
+// These functions are handled specially by the compiler's code generator
+// and do not have actual implementations. They must be called with the
+// #[ulang_intrinsic] attribute, which allows them to have no body.
+
+/// Returns the size in bytes of the given value's type.
+#[ulang_intrinsic]
+pub fn size_of<T>(x: T) -> usize;
+
+/// Returns a shared reference to the element at `idx` in the array `s`.
+#[ulang_intrinsic]
+pub fn slice_index<T>(s: &[T], idx: usize) -> &T;
+
+/// Returns a mutable reference to the element at `idx` in the array `s`.
+#[ulang_intrinsic]
+pub fn slice_index_mut<T>(s: &mut [T], idx: usize) -> &mut T;
+
+/// Converts a reference to an array into a raw pointer to its first element.
+#[ulang_intrinsic]
+pub fn slice_as_ptr<T>(s: &[T]) -> *const T;
+
+/// Creates a fat pointer (reference to slice) from a raw pointer and length.
+#[ulang_intrinsic]
+pub fn slice_from_raw_parts<T>(ptr: *const T, len: usize) -> &[T];
+
+/// Creates a mutable fat pointer (reference to slice) from a raw pointer and length.
+#[ulang_intrinsic]
+pub fn slice_from_raw_parts_mut<T>(ptr: *mut T, len: usize) -> &mut [T];

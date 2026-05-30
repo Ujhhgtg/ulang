@@ -2157,6 +2157,108 @@ fn collect_stdlib_symbols(
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum AttrContext {
+    Name { prefix: String },
+    DeriveArgs { prefix: String },
+    InlineArgs { prefix: String },
+}
+
+fn get_attribute_word_prefix(source: &str, offset: usize) -> String {
+    let mut start = offset;
+    let bytes = source.as_bytes();
+    while start > 0 {
+        let c = bytes[start - 1];
+        if c.is_ascii_alphanumeric() || c == b'_' {
+            start -= 1;
+        } else {
+            break;
+        }
+    }
+    source[start..offset].to_string()
+}
+
+fn get_attribute_context(
+    tokens: &[(Token, Span)],
+    source: &str,
+    offset: usize,
+) -> Option<AttrContext> {
+    let mut next_idx = tokens.len();
+    for (i, (_, span)) in tokens.iter().enumerate() {
+        if span.lo >= offset {
+            next_idx = i;
+            break;
+        }
+    }
+
+    if next_idx == 0 {
+        return None;
+    }
+
+    let mut paren_depth = 0;
+    let mut bracket_depth = 0;
+    let mut i = next_idx;
+    let word_prefix = get_attribute_word_prefix(source, offset);
+
+    while i > 0 {
+        i -= 1;
+        let (tok, _) = &tokens[i];
+        match tok {
+            Token::RParen => {
+                paren_depth += 1;
+            }
+            Token::LParen => {
+                if paren_depth > 0 {
+                    paren_depth -= 1;
+                } else {
+                    if i > 0
+                        && let Token::Ident(ref name) = tokens[i - 1].0
+                    {
+                        if name == "derive" {
+                            return Some(AttrContext::DeriveArgs {
+                                prefix: word_prefix,
+                            });
+                        } else if name == "inline" {
+                            return Some(AttrContext::InlineArgs {
+                                prefix: word_prefix,
+                            });
+                        }
+                    }
+                    return None;
+                }
+            }
+            Token::RBracket => {
+                bracket_depth += 1;
+            }
+            Token::LBracket => {
+                if bracket_depth > 0 {
+                    bracket_depth -= 1;
+                } else {
+                    if i > 0 && tokens[i - 1].0 == Token::Pound {
+                        return Some(AttrContext::Name {
+                            prefix: word_prefix,
+                        });
+                    }
+                    return None;
+                }
+            }
+            Token::Semicolon
+            | Token::LBrace
+            | Token::RBrace
+            | Token::Fn
+            | Token::Let
+            | Token::Struct
+            | Token::Enum
+            | Token::Impl
+            | Token::Trait => {
+                return None;
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn handle_completion(
     documents: &HashMap<Url, DocumentState>,
     stdlib_cache: &StdlibCache,
@@ -2182,6 +2284,100 @@ fn handle_completion(
             }
             Err(_) => break,
         }
+    }
+
+    let attr_context = get_attribute_context(&tokens, &doc.source, offset);
+    if attr_context.is_some() {
+        let mut items = Vec::new();
+        if let Some(ctx) = attr_context {
+            match ctx {
+                AttrContext::Name { prefix } => {
+                    let prefix_lower = prefix.to_lowercase();
+                    let options = vec![
+                        (
+                            "derive",
+                            Some("derive($0)".to_string()),
+                            Some(InsertTextFormat::SNIPPET),
+                            "derive attribute",
+                        ),
+                        (
+                            "inline",
+                            Some("inline".to_string()),
+                            None,
+                            "inline attribute",
+                        ),
+                        (
+                            "inline(always)",
+                            Some("inline(always)".to_string()),
+                            None,
+                            "force inline always",
+                        ),
+                        (
+                            "inline(never)",
+                            Some("inline(never)".to_string()),
+                            None,
+                            "force no inline",
+                        ),
+                        (
+                            "ulang_intrinsic",
+                            Some("ulang_intrinsic".to_string()),
+                            None,
+                            "intrinsic attribute",
+                        ),
+                    ];
+                    for (label, insert_text, format, detail) in options {
+                        if label.to_lowercase().starts_with(&prefix_lower) {
+                            items.push(CompletionItem {
+                                label: label.to_string(),
+                                kind: Some(CompletionItemKind::KEYWORD),
+                                detail: Some(detail.to_string()),
+                                insert_text,
+                                insert_text_format: format,
+                                sort_text: Some(format!("0_{}", label)),
+                                ..Default::default()
+                            });
+                        }
+                    }
+                }
+                AttrContext::DeriveArgs { prefix } => {
+                    let prefix_lower = prefix.to_lowercase();
+                    let options = vec![
+                        ("Default", "derive Default trait"),
+                        ("Clone", "derive Clone trait"),
+                        ("Eq", "derive Eq trait"),
+                        ("Ord", "derive Ord trait"),
+                        ("Copy", "derive Copy trait"),
+                    ];
+                    for (label, detail) in options {
+                        if label.to_lowercase().starts_with(&prefix_lower) {
+                            items.push(CompletionItem {
+                                label: label.to_string(),
+                                kind: Some(CompletionItemKind::VALUE),
+                                detail: Some(detail.to_string()),
+                                sort_text: Some(format!("0_{}", label)),
+                                ..Default::default()
+                            });
+                        }
+                    }
+                }
+                AttrContext::InlineArgs { prefix } => {
+                    let prefix_lower = prefix.to_lowercase();
+                    let options = vec![("always", "always inline"), ("never", "never inline")];
+                    for (label, detail) in options {
+                        if label.to_lowercase().starts_with(&prefix_lower) {
+                            items.push(CompletionItem {
+                                label: label.to_string(),
+                                kind: Some(CompletionItemKind::VALUE),
+                                detail: Some(detail.to_string()),
+                                sort_text: Some(format!("0_{}", label)),
+                                ..Default::default()
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        return Some(CompletionResponse::Array(items));
     }
 
     let word_prefix = get_word_prefix_at_offset(&tokens, &doc.source, offset);
@@ -2387,7 +2583,7 @@ pub fn run_server() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         definition_provider: Some(OneOf::Left(true)),
         completion_provider: Some(CompletionOptions {
             resolve_provider: None,
-            trigger_characters: None,
+            trigger_characters: Some(vec!["[".to_string(), "(".to_string(), ",".to_string()]),
             work_done_progress_options: Default::default(),
             all_commit_characters: None,
             completion_item: None,
@@ -3536,5 +3732,129 @@ mod tests {
             items.iter().any(|i| i.label == "Vec"),
             "Vec should be in vec module completions"
         );
+    }
+
+    #[test]
+    fn test_attribute_completion() {
+        let src = "#[in";
+        let mut tokens = Vec::new();
+        let mut lexer = Lexer::new(src);
+        loop {
+            let (t, s) = lexer.next_token().unwrap();
+            tokens.push((t.clone(), s));
+            if matches!(t, Token::Eof) {
+                break;
+            }
+        }
+        let ctx = get_attribute_context(&tokens, src, src.len());
+        assert_eq!(
+            ctx,
+            Some(AttrContext::Name {
+                prefix: "in".to_string()
+            })
+        );
+
+        let src_derive = "#[derive(De";
+        let mut tokens_derive = Vec::new();
+        let mut lexer_derive = Lexer::new(src_derive);
+        loop {
+            let (t, s) = lexer_derive.next_token().unwrap();
+            tokens_derive.push((t.clone(), s));
+            if matches!(t, Token::Eof) {
+                break;
+            }
+        }
+        let ctx_derive = get_attribute_context(&tokens_derive, src_derive, src_derive.len());
+        assert_eq!(
+            ctx_derive,
+            Some(AttrContext::DeriveArgs {
+                prefix: "De".to_string()
+            })
+        );
+
+        let src_inline = "#[inline(al";
+        let mut tokens_inline = Vec::new();
+        let mut lexer_inline = Lexer::new(src_inline);
+        loop {
+            let (t, s) = lexer_inline.next_token().unwrap();
+            tokens_inline.push((t.clone(), s));
+            if matches!(t, Token::Eof) {
+                break;
+            }
+        }
+        let ctx_inline = get_attribute_context(&tokens_inline, src_inline, src_inline.len());
+        assert_eq!(
+            ctx_inline,
+            Some(AttrContext::InlineArgs {
+                prefix: "al".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn test_handle_completion_for_attributes() {
+        let mut documents = HashMap::new();
+        let url = Url::parse("file:///test.u").unwrap();
+        documents.insert(
+            url.clone(),
+            DocumentState {
+                source: "#[derive(De".to_string(),
+                last_valid_program: None,
+            },
+        );
+        let cache = load_stdlib_cache();
+        let workspace_root = None;
+        let params = CompletionParams {
+            text_document_position: lsp_types::TextDocumentPositionParams {
+                text_document: lsp_types::TextDocumentIdentifier::new(
+                    url.to_string().parse().unwrap(),
+                ),
+                position: Position::new(0, 11), // position after "De"
+            },
+            context: None,
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+
+        let response = handle_completion(&documents, &cache, &workspace_root, params.clone());
+        assert!(response.is_some());
+        if let Some(CompletionResponse::Array(items)) = response {
+            let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+            assert!(labels.contains(&"Default"));
+            assert!(!labels.contains(&"always"));
+        } else {
+            panic!("Expected CompletionResponse::Array");
+        }
+
+        // Test attribute name completion
+        let mut documents2 = HashMap::new();
+        documents2.insert(
+            url.clone(),
+            DocumentState {
+                source: "#[d".to_string(),
+                last_valid_program: None,
+            },
+        );
+        let params2 = CompletionParams {
+            text_document_position: lsp_types::TextDocumentPositionParams {
+                text_document: lsp_types::TextDocumentIdentifier::new(
+                    url.to_string().parse().unwrap(),
+                ),
+                position: Position::new(0, 3), // position after "d"
+            },
+            context: None,
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+
+        let response2 = handle_completion(&documents2, &cache, &workspace_root, params2);
+        assert!(response2.is_some());
+        if let Some(CompletionResponse::Array(items)) = response2 {
+            let derive_item = items.iter().find(|i| i.label == "derive").unwrap();
+            assert_eq!(derive_item.insert_text, Some("derive($0)".to_string()));
+            assert_eq!(derive_item.insert_text_format, Some(InsertTextFormat::SNIPPET));
+        } else {
+            panic!("Expected CompletionResponse::Array");
+        }
     }
 }

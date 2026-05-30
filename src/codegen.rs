@@ -3720,10 +3720,6 @@ impl<'ctx> CodeGen<'ctx> {
                 CodegenError::new(format!("failed to create target machine for '{}'", triple))
             })?;
 
-        let _ = self
-            .module
-            .print_to_file("/home/keneeeeert/.gemini/antigravity/scratch/debug.ll");
-
         machine
             .write_to_file(&self.module, FileType::Object, path)
             .map_err(|e| CodegenError::new(format!("failed to write object file: {}", e)))?;
@@ -4030,7 +4026,6 @@ impl<'ctx> CodeGen<'ctx> {
             } else {
                 Type::Unit
             };
-            eprintln!("DEBUG resolve_match_result_type: arm body type={:?}", ty);
             if ty != Type::Never {
                 return ty;
             }
@@ -4965,7 +4960,6 @@ impl<'ctx> CodeGen<'ctx> {
     }
 
     fn compile_function_body_inner(&mut self, func: &Function) -> Result<(), CodegenError> {
-        eprintln!("DEBUG compile_function_body_inner: {}", func.name);
         self.current_module_path = self.get_module_path_for_item_name(&func.name);
 
         // Validate visibility of parameter and return types
@@ -9569,16 +9563,7 @@ impl<'ctx> CodeGen<'ctx> {
                     }
                 }
             }
-            _ => {
-                eprintln!(
-                    "DEBUG emit_cast: from_type={:?}, to_type={:?}, val={:?}\nBacktrace:\n{:?}",
-                    from_type,
-                    to_type,
-                    val,
-                    std::backtrace::Backtrace::force_capture()
-                );
-                Err(format!("unsupported value type for cast: val={:?}", val).into())
-            }
+            _ => Err(format!("unsupported value type for cast: val={:?}", val).into()),
         }
     }
 }

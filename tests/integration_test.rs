@@ -1954,3 +1954,70 @@ fn test_vec_as_mut_slice() {
         "#
     ));
 }
+
+#[test]
+fn test_turbofish_generic_functions() {
+    assert!(run_test(
+        "turbofish_generic_functions",
+        r#"
+        // Test turbofish with explicit type arguments
+        fn identity<T>(x: T) -> T { x }
+
+        fn pair<A, B>(a: A, b: B) -> i32 { 42 }
+
+        struct Container { value: i32, }
+        impl Container {
+            fn identity<T>(&self, x: T) -> T { x }
+        }
+
+        fn main() -> i32 {
+            // Basic turbofish on function call
+            let x = identity::<i32>(42);
+            if x != 42 { return 1; };
+
+            // Inference still works when turbofish is not used
+            let y = identity(100);
+            if y != 100 { return 1; };
+
+            // Multiple type params with turbofish
+            let z = pair::<i32, f64>(1, 2.0);
+            if z != 42 { return 1; };
+
+            // Qualified call with turbofish (Container::identity)
+            // Uses turbofish on the method call
+            let c = Container { value: 10 };
+            let r = c.identity::<i32>(7);
+            if r != 7 { return 1; };
+
+            0
+        }
+        "#
+    ));
+}
+
+#[test]
+fn test_turbofish_wildcard_infer() {
+    assert!(run_test(
+        "turbofish_wildcard",
+        r#"
+        // Test _ wildcard in turbofish: lets inference fill in some params
+        // while others are explicitly provided
+        fn convert<T, D>(x: T) -> D {
+            let result: D = 42 as D;
+            result
+        }
+
+        fn main() -> i32 {
+            // D is not inferrable from args (only T is), use _ for T
+            let r = convert::<_, i32>(100);
+            if r != 42 { return 1; };
+
+            // Full explicit also works
+            let r2 = convert::<i32, i32>(200);
+            if r2 != 42 { return 1; };
+
+            0
+        }
+        "#
+    ));
+}

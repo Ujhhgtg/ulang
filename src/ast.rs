@@ -135,6 +135,7 @@ pub enum Type {
     GenericInstance(String, Vec<Type>),
     Alias(String, Vec<Type>),
     SelfType,
+    Infer,
     ImplTrait(Vec<TraitBound>),
 }
 
@@ -160,12 +161,14 @@ pub enum Expr {
     Call {
         callee: String,
         args: Vec<Expr>,
+        type_args: Vec<Type>,
         span: Span,
     },
     QualifiedCall {
         module: String,
         callee: String,
         args: Vec<Expr>,
+        type_args: Vec<Type>,
         span: Span,
     },
     Binary {
@@ -204,6 +207,7 @@ pub enum Expr {
         expr: Box<Expr>,
         method: String,
         args: Vec<Expr>,
+        type_args: Vec<Type>,
         span: Span,
     },
     StructLit {

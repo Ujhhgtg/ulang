@@ -1580,13 +1580,28 @@ impl<'a> Parser<'a> {
                         Token::Ident(name) => {
                             let field = name.clone();
                             self.advance(); // consume field/method name
-                            if *self.peek_token() == Token::LParen {
+                            // Check for turbofish syntax: .method::<Types>(args)
+                            if *self.peek_token() == Token::DoubleColon {
+                                self.advance(); // consume ::
+                                // Expect turbofish types
+                                let turbofish_types = self.parse_turbofish_types()?;
                                 let args = self.parse_call_args()?;
                                 let span = Span::new(expr.span().lo, self.last_span_end());
                                 expr = Expr::MethodCall {
                                     expr: Box::new(expr),
                                     method: field,
                                     args,
+                                    type_args: turbofish_types,
+                                    span,
+                                };
+                            } else if *self.peek_token() == Token::LParen {
+                                let args = self.parse_call_args()?;
+                                let span = Span::new(expr.span().lo, self.last_span_end());
+                                expr = Expr::MethodCall {
+                                    expr: Box::new(expr),
+                                    method: field,
+                                    args,
+                                    type_args: vec![],
                                     span,
                                 };
                             } else {
@@ -1860,6 +1875,7 @@ impl<'a> Parser<'a> {
             Token::Bool => Ok(Type::Bool),
             Token::Str => Ok(Type::Str),
             Token::SelfType => Ok(Type::SelfType),
+            Token::Underscore => Ok(Type::Infer),
             Token::Ident(name) => {
                 let mut path = vec![name];
                 while *self.peek_token() == Token::DoubleColon {
@@ -1991,6 +2007,24 @@ impl<'a> Parser<'a> {
         Ok(args)
     }
 
+    fn parse_turbofish_types(&mut self) -> Result<Vec<Type>, ParseError> {
+        self.expect(&Token::Lt)?;
+        let mut types = Vec::new();
+        if *self.peek_token() != Token::Gt {
+            loop {
+                let ty = self.parse_type()?;
+                types.push(ty);
+                if *self.peek_token() == Token::Comma {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+        }
+        self.expect(&Token::Gt)?;
+        Ok(types)
+    }
+
     fn parse_struct_lit(&mut self, struct_name: &str, start_lo: usize) -> Result<Expr, ParseError> {
         self.expect(&Token::LBrace)?;
         let mut fields = Vec::new();
@@ -2099,6 +2133,7 @@ impl<'a> Parser<'a> {
                     module: type_str,
                     callee,
                     args,
+                    type_args: vec![],
                     span: Span::new(lo_qual, hi),
                 });
             } else {
@@ -2107,6 +2142,7 @@ impl<'a> Parser<'a> {
                     module: type_str,
                     callee,
                     args: vec![],
+                    type_args: vec![],
                     span: Span::new(lo_qual, hi),
                 });
             }
@@ -2188,12 +2224,17 @@ impl<'a> Parser<'a> {
                 let ident_span = self.current().unwrap().1;
                 self.advance();
                 let mut path = vec![name];
+                let mut type_args: Option<Vec<Type>> = None;
                 while *self.peek_token() == Token::DoubleColon {
                     self.advance(); // consume ::
                     match self.peek_token() {
                         Token::Ident(s) => {
                             path.push(s.clone());
                             self.advance();
+                        }
+                        Token::Lt => {
+                            type_args = Some(self.parse_turbofish_types()?);
+                            break;
                         }
                         _ => {
                             let default = (Token::Eof, Span::empty(0));
@@ -2221,6 +2262,19 @@ impl<'a> Parser<'a> {
                     if *self.peek_token() == Token::LBrace && !self.suppress_struct_lit {
                         let full_struct_name = path.join("::");
                         return self.parse_struct_lit(&full_struct_name, ident_span.lo);
+                    }
+
+                    // If turbofish was used, this must be a qualified call, not an enum literal
+                    if type_args.is_some() {
+                        let args = self.parse_call_args()?;
+                        let hi = self.last_span_end();
+                        return Ok(Expr::QualifiedCall {
+                            module: prefix_str,
+                            callee: last_segment,
+                            args,
+                            type_args: type_args.unwrap_or_default(),
+                            span: Span::new(ident_span.lo, hi),
+                        });
                     }
 
                     if *self.peek_token() == Token::LParen {
@@ -2252,6 +2306,7 @@ impl<'a> Parser<'a> {
                                 module: prefix_str,
                                 callee: last_segment,
                                 args,
+                                type_args: type_args.unwrap_or_default(),
                                 span: Span::new(ident_span.lo, hi),
                             })
                         }
@@ -2268,6 +2323,7 @@ impl<'a> Parser<'a> {
                                 module: prefix_str,
                                 callee: last_segment,
                                 args: vec![],
+                                type_args: type_args.unwrap_or_default(),
                                 span: Span::new(ident_span.lo, self.last_span_end()),
                             })
                         }
@@ -2278,12 +2334,15 @@ impl<'a> Parser<'a> {
                     if *self.peek_token() == Token::LBrace && !self.suppress_struct_lit {
                         return self.parse_struct_lit(&single_name, ident_span.lo);
                     }
-                    if *self.peek_token() == Token::LParen {
+                    // If turbofish is present, we must have a call
+                    let type_args_val = type_args.clone().unwrap_or_default();
+                    if *self.peek_token() == Token::LParen || type_args.is_some() {
                         let args = self.parse_call_args()?;
                         let hi = self.last_span_end();
                         return Ok(Expr::Call {
                             callee: single_name,
                             args,
+                            type_args: type_args_val,
                             span: Span::new(ident_span.lo, hi),
                         });
                     }

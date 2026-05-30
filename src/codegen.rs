@@ -2503,6 +2503,7 @@ impl<'ctx> CodeGen<'ctx> {
         type_name: &str,
         gen_method: &Function,
         args: &[Expr],
+        explicit_type_args: Option<&[Type]>,
     ) -> Result<String, CodegenError> {
         let mut cloned = gen_method.clone();
         let param_names: Vec<String> = gen_method
@@ -2514,12 +2515,27 @@ impl<'ctx> CodeGen<'ctx> {
 
         let caller_arg_types: Vec<Type> = args.iter().map(|a| self.expr_type(a)).collect();
 
-        // Match parameter types against argument types to infer mapping
-        for (param, arg_ty) in gen_method.params.iter().zip(&caller_arg_types) {
-            self.infer_type_mappings(&param.ty, arg_ty, &param_names, &mut mappings);
+        if let Some(explicit) = explicit_type_args {
+            for (name, ty) in param_names.iter().zip(explicit.iter()) {
+                if !matches!(ty, Type::Infer) {
+                    mappings.insert(name.clone(), ty.clone());
+                }
+            }
         }
-
-        // Verify type params are inferred
+        // Still try to infer any params not provided explicitly (e.g., Type::Infer wildcards)
+        for (param, arg_ty) in gen_method.params.iter().zip(&caller_arg_types) {
+            for name in &param_names {
+                if !mappings.contains_key(name) {
+                    self.infer_type_mappings(&param.ty, arg_ty, &param_names, &mut mappings);
+                }
+            }
+        }
+        // If no explicit type args, original inference
+        if explicit_type_args.is_none() {
+            for (param, arg_ty) in gen_method.params.iter().zip(&caller_arg_types) {
+                self.infer_type_mappings(&param.ty, arg_ty, &param_names, &mut mappings);
+            }
+        }
         for name in &param_names {
             if !mappings.contains_key(name) {
                 return Err(format!(
@@ -2621,6 +2637,7 @@ impl<'ctx> CodeGen<'ctx> {
         &mut self,
         gen_func: &Function,
         args: &[Expr],
+        explicit_type_args: Option<&[Type]>,
     ) -> Result<String, CodegenError> {
         let mut cloned = gen_func.clone();
         let param_names: Vec<String> = gen_func
@@ -2629,12 +2646,28 @@ impl<'ctx> CodeGen<'ctx> {
             .map(|p| p.name.clone())
             .collect();
         let mut mappings: HashMap<String, Type> = HashMap::new();
-
         let caller_arg_types: Vec<Type> = args.iter().map(|a| self.expr_type(a)).collect();
 
-        // Match parameter types against argument types to infer mapping
+        if let Some(explicit) = explicit_type_args {
+            for (name, ty) in param_names.iter().zip(explicit.iter()) {
+                if !matches!(ty, Type::Infer) {
+                    mappings.insert(name.clone(), ty.clone());
+                }
+            }
+        }
+        // Still try to infer any params not provided explicitly (e.g., Type::Infer wildcards)
         for (param, arg_ty) in gen_func.params.iter().zip(&caller_arg_types) {
-            self.infer_type_mappings(&param.ty, arg_ty, &param_names, &mut mappings);
+            for name in &param_names {
+                if !mappings.contains_key(name) {
+                    self.infer_type_mappings(&param.ty, arg_ty, &param_names, &mut mappings);
+                }
+            }
+        }
+        // If no explicit type args, original inference
+        if explicit_type_args.is_none() {
+            for (param, arg_ty) in gen_func.params.iter().zip(&caller_arg_types) {
+                self.infer_type_mappings(&param.ty, arg_ty, &param_names, &mut mappings);
+            }
         }
 
         // Verify type params are inferred
@@ -2647,7 +2680,6 @@ impl<'ctx> CodeGen<'ctx> {
                 .into());
             }
         }
-
         // Verify generic bounds
         for p in &gen_func.type_params {
             let concrete_ty = mappings.get(&p.name).unwrap();
@@ -3752,6 +3784,9 @@ impl<'ctx> CodeGen<'ctx> {
             Type::SelfType => {
                 panic!("SelfType used outside of impl context");
             }
+            Type::Infer => {
+                panic!("Type::Infer should be resolved before codegen");
+            }
             Type::Slice { .. } => {
                 let elems: [BasicTypeEnum; 2] = [
                     self.context.ptr_type(AddressSpace::default()).into(),
@@ -3969,6 +4004,7 @@ impl<'ctx> CodeGen<'ctx> {
                 expr: receiver,
                 method,
                 args,
+                type_args,
                 ..
             } => {
                 // Try to determine return type from method definition
@@ -4034,15 +4070,27 @@ impl<'ctx> CodeGen<'ctx> {
                             .map(|p| p.name.clone())
                             .collect();
                         let mut mappings = HashMap::new();
+                        if !type_args.is_empty() {
+                            for (name, ty) in param_names.iter().zip(type_args.iter()) {
+                                if !matches!(ty, Type::Infer) {
+                                    mappings.insert(name.clone(), ty.clone());
+                                }
+                            }
+                        }
+                        // Infer any remaining (unmapped) type parameters from arguments
                         let mut all_arg_types = vec![receiver_type.clone()];
                         all_arg_types.extend(args.iter().map(|a| self.expr_type(a)));
                         for (param, arg_ty) in gen_method.params.iter().zip(&all_arg_types) {
-                            self.infer_type_mappings(
-                                &param.ty,
-                                arg_ty,
-                                &param_names,
-                                &mut mappings,
-                            );
+                            for name in &param_names {
+                                if !mappings.contains_key(name) {
+                                    self.infer_type_mappings(
+                                        &param.ty,
+                                        arg_ty,
+                                        &param_names,
+                                        &mut mappings,
+                                    );
+                                }
+                            }
                         }
                         if let Some(mut ret_ty) = gen_method.return_type.clone() {
                             Self::substitute_type_params(
@@ -4188,7 +4236,12 @@ impl<'ctx> CodeGen<'ctx> {
             Expr::Match {
                 scrutinee, arms, ..
             } => self.resolve_match_result_type(scrutinee, arms),
-            Expr::Call { callee, args, .. } => {
+            Expr::Call {
+                callee,
+                args,
+                type_args,
+                ..
+            } => {
                 // Handle builtin slice intrinsics
                 if let Some(ret_ty) = self.slice_intrinsic_return_type(callee, args) {
                     return ret_ty;
@@ -4215,8 +4268,25 @@ impl<'ctx> CodeGen<'ctx> {
                         .map(|p| p.name.clone())
                         .collect();
                     let mut mappings = HashMap::new();
+                    if !type_args.is_empty() {
+                        for (name, ty) in param_names.iter().zip(type_args.iter()) {
+                            if !matches!(ty, Type::Infer) {
+                                mappings.insert(name.clone(), ty.clone());
+                            }
+                        }
+                    }
+                    // Infer any remaining (unmapped) type parameters from arguments
                     for (param, arg_ty) in gen_func.params.iter().zip(&arg_types) {
-                        self.infer_type_mappings(&param.ty, arg_ty, &param_names, &mut mappings);
+                        for name in &param_names {
+                            if !mappings.contains_key(name) {
+                                self.infer_type_mappings(
+                                    &param.ty,
+                                    arg_ty,
+                                    &param_names,
+                                    &mut mappings,
+                                );
+                            }
+                        }
                     }
                     if let Some(mut ret_ty) = gen_func.return_type.clone() {
                         Self::substitute_type_params(
@@ -4243,6 +4313,7 @@ impl<'ctx> CodeGen<'ctx> {
                 module,
                 callee,
                 args,
+                type_args,
                 ..
             } => {
                 let qualified_name = format!("{}::{}", module, callee);
@@ -4258,6 +4329,52 @@ impl<'ctx> CodeGen<'ctx> {
                     && let Some((_, mangled)) = methods.iter().find(|(name, _)| name == callee)
                 {
                     name = mangled.clone();
+                }
+                // Try generic function return type inference
+                if !self.module.get_function(&name).is_some()
+                    && let Some(gen_func) = self.generic_funcs.get(callee)
+                {
+                    let param_names: Vec<String> = gen_func
+                        .type_params
+                        .iter()
+                        .map(|p| p.name.clone())
+                        .collect();
+                    let mut mappings = HashMap::new();
+                    if !type_args.is_empty() {
+                        for (name, ty) in param_names.iter().zip(type_args.iter()) {
+                            if !matches!(ty, Type::Infer) {
+                                mappings.insert(name.clone(), ty.clone());
+                            }
+                        }
+                    }
+                    // Infer any remaining (unmapped) type parameters from arguments
+                    let arg_types: Vec<Type> =
+                        args.iter().map(|a| self.expr_type(a)).collect();
+                    for (param, arg_ty) in gen_func.params.iter().zip(&arg_types) {
+                        for name in &param_names {
+                            if !mappings.contains_key(name) {
+                                self.infer_type_mappings(
+                                    &param.ty,
+                                    arg_ty,
+                                    &param_names,
+                                    &mut mappings,
+                                );
+                            }
+                        }
+                    }
+                    if let Some(mut ret_ty) = gen_func.return_type.clone() {
+                        Self::substitute_type_params(
+                            &mut ret_ty,
+                            &param_names,
+                            &param_names
+                                .iter()
+                                .map(|n| mappings.get(n).cloned().unwrap_or(Type::I32))
+                                .collect::<Vec<_>>(),
+                        );
+                        return ret_ty;
+                    } else {
+                        return Type::Unit;
+                    }
                 }
                 self.fn_return_types
                     .get(&name)
@@ -6079,7 +6196,12 @@ impl<'ctx> CodeGen<'ctx> {
                     .map_err(|e| CodegenError::new(format!("failed to build deref load: {}", e)))?;
                 Ok(val)
             }
-            Expr::Call { callee, args, .. } => {
+            Expr::Call {
+                callee,
+                args,
+                type_args,
+                ..
+            } => {
                 self.check_visibility_of_path(&self.current_module_path, callee)?;
                 // Handle size_of intrinsic
                 if callee == "size_of" && args.len() == 1 {
@@ -6125,10 +6247,16 @@ impl<'ctx> CodeGen<'ctx> {
                     return Ok(result);
                 }
                 let arg_types: Vec<Type> = args.iter().map(|a| self.expr_type(a)).collect();
+                let explicit_type_args = if type_args.is_empty() {
+                    None
+                } else {
+                    Some(type_args.as_slice())
+                };
                 let fn_val = if let Some(val) = self.resolve_function(callee, &arg_types) {
                     val
                 } else if let Some(gen_func) = self.generic_funcs.get(callee).cloned() {
-                    let mangled_name = self.monomorphize_generic_function(&gen_func, args)?;
+                    let mangled_name =
+                        self.monomorphize_generic_function(&gen_func, args, explicit_type_args)?;
                     self.resolve_function(&mangled_name, &arg_types)
                         .ok_or_else(|| {
                             format!(
@@ -6211,6 +6339,7 @@ impl<'ctx> CodeGen<'ctx> {
                 module,
                 callee,
                 args,
+                type_args,
                 ..
             } => {
                 let qualified_name = format!("{}::{}", module, callee);
@@ -6239,6 +6368,22 @@ impl<'ctx> CodeGen<'ctx> {
                     && let Some((_, mangled)) = methods.iter().find(|(name, _)| name == callee)
                 {
                     resolved_fn_val = self.module.get_function(mangled);
+                }
+
+                // Try generic function
+                if resolved_fn_val.is_none() {
+                    let explicit_type_args = if type_args.is_empty() {
+                        None
+                    } else {
+                        Some(type_args.as_slice())
+                    };
+                    if let Some(gen_func) = self.generic_funcs.get(callee).cloned() {
+                        if let Ok(mangled) =
+                            self.monomorphize_generic_function(&gen_func, args, explicit_type_args)
+                        {
+                            resolved_fn_val = self.module.get_function(&mangled);
+                        }
+                    }
                 }
 
                 let fn_val = resolved_fn_val.ok_or_else(|| {
@@ -6708,6 +6853,7 @@ impl<'ctx> CodeGen<'ctx> {
                 expr: receiver,
                 method,
                 args,
+                type_args,
                 ..
             } => {
                 // Reject direct .drop() calls
@@ -6871,11 +7017,20 @@ impl<'ctx> CodeGen<'ctx> {
                     } else {
                         None
                     };
-
                 let mangled = if let Some(gen_method) = gen_method_opt {
                     let mut all_exprs = vec![receiver.as_ref().clone()];
                     all_exprs.extend(args.clone());
-                    self.monomorphize_generic_method(&type_name, &gen_method, &all_exprs)?
+                    let explicit_type_args = if type_args.is_empty() {
+                        None
+                    } else {
+                        Some(type_args.as_slice())
+                    };
+                    self.monomorphize_generic_method(
+                        &type_name,
+                        &gen_method,
+                        &all_exprs,
+                        explicit_type_args,
+                    )?
                 } else if let Some(methods) = self.impl_methods.get(&type_name)
                     && let Some((_, mangled_name)) = methods.iter().find(|(name, _)| name == method)
                 {
@@ -7941,6 +8096,7 @@ impl<'ctx> CodeGen<'ctx> {
                 expr: Box::new(container.clone()),
                 method: "iter".to_string(),
                 args: vec![],
+                type_args: vec![],
                 span: Span::empty(0),
             }
         } else if is_iter {
@@ -7959,6 +8115,7 @@ impl<'ctx> CodeGen<'ctx> {
             expr: Box::new(Expr::Ident("__for_loop_iter".to_string(), Span::empty(0))),
             method: "next".to_string(),
             args: vec![],
+            type_args: vec![],
             span: Span::empty(0),
         };
         // Create a temporary mock scope to retrieve the return type of iterator.next()
@@ -9171,6 +9328,9 @@ impl<'ctx> CodeGen<'ctx> {
                     Type::SelfType => return Err("cannot cast to Self type".to_string().into()),
                     // Bool caught by early return above, but keep for completeness
                     Type::Bool => 1,
+                    Type::Infer => {
+                        return Err("cannot cast to inferred type".to_string().into());
+                    }
                 };
 
                 if is_dst_float {

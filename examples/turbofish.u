@@ -1,0 +1,18 @@
+use std::io::println;
+use std::string::String;
+
+fn identity<T>(x: T) -> T {
+    x
+}
+
+fn main() -> i32 {
+    // Test basic turbofish with simple function
+    let x = identity::<i32>(42);
+    println(x);
+
+    // Test without turbofish (inference still works)
+    let y = identity(100);
+    println(y);
+
+    0
+}

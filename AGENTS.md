@@ -169,31 +169,27 @@ However, in `ulang`, to clarify statements and expressions, **every statement co
 For example:
 
 ```rust
-// Correct statement usage:
-println("do something");
-if true {
-    println("do something 1");
-} else {
-    println("do something 2");
-}; // <- Trailing semicolon is required!
-println("do something");
-```
+// In ulang:
 
-```rust
+// Correct statement usage:
+if 1 == 2 {
+    println("whoops, mathematics broke");
+} else {
+    println("everything's fine!");
+}; // <- Trailing semicolon is required!
+
+// Correct expression usage:
+let value = if true {
+    1
+} else {
+    2
+}; // <- Trailing semicolon is required!
+
 // Correct tail expression (implicit return) usage:
 fn main() -> i32 {
-    let val = if true { return 0; } else { return 1; }; // semicolons inside let binding
-    val // tail expression does not have a semicolon
+    if true { 0 } else { 1 }
 }
 ```
-
-### Keyword differences
-
-- `Self` type uses `Self` (capital S, same as Rust).
-- `self` parameter uses `&self` for shared references and `&mut self` for mutable references.
-- Trait/impl method signatures use `&self`, `&mut self`, and `Self` as in Rust.
-- Enum variants are accessed via `EnumName::Variant` (double colon).
-- Modules use `mod` keyword; file-based modules follow the same convention as Rust.
 
 ## Key Directories
 

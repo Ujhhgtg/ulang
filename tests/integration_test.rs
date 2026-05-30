@@ -2028,3 +2028,117 @@ fn test_turbofish_wildcard_infer() {
         "#
     ));
 }
+
+#[test]
+fn test_inline_attributes() {
+    let src = r#"
+    #[inline]
+    fn f_default() -> i32 { 1 }
+
+    #[inline(always)]
+    fn f_always() -> i32 { 2 }
+
+    #[inline(never)]
+    fn f_never() -> i32 { 3 }
+
+    struct MyStruct;
+    impl MyStruct {
+        #[inline(always)]
+        fn method_always(&self) -> i32 { 4 }
+
+        #[inline(never)]
+        fn method_never(&self) -> i32 { 5 }
+    }
+
+    trait Foo {
+        fn trait_method(&self) -> i32;
+    }
+    impl Foo for MyStruct {
+        #[inline(always)]
+        fn trait_method(&self) -> i32 { 6 }
+    }
+
+    fn main() -> i32 {
+        let s = MyStruct;
+        if f_default() != 1 { return 1; };
+        if f_always() != 2 { return 2; };
+        if f_never() != 3 { return 3; };
+        if s.method_always() != 4 { return 4; };
+        if s.method_never() != 5 { return 5; };
+        if s.trait_method() != 6 { return 6; };
+        0
+    }
+    "#;
+
+    // 1. Verify JIT execution works
+    assert!(run_test("inline_attr_jit", src));
+
+    // 2. Verify emitted LLVM IR contains alwaysinline and noinline attributes
+    let path = write_test(src, "inline_attr_ir");
+    let output = Command::new(ulang_binary())
+        .args(["emit-ir", &path.to_string_lossy()])
+        .output()
+        .expect("failed to execute ulang emit-ir");
+    assert!(output.status.success());
+    let ir = String::from_utf8_lossy(&output.stdout);
+    assert!(ir.contains("alwaysinline"));
+    assert!(ir.contains("noinline"));
+}
+
+#[test]
+fn test_invalid_inline_attributes() {
+    // 1. Invalid argument spelling
+    assert!(run_test_expect_error(
+        "invalid_inline_arg",
+        r#"
+        #[inline(foo)]
+        fn main() {}
+        "#
+    ));
+
+    // 2. Too many arguments
+    assert!(run_test_expect_error(
+        "too_many_inline_args",
+        r#"
+        #[inline(always, never)]
+        fn main() {}
+        "#
+    ));
+
+    // 3. Conflicting attributes
+    assert!(run_test_expect_error(
+        "conflicting_inline_attrs",
+        r#"
+        #[inline(always)]
+        #[inline(never)]
+        fn main() {}
+        "#
+    ));
+}
+
+#[test]
+fn test_inline_on_struct_enum_errors() {
+    // 1. inline on struct
+    assert!(run_test_expect_error(
+        "inline_on_struct",
+        r#"
+        #[inline]
+        struct S {
+            x: i32,
+        }
+        fn main() {}
+        "#
+    ));
+
+    // 2. inline on enum
+    assert!(run_test_expect_error(
+        "inline_on_enum",
+        r#"
+        #[inline]
+        enum E {
+            A,
+        }
+        fn main() {}
+        "#
+    ));
+}

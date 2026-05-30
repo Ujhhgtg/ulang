@@ -3270,6 +3270,28 @@ impl<'ctx> CodeGen<'ctx> {
     }
 
     pub fn compile_module(&mut self, program: &Program) -> Result<(), CodegenError> {
+        // Validate attributes: inline cannot be on structs or enums
+        for decl in &program.structs {
+            for attr in &decl.attribs {
+                if attr.name == "inline" {
+                    return Err(CodegenError::with_span(
+                        "attribute `inline` can only be marked on functions",
+                        attr.span,
+                    ));
+                }
+            }
+        }
+        for decl in &program.enums {
+            for attr in &decl.attribs {
+                if attr.name == "inline" {
+                    return Err(CodegenError::with_span(
+                        "attribute `inline` can only be marked on functions",
+                        attr.span,
+                    ));
+                }
+            }
+        }
+
         // Populate visibility map
         for func in &program.funcs {
             self.visibility_map.insert(func.name.clone(), func.is_pub);
@@ -3409,7 +3431,11 @@ impl<'ctx> CodeGen<'ctx> {
                 };
                 let mut method_func = method.clone();
                 method_func.name = mangled_name.clone();
-                let self_type = if type_name == "str" { Type::Str } else { Type::Struct(type_name.clone()) };
+                let self_type = if type_name == "str" {
+                    Type::Str
+                } else {
+                    Type::Struct(type_name.clone())
+                };
                 Self::resolve_self_type(&mut method_func, &self_type);
                 self.declare_function(&method_func)?;
                 self.impl_methods
@@ -3445,7 +3471,11 @@ impl<'ctx> CodeGen<'ctx> {
                             .push(method_func);
                         continue;
                     }
-                    let self_type = if type_name == "str" { Type::Str } else { Type::Struct(type_name.clone()) };
+                    let self_type = if type_name == "str" {
+                        Type::Str
+                    } else {
+                        Type::Struct(type_name.clone())
+                    };
                     Self::resolve_self_type(&mut method_func, &self_type);
                     self.declare_function(&method_func)?;
                     self.impl_methods
@@ -3576,8 +3606,12 @@ impl<'ctx> CodeGen<'ctx> {
                 Type::Str => "str".to_string(),
                 _ => continue,
             };
-            let self_type = if type_name == "str" { Type::Str } else { Type::Struct(type_name.clone()) };
-            
+            let self_type = if type_name == "str" {
+                Type::Str
+            } else {
+                Type::Struct(type_name.clone())
+            };
+
             for method in &decl.methods {
                 if Self::has_impl_trait_param(method) {
                     continue;
@@ -4808,13 +4842,69 @@ impl<'ctx> CodeGen<'ctx> {
             }
         };
 
-        if self.module.get_function(&func.name).is_none() {
-            let fn_val = self.module.add_function(&func.name, fn_type, None);
+        let mut force_inline = false;
+        let mut force_noinline = false;
+
+        for attr in &func.attribs {
+            if attr.name == "inline" {
+                if attr.args.is_empty() {
+                    force_inline = true;
+                } else if attr.args.len() == 1 {
+                    match attr.args[0].as_str() {
+                        "always" => force_inline = true,
+                        "never" => force_noinline = true,
+                        _ => {
+                            return Err(CodegenError::with_span(
+                                format!(
+                                    "invalid 'inline' attribute argument: expected 'always' or 'never', found '{}'",
+                                    attr.args[0]
+                                ),
+                                attr.span,
+                            ));
+                        }
+                    }
+                } else {
+                    return Err(CodegenError::with_span(
+                        "invalid 'inline' attribute: expected at most 1 argument (always or never)",
+                        attr.span,
+                    ));
+                }
+            }
+        }
+
+        if force_inline && force_noinline {
+            let inline_span = func
+                .attribs
+                .iter()
+                .find(|a| a.name == "inline")
+                .map(|a| a.span)
+                .unwrap_or(func.span);
+            return Err(CodegenError::with_span(
+                "conflicting 'inline' attributes",
+                inline_span,
+            ));
+        }
+
+        let fn_val = if let Some(existing) = self.module.get_function(&func.name) {
+            existing
+        } else {
+            let val = self.module.add_function(&func.name, fn_type, None);
             if is_never {
                 let kind_id = Attribute::get_named_enum_kind_id("noreturn");
                 let attr = self.context.create_enum_attribute(kind_id, 0);
-                fn_val.add_attribute(inkwell::attributes::AttributeLoc::Function, attr);
+                val.add_attribute(inkwell::attributes::AttributeLoc::Function, attr);
             }
+            val
+        };
+
+        if force_inline {
+            let kind_id = Attribute::get_named_enum_kind_id("alwaysinline");
+            let attr = self.context.create_enum_attribute(kind_id, 0);
+            fn_val.add_attribute(inkwell::attributes::AttributeLoc::Function, attr);
+        } else if force_noinline {
+            let kind_id = Attribute::get_named_enum_kind_id("noinline");
+            let attr = self.context.create_enum_attribute(kind_id, 0);
+            fn_val.add_attribute(inkwell::attributes::AttributeLoc::Function, attr);
         }
         // Store return type for expr_type resolution
         let ret_type = func.return_type.clone().unwrap_or(Type::I32);
@@ -6405,9 +6495,9 @@ impl<'ctx> CodeGen<'ctx> {
                     if let Some(gen_func) = self.generic_funcs.get(callee).cloned()
                         && let Ok(mangled) =
                             self.monomorphize_generic_function(&gen_func, args, explicit_type_args)
-                        {
-                            resolved_fn_val = self.module.get_function(&mangled);
-                        }
+                    {
+                        resolved_fn_val = self.module.get_function(&mangled);
+                    }
                 }
 
                 let fn_val = resolved_fn_val.ok_or_else(|| {
@@ -7089,7 +7179,9 @@ impl<'ctx> CodeGen<'ctx> {
                     let alloca = self
                         .builder
                         .build_alloca(receiver_val.get_type(), "method_self")
-                        .map_err(|e| format!("failed to build alloca for method receiver: {}", e))?;
+                        .map_err(|e| {
+                            format!("failed to build alloca for method receiver: {}", e)
+                        })?;
                     self.builder
                         .build_store(alloca, receiver_val)
                         .map_err(|e| format!("failed to store receiver for method call: {}", e))?;
@@ -7126,10 +7218,12 @@ impl<'ctx> CodeGen<'ctx> {
                                                     }
                                                     _ => unreachable!(),
                                                 };
-                                                let fields =
-                                                    self.struct_fields.get(&struct_name).ok_or_else(
-                                                        || format!("unknown struct '{}'", struct_name),
-                                                    )?;
+                                                let fields = self
+                                                    .struct_fields
+                                                    .get(&struct_name)
+                                                    .ok_or_else(|| {
+                                                    format!("unknown struct '{}'", struct_name)
+                                                })?;
                                                 let idx = fields
                                                     .iter()
                                                     .position(|f| f.name == *field_name)
@@ -7151,11 +7245,16 @@ impl<'ctx> CodeGen<'ctx> {
                                                                 "ref_base",
                                                             )
                                                             .map_err(|e| {
-                                                                format!("failed to build alloca: {}", e)
+                                                                format!(
+                                                                    "failed to build alloca: {}",
+                                                                    e
+                                                                )
                                                             })?;
-                                                        self.builder.build_store(a, ptr_val).map_err(
-                                                            |e| format!("failed to store: {}", e),
-                                                        )?;
+                                                        self.builder
+                                                            .build_store(a, ptr_val)
+                                                            .map_err(|e| {
+                                                                format!("failed to store: {}", e)
+                                                            })?;
                                                         a
                                                     }
                                                 };
@@ -10405,6 +10504,11 @@ mod tests {
     }
 
     #[test]
+    fn test_jit_if_else_as_tail_expr() {
+        assert_eq!(jit("fn main() { if false { 2 } else { 3 } }").unwrap(), 3);
+    }
+
+    #[test]
     fn test_jit_if_else_if() {
         // if as expression statement with ;
         assert_eq!(
@@ -10416,7 +10520,7 @@ mod tests {
     #[test]
     fn test_jit_loop_infinite() {
         // loop with return to escape
-        assert_eq!(jit("fn main() { return 42; }").unwrap(), 42);
+        assert_eq!(jit("fn main() { loop { break 42; } }").unwrap(), 42);
     }
 
     #[test]

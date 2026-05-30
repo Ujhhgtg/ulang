@@ -982,13 +982,14 @@ impl<'a> Parser<'a> {
         self.expect(&Token::LBrace)?;
         let mut methods = Vec::new();
         while *self.peek_token() != Token::RBrace && *self.peek_token() != Token::Eof {
+            let attribs = self.parse_attrs()?;
             let is_method_pub = if *self.peek_token() == Token::Pub {
                 self.advance();
                 true
             } else {
                 false
             };
-            let mut func = self.parse_function(Vec::new())?;
+            let mut func = self.parse_function(attribs)?;
             func.is_pub = is_method_pub;
             func.is_method = true;
             methods.push(func);

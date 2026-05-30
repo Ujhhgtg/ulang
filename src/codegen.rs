@@ -3289,30 +3289,28 @@ impl<'ctx> CodeGen<'ctx> {
             }
             // Also inherit default trait constants for this concrete generic instance
             if let Some(ref tname) = impl_decl.trait_name
-                && let Some(trait_def) = self.trait_defs.get(tname) {
-                    for tc in &trait_def.consts {
-                        if !impl_decl.consts.iter().any(|ic| ic.name == tc.name)
-                            && let Some(ref def_val) = tc.default_value {
-                                let substituted_val = def_val.clone();
-                                let mut substituted_ty = tc.ty.clone();
-                                Self::m_substitute_types_in_expr(
-                                    &mut Box::new(substituted_val.clone()),
-                                    &param_names,
-                                    args,
-                                );
-                                Self::substitute_type_params(
-                                    &mut substituted_ty,
-                                    &param_names,
-                                    args,
-                                );
+                && let Some(trait_def) = self.trait_defs.get(tname)
+            {
+                for tc in &trait_def.consts {
+                    if !impl_decl.consts.iter().any(|ic| ic.name == tc.name)
+                        && let Some(ref def_val) = tc.default_value
+                    {
+                        let substituted_val = def_val.clone();
+                        let mut substituted_ty = tc.ty.clone();
+                        Self::m_substitute_types_in_expr(
+                            &mut Box::new(substituted_val.clone()),
+                            &param_names,
+                            args,
+                        );
+                        Self::substitute_type_params(&mut substituted_ty, &param_names, args);
 
-                                self.associated_const_defs.insert(
-                                    (mangled.clone(), tc.name.clone()),
-                                    (substituted_val, substituted_ty),
-                                );
-                            }
+                        self.associated_const_defs.insert(
+                            (mangled.clone(), tc.name.clone()),
+                            (substituted_val, substituted_ty),
+                        );
                     }
                 }
+            }
             for method in &impl_decl.methods {
                 let mut method_func = method.clone();
 
@@ -3541,38 +3539,39 @@ impl<'ctx> CodeGen<'ctx> {
 
             // Trait associated constants & methods completeness validation and inheritance
             if let Some(ref tname) = decl.trait_name
-                && let Some(trait_def) = program.traits.iter().find(|t| t.name == *tname) {
-                    for tc in &trait_def.consts {
-                        if !decl.consts.iter().any(|ic| ic.name == tc.name) {
-                            if let Some(ref def_val) = tc.default_value {
-                                // Inherit trait's default constant
-                                self.associated_const_defs.insert(
-                                    (type_name.clone(), tc.name.clone()),
-                                    (def_val.clone(), tc.ty.clone()),
-                                );
-                            } else {
-                                return Err(CodegenError::with_span(
-                                    format!(
-                                        "missing associated constant '{}' in implementation of trait '{}' for '{}'",
-                                        tc.name, tname, type_name
-                                    ),
-                                    decl.span,
-                                ));
-                            }
-                        }
-                    }
-                    for tm in &trait_def.methods {
-                        if tm.body.is_none() && !decl.methods.iter().any(|im| im.name == tm.name) {
+                && let Some(trait_def) = program.traits.iter().find(|t| t.name == *tname)
+            {
+                for tc in &trait_def.consts {
+                    if !decl.consts.iter().any(|ic| ic.name == tc.name) {
+                        if let Some(ref def_val) = tc.default_value {
+                            // Inherit trait's default constant
+                            self.associated_const_defs.insert(
+                                (type_name.clone(), tc.name.clone()),
+                                (def_val.clone(), tc.ty.clone()),
+                            );
+                        } else {
                             return Err(CodegenError::with_span(
                                 format!(
-                                    "missing method '{}' in implementation of trait '{}' for '{}'",
-                                    tm.name, tname, type_name
+                                    "missing associated constant '{}' in implementation of trait '{}' for '{}'",
+                                    tc.name, tname, type_name
                                 ),
                                 decl.span,
                             ));
                         }
                     }
                 }
+                for tm in &trait_def.methods {
+                    if tm.body.is_none() && !decl.methods.iter().any(|im| im.name == tm.name) {
+                        return Err(CodegenError::with_span(
+                            format!(
+                                "missing method '{}' in implementation of trait '{}' for '{}'",
+                                tm.name, tname, type_name
+                            ),
+                            decl.span,
+                        ));
+                    }
+                }
+            }
 
             if !decl.type_params.is_empty() {
                 self.generic_impls

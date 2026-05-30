@@ -1,12 +1,16 @@
-use crate::ast::Program;
+use crate::ast::Type;
+use crate::ast::{Block, Expr, Pattern, Program, Stmt};
 use crate::lexer::Lexer;
 use crate::parser::Parser;
 use crate::token::{Span, Token};
 use lsp_server::{Connection, Message, Notification, Request, Response};
 use lsp_types::request::Completion;
+use lsp_types::request::SemanticTokensFullRequest;
 use lsp_types::{
     CompletionItem, CompletionItemKind, CompletionOptions, CompletionParams, CompletionResponse,
-    InsertTextFormat, TextEdit,
+    InsertTextFormat, SemanticToken, SemanticTokenModifier, SemanticTokenType, SemanticTokens,
+    SemanticTokensFullOptions, SemanticTokensLegend, SemanticTokensOptions, SemanticTokensResult,
+    SemanticTokensServerCapabilities, TextEdit,
 };
 use lsp_types::{
     Diagnostic, DiagnosticSeverity, GotoDefinitionParams, GotoDefinitionResponse, Hover,
@@ -16,6 +20,407 @@ use lsp_types::{
 };
 use std::collections::HashMap;
 use url::Url;
+
+// ---------------------------------------------------------------------------
+// Semantic Tokens
+// ---------------------------------------------------------------------------
+
+/// The semantic token types used by this server, in legend order.
+/// Index into this array = `token_type` field in delta-encoded tokens.
+const TOKEN_TYPES: &[SemanticTokenType] = &[
+    SemanticTokenType::FUNCTION,
+    SemanticTokenType::METHOD,
+    SemanticTokenType::STRUCT,
+    SemanticTokenType::ENUM,
+    SemanticTokenType::ENUM_MEMBER,
+    SemanticTokenType::new("trait"),
+    SemanticTokenType::new("typeAlias"),
+    SemanticTokenType::TYPE_PARAMETER,
+    SemanticTokenType::PARAMETER,
+    SemanticTokenType::VARIABLE,
+    SemanticTokenType::new("builtinType"),
+    SemanticTokenType::KEYWORD,
+    SemanticTokenType::STRING,
+    SemanticTokenType::NUMBER,
+    SemanticTokenType::new("boolean"),
+    SemanticTokenType::COMMENT,
+    SemanticTokenType::OPERATOR,
+];
+
+/// The semantic token modifiers used by this server, in legend order.
+/// Bit 0 = declaration, bit 1 = mutable, bit 2 = reference.
+const TOKEN_MODIFIERS: &[SemanticTokenModifier] = &[
+    SemanticTokenModifier::DECLARATION,
+    SemanticTokenModifier::new("mutable"),
+    SemanticTokenModifier::new("reference"),
+];
+
+// Type index constants (position in TOKEN_TYPES)
+const T_FUNCTION: u32 = 0;
+const T_METHOD: u32 = 1;
+const T_STRUCT: u32 = 2;
+const T_ENUM: u32 = 3;
+const T_ENUM_MEMBER: u32 = 4;
+const T_TRAIT: u32 = 5;
+const T_TYPE_ALIAS: u32 = 6;
+const T_TYPE_PARAMETER: u32 = 7;
+const T_PARAMETER: u32 = 8;
+const T_VARIABLE: u32 = 9;
+const T_BUILTIN_TYPE: u32 = 10;
+const T_KEYWORD: u32 = 11;
+const T_STRING: u32 = 12;
+const T_NUMBER: u32 = 13;
+const T_BOOLEAN: u32 = 14;
+#[allow(dead_code)]
+const T_COMMENT: u32 = 15;
+#[allow(dead_code)]
+const T_OPERATOR: u32 = 16;
+
+// Modifier bitmask constants (bit position in TOKEN_MODIFIERS)
+const M_DECLARATION: u32 = 1 << 0;
+const M_MUTABLE: u32 = 1 << 1;
+const M_REFERENCE: u32 = 1 << 2;
+
+/// A semantic map entry: (name, type_index, modifier_bitmask, scope_span).
+type SemanticMap = Vec<(String, u32, u32, Span)>;
+
+/// Walk a block's statements and collect let-binding variable names.
+fn walk_block_stmts(block: &Block, map: &mut SemanticMap) {
+    for stmt in &block.stmts {
+        if let Stmt::Let {
+            pattern,
+            is_mut,
+            span,
+            ..
+        } = stmt
+        {
+            let mods = if *is_mut { M_MUTABLE } else { 0 };
+            collect_pattern_bindings(pattern, mods, *span, map);
+        }
+    }
+    if let Some(tail) = &block.tail_expr {
+        walk_expr_for_lets(tail, map);
+    }
+}
+fn collect_pattern_bindings(pattern: &Pattern, mods: u32, span: Span, map: &mut SemanticMap) {
+    match pattern {
+        Pattern::Binding(name) => {
+            if name != "_" {
+                map.push((name.clone(), T_VARIABLE, mods, span));
+            }
+        }
+        Pattern::EnumVariant { payload, .. } => {
+            if let Some(p) = payload {
+                collect_pattern_bindings(p, mods, span, map);
+            }
+        }
+        Pattern::Wildcard | Pattern::IntLit(..) | Pattern::BoolLit(..) => {}
+    }
+}
+
+/// Walk expressions looking for nested blocks that may contain let bindings.
+fn walk_expr_for_lets(expr: &Expr, map: &mut SemanticMap) {
+    match expr {
+        Expr::Block(block, _) => {
+            walk_block_stmts(block, map);
+        }
+        Expr::If {
+            then_block,
+            else_ifs,
+            else_block,
+            ..
+        } => {
+            walk_block_stmts(then_block, map);
+            for (_, b) in else_ifs {
+                walk_block_stmts(b, map);
+            }
+            if let Some(b) = else_block {
+                walk_block_stmts(b, map);
+            }
+        }
+        Expr::Loop { body, .. } | Expr::While { body, .. } => {
+            walk_block_stmts(body, map);
+        }
+        Expr::For { body, .. } => {
+            walk_block_stmts(body, map);
+        }
+        Expr::Match { arms, .. } => {
+            for arm in arms {
+                walk_block_stmts(&arm.body, map);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Build the semantic map from a parsed Program AST.
+/// Returns entries of (name, type_index, modifier_bitmask, scope_span).
+fn build_semantic_map(program: &Program) -> SemanticMap {
+    let mut map = Vec::new();
+
+    // Functions
+    for func in &program.funcs {
+        let tag = if func.is_method { T_METHOD } else { T_FUNCTION };
+        let mut mods = M_DECLARATION;
+        if func.is_method && !func.params.is_empty() {
+            match &func.params[0].ty {
+                Type::SelfType => {} // no extra
+                Type::Ref { is_mut: false, .. } => mods |= M_REFERENCE,
+                Type::Ref { is_mut: true, .. } => mods |= M_REFERENCE | M_MUTABLE,
+                _ => {}
+            }
+        }
+        map.push((func.name.clone(), tag, mods, func.span));
+
+        for tp in &func.type_params {
+            map.push((tp.name.clone(), T_TYPE_PARAMETER, M_DECLARATION, func.span));
+        }
+
+        for param in &func.params {
+            let mut p_mods = M_DECLARATION;
+            match &param.ty {
+                Type::Ref { is_mut: false, .. } => p_mods |= M_REFERENCE,
+                Type::Ref { is_mut: true, .. } => p_mods |= M_REFERENCE | M_MUTABLE,
+                _ => {}
+            }
+            map.push((param.name.clone(), T_PARAMETER, p_mods, param.span));
+        }
+
+        walk_block_stmts(&func.body, &mut map);
+    }
+
+    // Structs
+    for s in &program.structs {
+        map.push((s.name.clone(), T_STRUCT, M_DECLARATION, s.span));
+        for tp in &s.type_params {
+            map.push((tp.name.clone(), T_TYPE_PARAMETER, M_DECLARATION, s.span));
+        }
+    }
+
+    // Enums
+    for e in &program.enums {
+        map.push((e.name.clone(), T_ENUM, M_DECLARATION, e.span));
+        for tp in &e.type_params {
+            map.push((tp.name.clone(), T_TYPE_PARAMETER, M_DECLARATION, e.span));
+        }
+        for variant in &e.variants {
+            map.push((variant.name.clone(), T_ENUM_MEMBER, M_DECLARATION, e.span));
+        }
+    }
+
+    // Traits
+    for t in &program.traits {
+        map.push((t.name.clone(), T_TRAIT, M_DECLARATION, t.span));
+        for tp in &t.type_params {
+            map.push((tp.name.clone(), T_TYPE_PARAMETER, M_DECLARATION, t.span));
+        }
+    }
+
+    // Type aliases
+    for a in &program.type_aliases {
+        map.push((a.name.clone(), T_TYPE_ALIAS, M_DECLARATION, a.span));
+        for tp in &a.type_params {
+            map.push((tp.name.clone(), T_TYPE_PARAMETER, M_DECLARATION, a.span));
+        }
+    }
+
+    map
+}
+
+/// Look up a name in the semantic map, checking if the token's span falls
+/// within the entry's scope_span. Returns (type_index, modifier_bitmask) if found.
+fn lookup_semantic_map(name: &str, token_span: &Span, map: &SemanticMap) -> Option<(u32, u32)> {
+    // Iterate in reverse so that inner scopes shadow outer ones.
+    for entry in map.iter().rev() {
+        if entry.0 == name && token_span.lo >= entry.3.lo && token_span.hi <= entry.3.hi {
+            return Some((entry.1, entry.2));
+        }
+    }
+    None
+}
+
+/// Collect semantic tokens by walking the token stream and resolving identifiers
+/// against the semantic map. Returns delta-encoded SemanticTokens.
+fn collect_semantic_tokens(
+    tokens: &[(Token, Span)],
+    source: &str,
+    semantic_map: &SemanticMap,
+) -> Vec<SemanticToken> {
+    // Absolute-positioned tokens: (line, col, length, type_idx, modifiers)
+    let mut raw: Vec<(u32, u32, u32, u32, u32)> = Vec::new();
+
+    for (token, span) in tokens {
+        match token {
+            Token::Ident(name) => {
+                if let Some((type_idx, mods)) = lookup_semantic_map(name, span, semantic_map) {
+                    let pos = offset_to_position(source, span.lo);
+                    raw.push((
+                        pos.line,
+                        pos.character,
+                        (span.hi - span.lo) as u32,
+                        type_idx,
+                        mods,
+                    ));
+                }
+            }
+            Token::Fn
+            | Token::Let
+            | Token::Mut
+            | Token::Const
+            | Token::If
+            | Token::Else
+            | Token::Loop
+            | Token::While
+            | Token::Return
+            | Token::Continue
+            | Token::Break
+            | Token::Mod
+            | Token::As
+            | Token::Use
+            | Token::Extern
+            | Token::Pub
+            | Token::Struct
+            | Token::Enum
+            | Token::Impl
+            | Token::Trait
+            | Token::Type
+            | Token::For
+            | Token::In
+            | Token::Self_
+            | Token::SelfType
+            | Token::Underscore
+            | Token::Match => {
+                let pos = offset_to_position(source, span.lo);
+                raw.push((
+                    pos.line,
+                    pos.character,
+                    (span.hi - span.lo) as u32,
+                    T_KEYWORD,
+                    0,
+                ));
+            }
+            Token::StrLit(_) => {
+                let pos = offset_to_position(source, span.lo);
+                raw.push((
+                    pos.line,
+                    pos.character,
+                    (span.hi - span.lo) as u32,
+                    T_STRING,
+                    0,
+                ));
+            }
+            Token::IntLit(_)
+            | Token::FloatLit(_)
+            | Token::IntSuffixLit(..)
+            | Token::FloatSuffixLit(..) => {
+                let pos = offset_to_position(source, span.lo);
+                raw.push((
+                    pos.line,
+                    pos.character,
+                    (span.hi - span.lo) as u32,
+                    T_NUMBER,
+                    0,
+                ));
+            }
+            Token::True | Token::False => {
+                let pos = offset_to_position(source, span.lo);
+                raw.push((
+                    pos.line,
+                    pos.character,
+                    (span.hi - span.lo) as u32,
+                    T_BOOLEAN,
+                    0,
+                ));
+            }
+            Token::I8
+            | Token::I16
+            | Token::I32
+            | Token::I64
+            | Token::U8
+            | Token::U16
+            | Token::U32
+            | Token::U64
+            | Token::Usize
+            | Token::Isize
+            | Token::F32
+            | Token::F64
+            | Token::Bool
+            | Token::Str => {
+                let pos = offset_to_position(source, span.lo);
+                raw.push((
+                    pos.line,
+                    pos.character,
+                    (span.hi - span.lo) as u32,
+                    T_BUILTIN_TYPE,
+                    0,
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    // Sort by (line, col)
+    raw.sort_by_key(|&(l, c, _, _, _)| (l, c));
+
+    // Delta-encode
+    let mut result = Vec::with_capacity(raw.len());
+    let mut prev_line = 0u32;
+    let mut prev_col = 0u32;
+
+    for (line, col, len, type_idx, mods) in raw {
+        let delta_line = line - prev_line;
+        let delta_start = if delta_line == 0 { col - prev_col } else { col };
+        result.push(SemanticToken {
+            delta_line,
+            delta_start,
+            length: len,
+            token_type: type_idx,
+            token_modifiers_bitset: mods,
+        });
+        prev_line = line;
+        prev_col = col;
+    }
+
+    result
+}
+
+/// Handle a `textDocument/semanticTokens/full` request.
+fn handle_semantic_tokens(
+    documents: &HashMap<Url, DocumentState>,
+    params: lsp_types::SemanticTokensParams,
+) -> Option<SemanticTokensResult> {
+    let url = Url::parse(params.text_document.uri.as_str()).ok()?;
+    let doc = documents.get(&url)?;
+
+    let source = &doc.source;
+
+    // Lex
+    let mut lexer = Lexer::new(source);
+    let mut tokens = Vec::new();
+    loop {
+        match lexer.next_token() {
+            Ok((token, span)) => {
+                let is_eof = matches!(token, Token::Eof);
+                tokens.push((token, span));
+                if is_eof {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+
+    let semantic_map = match &doc.last_valid_program {
+        Some(prog) => build_semantic_map(prog),
+        None => Vec::new(),
+    };
+
+    let data = collect_semantic_tokens(&tokens, source, &semantic_map);
+    Some(SemanticTokensResult::Tokens(SemanticTokens {
+        result_id: None,
+        data,
+    }))
+}
 
 struct DocumentState {
     source: String,
@@ -2800,6 +3205,14 @@ fn main_loop(
                             .sender
                             .send(Message::Response(Response::new_ok(id, result)))?;
                     }
+                    "textDocument/semanticTokens/full" => {
+                        let (id, params) = cast_request::<SemanticTokensFullRequest>(req)?;
+                        let response = handle_semantic_tokens(&documents, params);
+                        let result = serde_json::to_value(&response)?;
+                        connection
+                            .sender
+                            .send(Message::Response(Response::new_ok(id, result)))?;
+                    }
                     _ => {}
                 }
             }
@@ -2854,6 +3267,17 @@ pub fn run_server() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             all_commit_characters: None,
             completion_item: None,
         }),
+        semantic_tokens_provider: Some(SemanticTokensServerCapabilities::SemanticTokensOptions(
+            SemanticTokensOptions {
+                legend: SemanticTokensLegend {
+                    token_types: TOKEN_TYPES.to_vec(),
+                    token_modifiers: TOKEN_MODIFIERS.to_vec(),
+                },
+                range: None,
+                full: Some(SemanticTokensFullOptions::Bool(true)),
+                work_done_progress_options: Default::default(),
+            },
+        )),
         ..Default::default()
     })?;
 
@@ -4340,6 +4764,104 @@ mod tests {
             assert_eq!(location.range.start, def_start);
         } else {
             panic!("Expected Scalar response for inherited trait const definition");
+        }
+    }
+
+    #[test]
+    fn test_semantic_tokens_basic() {
+        // Parse a small program that uses multiple semantic token types
+        let src = r#"
+            struct Point {
+                x: i32,
+                y: i32,
+            }
+
+            fn add(a: i32, b: i32) -> i32 {
+                let result = a + b;
+                result
+            }
+
+            enum Option<T> {
+                Some(T),
+                None,
+            }
+        "#;
+
+        // Lex
+        let mut lexer = Lexer::new(src);
+        let mut tokens = Vec::new();
+        loop {
+            let (t, s) = lexer.next_token().unwrap();
+            tokens.push((t, s));
+            if tokens.last().unwrap().0 == Token::Eof {
+                break;
+            }
+        }
+
+        // Parse
+        let mut parser = Parser::new(&tokens);
+        let prog = parser.parse_program().unwrap();
+
+        // Build semantic map
+        let map = build_semantic_map(&prog);
+
+        // Verify semantic map entries
+        // Struct: Point
+        assert!(map.iter().any(|(name, ty, mods, _)| {
+            name == "Point" && *ty == T_STRUCT && *mods == M_DECLARATION
+        }));
+
+        // Function: add (not a method)
+        assert!(map.iter().any(|(name, ty, mods, _)| {
+            name == "add" && *ty == T_FUNCTION && *mods == M_DECLARATION
+        }));
+
+        // Parameters: a, b
+        assert!(map.iter().any(|(name, ty, _, _)| {
+            name == "a" && *ty == T_PARAMETER
+        }));
+        assert!(map.iter().any(|(name, ty, _, _)| {
+            name == "b" && *ty == T_PARAMETER
+        }));
+
+        // Type parameters: T
+        assert!(map.iter().any(|(name, ty, mods, _)| {
+            name == "T" && *ty == T_TYPE_PARAMETER && *mods == M_DECLARATION
+        }));
+
+        // Enum: Option
+        assert!(map.iter().any(|(name, ty, mods, _)| {
+            name == "Option" && *ty == T_ENUM && *mods == M_DECLARATION
+        }));
+
+        // Enum variant: Some
+        assert!(map.iter().any(|(name, ty, mods, _)| {
+            name == "Some" && *ty == T_ENUM_MEMBER && *mods == M_DECLARATION
+        }));
+
+        // Enum variant: None
+        assert!(map.iter().any(|(name, ty, mods, _)| {
+            name == "None" && *ty == T_ENUM_MEMBER && *mods == M_DECLARATION
+        }));
+
+        // Local variable: result
+        assert!(map.iter().any(|(name, ty, mods, _)| {
+            name == "result" && *ty == T_VARIABLE && *mods == 0
+        }));
+
+        // Collect semantic tokens
+        let tokens_data = collect_semantic_tokens(&tokens, src, &map);
+
+        // Verify we got some tokens
+        assert!(!tokens_data.is_empty(), "expected at least one semantic token");
+
+        // Verify delta encoding is valid: first token's delta_line should be 0
+        // (line 0), delta_start should be >= 0
+        // Just check the data is well-formed
+        for token in &tokens_data {
+            // All fields should be valid
+            assert!(token.token_type < TOKEN_TYPES.len() as u32,
+                    "token type {} out of range", token.token_type);
         }
     }
 }

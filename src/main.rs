@@ -1100,6 +1100,7 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
                             let impl_type_name = match &decl.impl_type {
                                 Type::Struct(name) => name.clone(),
                                 Type::GenericInstance(name, _) => name.clone(),
+                                Type::Str => continue, // handled below
                                 _ => continue,
                             };
                             if impl_type_name == *target_name {
@@ -1116,6 +1117,13 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
                                 }
                                 all_impls.push(new_decl);
                             }
+                        }
+                        // Also import non-struct impls (e.g., impl str, impl [T]) from same module
+                        for decl in &stdlib_prog.impls {
+                            if matches!(&decl.impl_type, Type::Struct(_) | Type::GenericInstance(_, _)) {
+                                continue; // already handled above
+                            }
+                            all_impls.push(decl.clone());
                         }
                         // Import extern "C" declarations from the same module
                         for func in &module_funcs {

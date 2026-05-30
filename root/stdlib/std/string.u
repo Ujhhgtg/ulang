@@ -76,3 +76,15 @@ impl String {
         self.vec = v;
     }
 }
+
+impl str {
+    pub fn to_string(&self) -> String {
+        let len = self.1;
+        let mut s = String::with_capacity(len);
+        let v = s.vec;
+        memcpy(v.ptr, self.0, len);
+        v.len = len;
+        s.vec = v;
+        s
+    }
+}

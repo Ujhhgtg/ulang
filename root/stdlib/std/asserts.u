@@ -1,0 +1,7 @@
+use std::panic::panic;
+
+pub fn assert(cond: bool) {
+    if !cond {
+        panic("assertion failed");
+    };
+}

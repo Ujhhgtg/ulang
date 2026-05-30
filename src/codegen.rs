@@ -516,6 +516,7 @@ impl<'ctx> CodeGen<'ctx> {
             Type::Isize => Some("isize"),
             Type::F32 => Some("f32"),
             Type::F64 => Some("f64"),
+            Type::Str => Some("str"),
             _ => None,
         }
     }
@@ -1062,6 +1063,11 @@ impl<'ctx> CodeGen<'ctx> {
             | Type::Isize
             | Type::F32
             | Type::F64 => true,
+            Type::Str => self
+                .trait_impls
+                .get("str")
+                .map(|traits| traits.contains(trait_name))
+                .unwrap_or(false),
             Type::Struct(name) => self
                 .trait_impls
                 .get(name)
@@ -3372,9 +3378,10 @@ impl<'ctx> CodeGen<'ctx> {
                     self.slice_impls.push(decl.clone());
                     continue;
                 }
+                Type::Str => "str".to_string(),
                 _ => {
                     return Err(format!(
-                        "impl target must be a struct type or Self, got {:?}",
+                        "impl target must be a struct type, str, or Self, got {:?}",
                         decl.impl_type
                     )
                     .into());
@@ -3402,7 +3409,7 @@ impl<'ctx> CodeGen<'ctx> {
                 };
                 let mut method_func = method.clone();
                 method_func.name = mangled_name.clone();
-                let self_type = Type::Struct(type_name.clone());
+                let self_type = if type_name == "str" { Type::Str } else { Type::Struct(type_name.clone()) };
                 Self::resolve_self_type(&mut method_func, &self_type);
                 self.declare_function(&method_func)?;
                 self.impl_methods
@@ -3438,7 +3445,7 @@ impl<'ctx> CodeGen<'ctx> {
                             .push(method_func);
                         continue;
                     }
-                    let self_type = Type::Struct(type_name.clone());
+                    let self_type = if type_name == "str" { Type::Str } else { Type::Struct(type_name.clone()) };
                     Self::resolve_self_type(&mut method_func, &self_type);
                     self.declare_function(&method_func)?;
                     self.impl_methods
@@ -3566,9 +3573,11 @@ impl<'ctx> CodeGen<'ctx> {
             let type_name = match &decl.impl_type {
                 Type::Struct(name) => name.clone(),
                 Type::SelfType => "Self".to_string(),
+                Type::Str => "str".to_string(),
                 _ => continue,
             };
-            let self_type = Type::Struct(type_name.clone());
+            let self_type = if type_name == "str" { Type::Str } else { Type::Struct(type_name.clone()) };
+            
             for method in &decl.methods {
                 if Self::has_impl_trait_param(method) {
                     continue;
@@ -6393,13 +6402,12 @@ impl<'ctx> CodeGen<'ctx> {
                     } else {
                         Some(type_args.as_slice())
                     };
-                    if let Some(gen_func) = self.generic_funcs.get(callee).cloned() {
-                        if let Ok(mangled) =
+                    if let Some(gen_func) = self.generic_funcs.get(callee).cloned()
+                        && let Ok(mangled) =
                             self.monomorphize_generic_function(&gen_func, args, explicit_type_args)
                         {
                             resolved_fn_val = self.module.get_function(&mangled);
                         }
-                    }
                 }
 
                 let fn_val = resolved_fn_val.ok_or_else(|| {
@@ -6992,6 +7000,7 @@ impl<'ctx> CodeGen<'ctx> {
                         Type::Isize => ("isize".to_string(), true),
                         Type::F32 => ("f32".to_string(), true),
                         Type::F64 => ("f64".to_string(), true),
+                        Type::Str => ("str".to_string(), true),
                         _ => {
                             return Err(CodegenError::with_span(
                                 format!(
@@ -7015,6 +7024,7 @@ impl<'ctx> CodeGen<'ctx> {
                     Type::Isize => ("isize".to_string(), false),
                     Type::F32 => ("f32".to_string(), false),
                     Type::F64 => ("f64".to_string(), false),
+                    Type::Str => ("str".to_string(), false),
                     _ => {
                         return Err(CodegenError::with_span(
                             format!(
@@ -7067,126 +7077,147 @@ impl<'ctx> CodeGen<'ctx> {
                     ))
                 })?;
 
-                // Compile receiver as first arg (pass pointer for &self)
+                // Compile receiver as first arg (pass pointer for &self, or value for fat pointers)
                 let receiver_val = self.compile_expr(receiver)?;
-                let receiver_ptr = match receiver_val {
-                    BasicValueEnum::PointerValue(p) => p,
-                    _ => {
-                        if let Expr::Ident(name, ..) = receiver.as_ref() {
-                            if let Some((ptr, _, _)) = self.symbols.get(name) {
-                                *ptr
+                let is_fat_ptr_receiver = self.fn_param_types.get(&mangled).is_some_and(|param_tys| {
+                    param_tys.first().is_some_and(|ty| matches!(ty, Type::Ref { inner, .. } if matches!(inner.as_ref(), Type::Str | Type::Slice { .. })))
+                });
+                let receiver_ptr: PointerValue = if is_fat_ptr_receiver {
+                    // Fat pointers (e.g., &str, &[T]) are passed as struct values.
+                    // We still need a pointer for the all_args vec, but we'll handle this below.
+                    // Store the fat pointer value to an alloca and pass its pointer.
+                    let alloca = self
+                        .builder
+                        .build_alloca(receiver_val.get_type(), "method_self")
+                        .map_err(|e| format!("failed to build alloca for method receiver: {}", e))?;
+                    self.builder
+                        .build_store(alloca, receiver_val)
+                        .map_err(|e| format!("failed to store receiver for method call: {}", e))?;
+                    alloca
+                } else {
+                    match receiver_val {
+                        BasicValueEnum::PointerValue(p) => p,
+                        _ => {
+                            if let Expr::Ident(name, ..) = receiver.as_ref() {
+                                if let Some((ptr, _, _)) = self.symbols.get(name) {
+                                    *ptr
+                                } else {
+                                    return Err(CodegenError::with_span(
+                                        format!("undefined variable '{}'", name),
+                                        expr.span(),
+                                    ));
+                                }
                             } else {
-                                return Err(CodegenError::with_span(
-                                    format!("undefined variable '{}'", name),
-                                    expr.span(),
-                                ));
-                            }
-                        } else {
-                            if let Expr::Member {
-                                expr: member_expr,
-                                index: _,
-                                field: Some(field_name),
-                                ..
-                            } = receiver.as_ref()
-                            {
-                                let parent_ty = self.expr_type(member_expr);
-                                if let Type::Ref { inner, .. } = &parent_ty {
-                                    match inner.as_ref() {
-                                        Type::Struct(_) | Type::GenericInstance(_, _) => {
-                                            let struct_name = match inner.as_ref() {
-                                                Type::Struct(name) => name.clone(),
-                                                Type::GenericInstance(name, args) => {
-                                                    Self::mangle_generic_instance(name, args)
-                                                }
-                                                _ => unreachable!(),
-                                            };
-                                            let fields =
-                                                self.struct_fields.get(&struct_name).ok_or_else(
-                                                    || format!("unknown struct '{}'", struct_name),
-                                                )?;
-                                            let idx = fields
-                                                .iter()
-                                                .position(|f| f.name == *field_name)
-                                                .ok_or_else(|| {
-                                                    format!(
-                                                        "struct '{}' has no field '{}'",
-                                                        struct_name, field_name
-                                                    )
-                                                })?;
-                                            let llvm_ty = self.type_to_llvm(inner);
-                                            let member_ptr = self.compile_expr(member_expr)?;
-                                            let base_ptr = match member_ptr {
-                                                BasicValueEnum::PointerValue(p) => p,
-                                                ptr_val => {
-                                                    let a = self
-                                                        .builder
-                                                        .build_alloca(
-                                                            ptr_val.get_type(),
-                                                            "ref_base",
-                                                        )
-                                                        .map_err(|e| {
-                                                            format!("failed to build alloca: {}", e)
-                                                        })?;
-                                                    self.builder.build_store(a, ptr_val).map_err(
-                                                        |e| format!("failed to store: {}", e),
+                                if let Expr::Member {
+                                    expr: member_expr,
+                                    index: _,
+                                    field: Some(field_name),
+                                    ..
+                                } = receiver.as_ref()
+                                {
+                                    let parent_ty = self.expr_type(member_expr);
+                                    if let Type::Ref { inner, .. } = &parent_ty {
+                                        match inner.as_ref() {
+                                            Type::Struct(_) | Type::GenericInstance(_, _) => {
+                                                let struct_name = match inner.as_ref() {
+                                                    Type::Struct(name) => name.clone(),
+                                                    Type::GenericInstance(name, args) => {
+                                                        Self::mangle_generic_instance(name, args)
+                                                    }
+                                                    _ => unreachable!(),
+                                                };
+                                                let fields =
+                                                    self.struct_fields.get(&struct_name).ok_or_else(
+                                                        || format!("unknown struct '{}'", struct_name),
                                                     )?;
-                                                    a
-                                                }
-                                            };
-                                            let field_ptr = self
-                                                .builder
-                                                .build_struct_gep(
-                                                    llvm_ty,
-                                                    base_ptr,
-                                                    idx as u32,
-                                                    "field_ptr",
-                                                )
-                                                .map_err(|e| {
-                                                    format!(
-                                                        "failed to build struct GEP for field '{}': {}",
-                                                        field_name, e
+                                                let idx = fields
+                                                    .iter()
+                                                    .position(|f| f.name == *field_name)
+                                                    .ok_or_else(|| {
+                                                        format!(
+                                                            "struct '{}' has no field '{}'",
+                                                            struct_name, field_name
+                                                        )
+                                                    })?;
+                                                let llvm_ty = self.type_to_llvm(inner);
+                                                let member_ptr = self.compile_expr(member_expr)?;
+                                                let base_ptr = match member_ptr {
+                                                    BasicValueEnum::PointerValue(p) => p,
+                                                    ptr_val => {
+                                                        let a = self
+                                                            .builder
+                                                            .build_alloca(
+                                                                ptr_val.get_type(),
+                                                                "ref_base",
+                                                            )
+                                                            .map_err(|e| {
+                                                                format!("failed to build alloca: {}", e)
+                                                            })?;
+                                                        self.builder.build_store(a, ptr_val).map_err(
+                                                            |e| format!("failed to store: {}", e),
+                                                        )?;
+                                                        a
+                                                    }
+                                                };
+                                                let field_ptr = self
+                                                    .builder
+                                                    .build_struct_gep(
+                                                        llvm_ty,
+                                                        base_ptr,
+                                                        idx as u32,
+                                                        "field_ptr",
                                                     )
-                                                })?;
+                                                    .map_err(|e| {
+                                                        format!(
+                                                            "failed to build struct GEP for field '{}': {}",
+                                                            field_name, e
+                                                        )
+                                                    })?;
 
-                                            let mut all_args = vec![field_ptr.into()];
-                                            for arg in args {
-                                                let val = self.compile_expr(arg)?;
-                                                all_args.push(val.into());
+                                                let mut all_args = vec![field_ptr.into()];
+                                                for arg in args {
+                                                    let val = self.compile_expr(arg)?;
+                                                    all_args.push(val.into());
+                                                }
+                                                let result = self
+                                                    .builder
+                                                    .build_call(fn_val, &all_args, "method_call")
+                                                    .map_err(|e| {
+                                                        format!(
+                                                            "failed to build method call '{}': {}",
+                                                            method, e
+                                                        )
+                                                    })?;
+                                                return Ok(self.try_extract_result(result));
                                             }
-                                            let result = self
-                                                .builder
-                                                .build_call(fn_val, &all_args, "method_call")
-                                                .map_err(|e| {
-                                                    format!(
-                                                        "failed to build method call '{}': {}",
-                                                        method, e
-                                                    )
-                                                })?;
-                                            return Ok(self.try_extract_result(result));
+                                            _ => {}
                                         }
-                                        _ => {}
                                     }
                                 }
-                            }
 
-                            // If receiver is a value, store to alloca and pass pointer
-                            let alloca = self
-                                .builder
-                                .build_alloca(receiver_val.get_type(), "method_self")
-                                .map_err(|e| {
-                                    format!("failed to build alloca for method receiver: {}", e)
-                                })?;
-                            self.builder
-                                .build_store(alloca, receiver_val)
-                                .map_err(|e| {
-                                    format!("failed to store receiver for method call: {}", e)
-                                })?;
-                            alloca
+                                // If receiver is a value, store to alloca and pass pointer
+                                let alloca = self
+                                    .builder
+                                    .build_alloca(receiver_val.get_type(), "method_self")
+                                    .map_err(|e| {
+                                        format!("failed to build alloca for method receiver: {}", e)
+                                    })?;
+                                self.builder
+                                    .build_store(alloca, receiver_val)
+                                    .map_err(|e| {
+                                        format!("failed to store receiver for method call: {}", e)
+                                    })?;
+                                alloca
+                            }
                         }
                     }
                 };
 
-                let mut all_args = vec![receiver_ptr.into()];
+                let mut all_args: Vec<BasicMetadataValueEnum> = if is_fat_ptr_receiver {
+                    vec![receiver_val.into()]
+                } else {
+                    vec![receiver_ptr.into()]
+                };
                 for (i, arg) in args.iter().enumerate() {
                     let val = self.compile_expr(arg)?;
                     all_args.push(val.into());

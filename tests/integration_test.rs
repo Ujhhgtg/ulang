@@ -597,6 +597,14 @@ fn test_print_str_utf8() {
 }
 
 #[test]
+fn test_str_to_string() {
+    assert!(run_test(
+        "str_to_string",
+        "use std::string::String;\nfn main() -> i32 { let s = \"hello, world\".to_string(); let len = s.len(); if len != 12 { return 1; }; 0 }\n"
+    ));
+}
+
+#[test]
 fn test_panic_str() {
     assert!(run_test_expect_error(
         "panic_str",

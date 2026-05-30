@@ -1,5 +1,6 @@
 // Direct std modules
 pub mod alloc;
+pub mod asserts;
 pub mod io;
 pub mod libc;
 pub mod panic;

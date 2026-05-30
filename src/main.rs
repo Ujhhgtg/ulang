@@ -1099,6 +1099,7 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
                         for decl in &stdlib_prog.impls {
                             let impl_type_name = match &decl.impl_type {
                                 Type::Struct(name) => name.clone(),
+                                Type::GenericInstance(name, _) => name.clone(),
                                 _ => continue,
                             };
                             if impl_type_name == *target_name {
@@ -1108,7 +1109,11 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
                                 } else {
                                     format!("{}{}", prefix, impl_type_name)
                                 };
-                                new_decl.impl_type = Type::Struct(new_name);
+                                match &mut new_decl.impl_type {
+                                    Type::Struct(name) => *name = new_name,
+                                    Type::GenericInstance(name, _) => *name = new_name,
+                                    _ => {}
+                                }
                                 all_impls.push(new_decl);
                             }
                         }

@@ -1216,8 +1216,6 @@ fn test_vec_iter() {
         "vec_iter",
         r#"
         use std::vec::Vec;
-        use std::iter::IntoIterator;
-        use std::iter::Iterator;
         use std::option::Option;
         use std::io::print;
 
@@ -1252,8 +1250,6 @@ fn test_vec_iter_mut() {
         "vec_iter_mut",
         r#"
         use std::vec::Vec;
-        use std::iter::IntoIteratorMut;
-        use std::iter::Iterator;
         use std::option::Option;
         use std::io::print;
 
@@ -1313,8 +1309,6 @@ fn test_for_loop_vec() {
         "for_loop_vec",
         r#"
         use std::vec::Vec;
-        use std::iter::IntoIterator;
-        use std::iter::Iterator;
         use std::io::print;
 
         fn main() {
@@ -1906,12 +1900,6 @@ fn test_vec_as_slice() {
         "vec_as_slice",
         r#"
         use std::vec::Vec;
-        use std::option::Option;
-        use std::iter::IntoIterator;
-        use std::iter::IntoIteratorMut;
-        use std::iter::Iterator;
-        use std::iter::Iter;
-        use std::iter::IterMut;
 
         fn main() -> i32 {
             let mut v: Vec<i32> = Vec::new();
@@ -1937,12 +1925,6 @@ fn test_vec_as_mut_slice() {
         "vec_as_mut_slice",
         r#"
         use std::vec::Vec;
-        use std::option::Option;
-        use std::iter::IntoIterator;
-        use std::iter::IntoIteratorMut;
-        use std::iter::Iterator;
-        use std::iter::Iter;
-        use std::iter::IterMut;
 
         fn main() -> i32 {
             let mut v: Vec<i32> = Vec::new();

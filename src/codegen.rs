@@ -1,3 +1,29 @@
+//! LLVM IR generation for the ulang compiler.
+//!
+//! This module implements the code generation pipeline that lowers ulang's AST
+//! into LLVM IR. The pipeline proceeds through several phases within
+//! [`CodeGen::compile_module`]: type registration, generic monomorphization,
+//! trait dispatch setup, and function body compilation.
+//!
+//! # Two Modes
+//! - **JIT mode** ([`CodeGen::new_jit`]): Creates an `ExecutionEngine` for
+//!   in-memory JIT compilation. Used by the REPL and evaluator.
+//! - **Native mode** ([`CodeGen::new_native`]): No execution engine; produces
+//!   an LLVM module for native code generation (`.o` files -> executable).
+//!
+//! # Architecture
+//! - **Generics monomorphization**: Generic structs, enums, and functions are
+//!   instantiated on demand by substituting concrete type parameters and
+//!   generating mangled names (`BaseName__Arg1_Arg2_...`).
+//! - **Trait dispatch**: Traits are implemented via direct dispatch through
+//!   builtin functions (`__trait_TraitName_method_TypeName`). Operators are
+//!   compiled as trait method calls (`Add::add`, `Eq::eq`, etc.).
+//! - **Enums as tagged unions**: Enums are lowered to LLVM structs with an
+//!   `__tag` field (i8) followed by variant payloads. Pattern matching uses
+//!   tag extraction + integer comparison.
+//! - **Move semantics**: Variables are tracked via `moved_vars`; by-value
+//!   moves mark the source as moved. `scope_stack` tracks declaration order
+//!   for correct drop emission.
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -27,12 +53,30 @@ use crate::token::Span;
 type OverloadMap = HashMap<String, Vec<(String, Vec<Type>)>>;
 
 /// Error type for codegen operations, carrying an optional source span.
+///
+/// Used throughout the codegen pipeline to report errors with or without
+/// source location information. The [`msg`] field holds a human-readable
+/// description. [`span`] carries the source span from the AST node that
+/// caused the error, enabling the diagnostic system to report precise
+/// locations.
+///
+/// Conversions from `String` and `&str` are provided for convenience,
+/// producing errors without a span. Use [`CodegenError::with_span`] when
+/// source location is available.
 #[derive(Debug)]
 pub struct CodegenError {
     pub msg: String,
     pub span: Option<Span>,
 }
 
+/// A compile-time constant value evaluated during codegen.
+///
+/// Used for `const` declarations and `const` generic parameters. The three
+/// variants mirror the primitive literal types supported at compile time.
+///
+/// - [`Int(i64)`](ConstValue::Int): Integer literals and arithmetic results.
+/// - [`Float(f64)`](ConstValue::Float): Floating-point literals and results.
+/// - [`Bool(bool)`](ConstValue::Bool): Boolean literals and logical results.
 #[derive(Debug, Clone)]
 pub enum ConstValue {
     Int(i64),
@@ -77,86 +121,128 @@ impl fmt::Display for CodegenError {
 type MainFunc = unsafe extern "C" fn() -> i32;
 
 pub struct CodeGen<'ctx> {
+    /// The LLVM `Context` that owns all LLVM objects in this compilation.
     context: &'ctx Context,
+    /// The LLVM `Module` being built; contains all functions, globals, and types.
     module: Module<'ctx>,
+    /// LLVM IR builder for constructing instructions at the current insertion point.
     builder: Builder<'ctx>,
+    /// Optional JIT execution engine. Present in JIT mode; `None` in native mode.
     execution_engine: Option<ExecutionEngine<'ctx>>,
+    /// Cached LLVM `i32` type.
     i32_type: IntType<'ctx>,
+    /// Cached LLVM `i8` type.
     i8_type: IntType<'ctx>,
+    /// Cached LLVM `i16` type.
     i16_type: IntType<'ctx>,
+    /// Cached LLVM `i64` type.
     i64_type: IntType<'ctx>,
+    /// Cached LLVM `i1` (boolean) type.
     bool_type: IntType<'ctx>,
+    /// Cached LLVM `f32` type.
     f32_type: FloatType<'ctx>,
+    /// Cached LLVM `f64` type.
     f64_type: FloatType<'ctx>,
+    /// Integer type matching pointer width (i64 on 64-bit platforms), used for pointer arithmetic.
     ptr_int_type: IntType<'ctx>,
+    /// Variable bindings: name -> (alloca_ptr, is_mutable, declared_type).
     symbols: HashMap<String, (PointerValue<'ctx>, bool, Type)>,
+    /// Compile-time constants evaluated from `const` declarations.
     consts: HashMap<String, (ConstValue, Type)>,
+    /// Associated constant definitions from trait impls: (type_name, const_name) -> (expr, type).
     associated_const_defs: HashMap<(String, String), (Expr, Type)>,
+    /// Evaluated associated constant values, lazily computed and cached.
     associated_const_values: RefCell<HashMap<(String, String), ConstValue>>,
+    /// Function overloading map: function name -> Vec<(mangled_name, param_types)>.
     pub overloads: OverloadMap,
+    /// Optimization level for LLVM passes.
     opt_level: OptimizationLevel,
+    /// Source code text (used for error messages and debug info).
     pub source: String,
+    /// File path of the source being compiled.
     pub path: String,
+    /// Field definitions for each struct/enum type: type_name -> Vec<StructField>.
     struct_fields: HashMap<String, Vec<StructField>>,
-    // Maps type_name -> LLVM struct type
+    /// Maps type_name -> LLVM struct type (opaque until body is set).
     struct_types: HashMap<String, inkwell::types::StructType<'ctx>>,
-    // Maps type_name -> Vec<(method_name, mangled_fn_name)>
+    /// Maps type_name -> Vec<(method_name, mangled_fn_name)> for inherent and trait impls.
     impl_methods: HashMap<String, Vec<(String, String)>>,
-    // Maps type_name -> set of trait names implemented
+    /// Maps type_name -> set of trait names implemented.
     trait_impls: HashMap<String, HashSet<String>>,
-    // Maps function name -> declared return type
+    /// Maps function name -> declared return type.
     fn_return_types: HashMap<String, Type>,
-    // Maps function name -> declared parameter types
+    /// Maps function name -> declared parameter types.
     fn_param_types: HashMap<String, Vec<Type>>,
-    // Generic struct definitions: base name -> StructDecl
+    /// Generic struct definitions: base name -> StructDecl (stored for on-demand monomorphization).
     generic_struct_defs: HashMap<String, StructDecl>,
-    // Generic enum definitions: base name -> EnumDecl
+    /// Generic enum definitions: base name -> EnumDecl (stored for on-demand monomorphization).
     generic_enum_defs: HashMap<String, EnumDecl>,
-    // Enum definitions: name -> EnumDecl
+    /// Concrete enum definitions: name -> EnumDecl.
     enum_defs: HashMap<String, EnumDecl>,
-    // Generic impl blocks: base name -> Vec<(type_params, ImplDecl)>
+    /// Generic impl blocks: base name -> Vec<(type_params, ImplDecl)>.
     generic_impls: HashMap<String, Vec<(Vec<GenericParam>, ImplDecl)>>,
-    // Trait definitions: name -> TraitDecl
+    /// Trait definitions: name -> TraitDecl.
     trait_defs: HashMap<String, TraitDecl>,
-    // Set of already-monomorphized concrete instance names
+    /// Set of already-monomorphized concrete instance names (prevents re-monomorphization).
     monomorphized: HashSet<String>,
-    // Current monomorphization context: (base_name, mangled_name)
+    /// Current monomorphization context: (base_name, mangled_name) when inside a monomorphization.
     current_monomorphization: Option<(String, String)>,
-    // Maps base_name -> mangled_name for all monomorphized instances
+    /// Maps base_name -> mangled_name for all monomorphized instances.
     monomorphized_names: HashMap<String, String>,
-    // Slice impl blocks: impl<T> [T] { ... } (stored for on-demand monomorphization)
+    /// Slice impl blocks: `impl<T> [T] { ... }` stored for on-demand monomorphization.
     slice_impls: Vec<ImplDecl>,
+    /// Module visibility map: item name -> is_pub.
     pub visibility_map: HashMap<String, bool>,
+    /// Per-struct field visibility: struct_name -> (field_name -> is_pub).
     pub field_visibility_map: HashMap<String, HashMap<String, bool>>,
+    /// Current module path segments for visibility resolution.
     pub current_module_path: Vec<String>,
+    /// Generic methods awaiting monomorphization: type_name -> Vec<Function>.
     generic_methods: HashMap<String, Vec<Function>>,
+    /// Generic functions awaiting monomorphization: name -> Function.
     generic_funcs: HashMap<String, Function>,
-    // Variable moved out tracking (save/restore at scope boundaries)
+    /// Set of variable names that have been moved out (use-after-move detection).
     moved_vars: HashSet<String>,
-    // Declaration-order tracking per scope for correct drop order
+    /// Declaration-order tracking per scope for correct drop order on scope exit.
     scope_stack: Vec<Vec<(String, Type, PointerValue<'ctx>)>>,
-    // Types known to be Copy
+    /// Types known to be Copy (via #[derive(Copy)] or builtin).
     copy_types: HashSet<String>,
-    // Types that need drop glue (direct impl Drop or transitively through fields)
+    /// Types that need drop glue (direct impl Drop or transitively through fields).
     drop_types: HashSet<String>,
-    /// Tracks active loops for `continue`/`break` compilation.
-    /// Set of function names declared with #[ulang_intrinsic].
+    /// Set of function names declared with #[ulang_intrinsic]; these are not compiled.
     intrinsic_funcs: HashSet<String>,
+    /// Stack of active loop contexts for `continue`/`break` compilation.
     loop_stack: Vec<LoopContext<'ctx>>,
 }
 
 /// Context for a single loop level
-/// `continue` and `break`.
+///
+/// Carries the LLVM basic blocks and result storage for a loop construct.
+/// Used by `continue` and `break` statements to generate correct branch
+/// instructions and (for `loop` expressions) to store the break value.
 #[derive(Clone)]
 struct LoopContext<'ctx> {
+    /// Basic block to branch to on `continue` (loop header / back-edge target).
     continue_bb: inkwell::basic_block::BasicBlock<'ctx>,
+    /// Basic block to branch to on `break` (merge point after the loop).
     break_bb: inkwell::basic_block::BasicBlock<'ctx>,
+    /// Alloca for the loop expression result value (only used by `loop { break X; }`).
     result_alloca: Option<inkwell::values::PointerValue<'ctx>>,
+    /// Type of the loop expression result.
     result_type: Option<Type>,
+    /// Whether this loop is a `loop` expression (as opposed to `while`/`for`).
+    /// Only `loop` expressions support `break` with a value.
     is_loop_expr: bool,
 }
 
 impl<'ctx> CodeGen<'ctx> {
+    /// Create a new `CodeGen` instance for JIT compilation.
+    ///
+    /// Creates an LLVM module and a JIT execution engine. The `context` must
+    /// outlive the returned `CodeGen` for the lifetime of all LLVM objects.
+    ///
+    /// # Errors
+    /// Returns `CodegenError` if the JIT execution engine cannot be created.
     pub fn new_jit(
         context: &'ctx Context,
         opt: OptimizationLevel,
@@ -219,6 +305,12 @@ impl<'ctx> CodeGen<'ctx> {
         })
     }
 
+    /// Create a new `CodeGen` instance for native (AOT) compilation.
+    ///
+    /// Unlike [`new_jit`], this does not create an execution engine; the
+    /// resulting module can be written to an object file via
+    /// [`compile_to_object`]. The `context` must outlive the returned
+    /// `CodeGen`.
     pub fn new_native(
         context: &'ctx Context,
         opt: OptimizationLevel,
@@ -278,6 +370,11 @@ impl<'ctx> CodeGen<'ctx> {
         }
     }
 
+    /// Extract the module path segments from a fully qualified item name.
+    ///
+    /// Strips trait prefixes (`__trait_...` mangling), splits on `::`,
+    /// and truncates at the first uppercase segment (the type name).
+    /// Used by visibility checks to determine if a caller is in a descendant module.
     fn get_module_path_for_item_name(&self, name: &str) -> Vec<String> {
         let mut clean_name = name.to_string();
         if clean_name.starts_with("__trait_")
@@ -331,6 +428,11 @@ impl<'ctx> CodeGen<'ctx> {
         }
     }
 
+    /// Check that `caller_path` can access `target_name` based on module visibility.
+    ///
+    /// Items are accessible if the caller is a descendant module of the item's
+    /// defining module, or if the item is `pub`. Returns an error for private
+    /// items accessed from non-descendant modules.
     fn check_visibility_of_path(
         &self,
         caller_path: &[String],
@@ -364,6 +466,9 @@ impl<'ctx> CodeGen<'ctx> {
         Ok(())
     }
 
+    /// Check that all types referenced in a type expression are visible from `caller_path`.
+    /// Recurses into struct names, generic arguments, tuple elements, reference/pointer
+    /// inner types, and array inner types.
     fn check_visibility_of_type(
         &self,
         caller_path: &[String],
@@ -401,6 +506,9 @@ impl<'ctx> CodeGen<'ctx> {
         Ok(())
     }
 
+    /// Check that `field_name` of `struct_name` is visible to `caller_path`.
+    /// Fields in descendant modules are always accessible; otherwise requires
+    /// the field to be `pub` in `field_visibility_map`.
     fn check_field_visibility(
         &self,
         caller_path: &[String],
@@ -429,6 +537,9 @@ impl<'ctx> CodeGen<'ctx> {
         Ok(())
     }
 
+    /// Verify that a struct can be constructed from `caller_path`.
+    /// Construction is forbidden if the struct has any non-public fields and
+    /// the caller is not a descendant module.
     fn check_struct_literal_construction(
         &self,
         caller_path: &[String],
@@ -1037,6 +1148,9 @@ impl<'ctx> CodeGen<'ctx> {
         Ok(())
     }
 
+    /// Convert a type to a string key for trait method lookup and debugging.
+    /// Primitives use their name ("i32", "bool"); structs use their declared
+    /// name; generic instances use their mangled name.
     fn type_to_mangled_name(ty: &Type) -> String {
         if let Some(name) = Self::primitive_type_name(ty) {
             return name.to_string();
@@ -3376,6 +3490,12 @@ impl<'ctx> CodeGen<'ctx> {
             .collect()
     }
 
+    /// Compile an entire program into the LLVM module.
+    ///
+    /// Runs the full codegen pipeline: visibility map population, opaque type
+    /// creation, builtin trait generation, generic impl separation, function
+    /// declaration, monomorphization, struct body setting, derive processing,
+    /// drop closure computation, and function body compilation.
     pub fn compile_module(&mut self, program: &Program) -> Result<(), CodegenError> {
         // Validate attributes: inline cannot be on structs or enums
         for decl in &program.structs {
@@ -3910,6 +4030,19 @@ impl<'ctx> CodeGen<'ctx> {
         Ok(())
     }
 
+    /// Convert a ulang type to its LLVM representation.
+    ///
+    /// Maps each `Type` variant to the corresponding LLVM type:
+    /// - Primitives (Bool, I32, F64, etc.) map to cached LLVM intrinsic types.
+    /// - `Struct`/`GenericInstance` look up the opaque struct type registered during Phase 0.
+    /// - `Ref` maps to a pointer type; references to `str`/`Slice` become `{ptr, i64}` fat pointers.
+    /// - `Array` produces an LLVM array type.
+    /// - `Tuple`/`Unit` produce LLVM struct types.
+    /// - `Str`/`Slice` produce the `{ptr, i64}` fat pointer struct.
+    ///
+    /// # Panics
+    /// Panics if `ImplTrait`, `Alias`, `SelfType`, `Infer`, or `GenericArray`
+    /// reach codegen — these should all be resolved/monomorphized before this point.
     fn type_to_llvm(&self, ty: &Type) -> BasicTypeEnum<'ctx> {
         match ty {
             Type::ImplTrait(_) => {
@@ -5118,12 +5251,22 @@ impl<'ctx> CodeGen<'ctx> {
         Ok(())
     }
 
+    /// Compile a single function body into the LLVM module.
+    ///
+    /// Creates the entry basic block, saves/restores the builder position and
+    /// symbol table so the caller's compilation context is unaffected.
+    /// Delegates to [`compile_function_body_inner`] which handles the actual
+    /// instruction generation.
     fn compile_function_body(&mut self, func: &Function) -> Result<(), CodegenError> {
         let saved_bb = self.builder.get_insert_block();
         let saved_symbols = self.symbols.clone();
         let saved_moved_vars = self.moved_vars.clone();
         let saved_scope_stack = self.scope_stack.clone();
         let saved_module_path = self.current_module_path.clone();
+        // Save/restore the builder position and symbol state so that inlining a function
+        // body (e.g. during monomorphization or method compilation) does not corrupt the
+        // caller's compilation context. Without this, nested compile_function_body calls
+        // would leave the builder pointing into the wrong function's basic blocks.
 
         self.enter_scope();
         let result = self.compile_function_body_inner(func);
@@ -5163,6 +5306,9 @@ impl<'ctx> CodeGen<'ctx> {
         self.builder.position_at_end(entry);
 
         // Allocate and store parameters
+        // All parameters are alloca'd at entry rather than at use sites because LLVM's
+        // mem2reg pass can only promote allocas that live in the entry block. This ensures
+        // the SSA construction pass has a single, static location for each variable.
         let param_values = fn_val.get_params();
         for (i, param) in func.params.iter().enumerate() {
             let llvm_ty = self.type_to_llvm(&param.ty);
@@ -5243,8 +5389,10 @@ impl<'ctx> CodeGen<'ctx> {
         Ok(())
     }
 
+    /// Compile a single statement, producing no value (statements are compiled for effects).
     fn compile_stmt(&mut self, stmt: &Stmt) -> Result<(), CodegenError> {
         match stmt {
+            // let pattern: type = init; — allocates stack slot, stores initial value
             Stmt::Let {
                 pattern,
                 is_mut,
@@ -5271,6 +5419,10 @@ impl<'ctx> CodeGen<'ctx> {
 
                         let ty = type_ann.clone().unwrap_or_else(|| self.expr_type(init));
                         let llvm_ty = self.type_to_llvm(&ty);
+                        // Alloca at use-site (rather than at function entry) because ulang
+                        // compiles one function at a time and LLVM's mem2reg pass can promote
+                        // allocas regardless of position. This also simplifies handling of
+                        // shadowed variables (drop-and-rebind within the same scope).
                         let alloca = self.builder.build_alloca(llvm_ty, name).map_err(|e| {
                             CodegenError::new(format!("failed to build alloca: {}", e))
                         })?;
@@ -5301,6 +5453,11 @@ impl<'ctx> CodeGen<'ctx> {
                         }
 
                         // Move detection: if init is a simple ident and source is not Copy
+                        // Move semantics are enforced at the IR level rather than the type level:
+                        // when a non-Copy variable is used by-value (assigned to another variable,
+                        // or passed as a non-ref argument), the source is marked as moved in
+                        // `moved_vars`. Any subsequent use triggers a compile error. This mirrors
+                        // Rust's borrow checker but implemented as a runtime check at codegen time.
                         if let Expr::Ident(src_name, _) = init {
                             let src_ty = self.expr_type(init);
                             if !self.is_copy_type(&src_ty) {
@@ -5322,6 +5479,7 @@ impl<'ctx> CodeGen<'ctx> {
                 }
                 Ok(())
             }
+            // const name: type = expr; — evaluates expression at compile time
             Stmt::Const {
                 name,
                 type_ann,
@@ -5333,10 +5491,12 @@ impl<'ctx> CodeGen<'ctx> {
                 self.consts.insert(name.clone(), (raw, ty));
                 Ok(())
             }
+            // expr; — evaluate expression, discard result
             Stmt::Expr(expr) => {
                 self.compile_expr(expr)?;
                 Ok(())
             }
+            // return expr; — build LLVM return instruction, then insert unreachable
             Stmt::Return { value, .. } => {
                 match value {
                     Some(expr) => {
@@ -5370,6 +5530,7 @@ impl<'ctx> CodeGen<'ctx> {
                 })?;
                 Ok(())
             }
+            // continue; — branch to the current loop's continue_bb
             Stmt::Continue { .. } => {
                 let ctx = self
                     .loop_stack
@@ -5383,6 +5544,8 @@ impl<'ctx> CodeGen<'ctx> {
                     })?;
                 Ok(())
             }
+            // break value?; — store result (if value expr) and branch to break_bb
+            // Only loop expressions accept break with a value
             Stmt::Break { value, .. } => {
                 let ctx = self
                     .loop_stack
@@ -6116,7 +6279,29 @@ impl<'ctx> CodeGen<'ctx> {
     }
 
     fn compile_expr(&mut self, expr: &Expr) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+        // Compile an expression to an LLVM value.
+        //
+        // This is the central codegen dispatch for all expression forms.
+        // Each expression variant maps to one or more LLVM IR instructions.
+        //
+        // ## Expression Lowering Patterns
+        // - **Literals**: const_int/const_float for immediates; build_global_string_ptr
+        //   for string constants, packed into a {ptr, len} fat pointer.
+        // - **Identifiers**: Symbol table lookup; if the variable has been moved,
+        //   returns a use-after-move error.
+        // - **Binary**: Short-circuit &&/|| use basic-block branching; arithmetic
+        //   and comparison operators delegate to trait methods (Add::add, Eq::eq, etc.).
+        // - **Call**: Direct function lookup, overload resolution via OverloadMap,
+        //   then generic monomorphization if needed.
+        // - **MethodCall**: Inherent impl methods vs. trait methods; special-cased
+        //   .len() and .as_ptr() for slice/str types.
+        // - **StructLit**: Alloca + insert_value to build the struct value.
+        // - **Array/Repeat**: Alloca + GEP + store for each element.
+        // - **If/While/Loop**: Basic block branching with a result alloca for the value.
+        // - **Match**: Sequential arm checking via gen_pattern_check, result stored
+        //   to alloca, then merged at the end.
         match expr {
+            // Literals: Bool(0/1), Int(const), Float(const), Str({ptr, len} fat pointer)
             Expr::BoolLit(val, ..) => Ok(self
                 .bool_type
                 .const_int(if *val { 1 } else { 0 }, false)
@@ -6154,6 +6339,7 @@ impl<'ctx> CodeGen<'ctx> {
                     })?;
                 Ok(str_struct.into_struct_value().into())
             }
+            // Ident — symbol lookup: check moved_vars, then consts, then symbols
             Expr::Ident(name, ..) => {
                 // Use-after-move check
                 if self.moved_vars.contains(name) {
@@ -6176,6 +6362,7 @@ impl<'ctx> CodeGen<'ctx> {
                     ))
                 }
             }
+            // Assign — store to variable, member field, deref target, or index
             Expr::Assign { target, value, .. } => match target.as_ref() {
                 Expr::Ident(name, ..) => {
                     if self.consts.contains_key(name) {
@@ -6462,6 +6649,7 @@ impl<'ctx> CodeGen<'ctx> {
                     expr.span(),
                 )),
             },
+            // Ref — create pointer to variable (alloca ptr), or alloca+store for temporaries
             Expr::Ref { expr, .. } => {
                 if let Expr::Ident(name, ..) = expr.as_ref() {
                     if let Some((ptr, _, _)) = self.symbols.get(name) {
@@ -6490,6 +6678,7 @@ impl<'ctx> CodeGen<'ctx> {
                     Ok(alloca.into())
                 }
             }
+            // Deref — load through a pointer operand
             Expr::Deref(expr, ..) => {
                 let ptr_val = self.compile_expr(expr)?;
                 let ptr = ptr_val.into_pointer_value();
@@ -6506,6 +6695,8 @@ impl<'ctx> CodeGen<'ctx> {
                     .map_err(|e| CodegenError::new(format!("failed to build deref load: {}", e)))?;
                 Ok(val)
             }
+            // Call — function call: size_of/transmute intrinsics, slice intrinsics,
+            // direct lookup, overload resolution, then generic monomorphization
             Expr::Call {
                 callee,
                 args,
@@ -6658,6 +6849,8 @@ impl<'ctx> CodeGen<'ctx> {
                 }
                 Ok(self.try_extract_result(result))
             }
+            // QualifiedCall — module qualified call (Module::func). Resolves through
+            // impl_methods, handles associated constants and generic monomorphization.
             Expr::QualifiedCall {
                 module,
                 callee,
@@ -6785,6 +6978,8 @@ impl<'ctx> CodeGen<'ctx> {
                 }
                 Ok(self.try_extract_result(result))
             }
+            // Binary — arithmetic/comparison via trait methods; short-circuit
+            // && and || via basic-block branching
             Expr::Binary { op, lhs, rhs, .. } => {
                 if *op == BinOp::And {
                     let parent_fn = self
@@ -7044,6 +7239,7 @@ impl<'ctx> CodeGen<'ctx> {
                 };
                 Ok(result)
             }
+            // Tuple — construct tuple as LLVM struct with insert_value
             Expr::Tuple(elems, ..) => {
                 let compiled: Vec<BasicValueEnum<'ctx>> = elems
                     .iter()
@@ -7065,10 +7261,12 @@ impl<'ctx> CodeGen<'ctx> {
                 }
                 Ok(result.into_struct_value().into())
             }
+            // Unit — empty tuple, lowered to empty LLVM struct
             Expr::Unit(_) => {
                 let unit_ty = self.context.struct_type(&[], false);
                 Ok(unit_ty.get_undef().into())
             }
+            // Member — extract struct/tuple field by name or index
             Expr::Member {
                 expr, index, field, ..
             } => {
@@ -7184,6 +7382,8 @@ impl<'ctx> CodeGen<'ctx> {
                     )),
                 }
             }
+            // MethodCall — method on a type: inherent impl vs trait dispatch.
+            // Special-cased .len() and .as_ptr() for &str/&[T] fat pointers.
             Expr::MethodCall {
                 expr: receiver,
                 method,
@@ -7581,6 +7781,7 @@ impl<'ctx> CodeGen<'ctx> {
                     })?;
                 Ok(self.try_extract_result(result))
             }
+            // StructLit — construct struct literal: undef + insert_value for each field
             Expr::StructLit {
                 struct_name,
                 fields,
@@ -7635,6 +7836,7 @@ impl<'ctx> CodeGen<'ctx> {
                     )),
                 }
             }
+            // Array — alloca + GEP + store for each element; generates Index impls on demand
             Expr::Array(elems, ..) => {
                 if elems.is_empty() {
                     return Err(CodegenError::with_span(
@@ -7686,6 +7888,7 @@ impl<'ctx> CodeGen<'ctx> {
                     .map_err(|e| CodegenError::new(format!("failed to load array: {}", e)))?;
                 Ok(result)
             }
+            // Repeat — initialize array[N] with a repeated expression value
             Expr::Repeat(expr, count, ..) => {
                 let elem_ty = self.expr_type(expr);
                 let elem_llvm = self.type_to_llvm(&elem_ty);
@@ -7731,9 +7934,10 @@ impl<'ctx> CodeGen<'ctx> {
                     .map_err(|e| CodegenError::new(format!("failed to load array: {}", e)))?;
                 Ok(result)
             }
+            // Index — array/slice element access: GEP for slices, index() method for arrays
             Expr::Index { array, index, .. } => {
                 let array_ty = self.expr_type(array);
-                // Handle slice/slice-ref indexing (fat pointer → GEP → load)
+                // Handle slice/slice-ref indexing (fat pointer -> GEP -> load)
                 let is_slice = matches!(&array_ty, Type::Slice { .. })
                     || matches!(&array_ty, Type::Ref { inner, .. } if matches!(inner.as_ref(), Type::Slice { .. }));
                 if is_slice {
@@ -7856,12 +8060,14 @@ impl<'ctx> CodeGen<'ctx> {
                     })?;
                 Ok(loaded)
             }
+            // Cast — type conversion via emit_cast (int-to-float, float-to-int, etc.)
             Expr::Cast { expr, to_type, .. } => {
                 self.check_visibility_of_type(&self.current_module_path, to_type)?;
                 let val = self.compile_expr(expr)?;
                 let expr_ty = self.expr_type(expr);
                 self.emit_cast(val, &expr_ty, to_type)
             }
+            // If — conditional branching: then/else-ifs/else blocks, result alloca for merge
             Expr::If {
                 cond,
                 then_block,
@@ -7981,6 +8187,9 @@ impl<'ctx> CodeGen<'ctx> {
                     .map_err(|e| CodegenError::new(format!("failed to load if result: {}", e)))?;
                 Ok(result)
             }
+            // Loop — infinite loop expression: header/body/continue_bb/break_bb.
+            // Can produce a value via `break expr`. Only loop expressions (not while)
+            // support break with a value.
             Expr::Loop { body, .. } => {
                 let parent_fn = self
                     .builder
@@ -8055,6 +8264,7 @@ impl<'ctx> CodeGen<'ctx> {
                     .map_err(|e| CodegenError::new(format!("failed to load loop result: {}", e)))?;
                 Ok(result)
             }
+            // While — conditional loop: header check, body block, continue to header
             Expr::While { cond, body, .. } => {
                 let parent_fn = self
                     .builder
@@ -8133,6 +8343,7 @@ impl<'ctx> CodeGen<'ctx> {
                 let unit_ty = self.context.struct_type(&[], false);
                 Ok(unit_ty.get_undef().into())
             }
+            // UnaryNot — bitwise NOT for integers, logical NOT for booleans
             Expr::UnaryNot(inner_expr, ..) => {
                 let val = self.compile_expr(inner_expr)?;
                 match val {
@@ -8144,11 +8355,12 @@ impl<'ctx> CodeGen<'ctx> {
                         })?
                         .into()),
                     _ => Err(CodegenError::with_span(
-                        "unary ! requires integer operand",
+                        "unary not requires integer or boolean operand",
                         expr.span(),
                     )),
                 }
             }
+            // UnaryMinus — integer or float negation via trait call or builtin
             Expr::UnaryMinus(inner_expr, ..) => {
                 let val = self.compile_expr(inner_expr)?;
                 match val {
@@ -8172,6 +8384,8 @@ impl<'ctx> CodeGen<'ctx> {
                     )),
                 }
             }
+            // EnumLit — construct enum variant as LLVM struct with tag + payload.
+            // The tag is stored as __tag (i8), variant payloads as __VariantName fields.
             Expr::EnumLit {
                 enum_name,
                 variant,
@@ -8289,12 +8503,14 @@ impl<'ctx> CodeGen<'ctx> {
                     )),
                 }
             }
+            // For — desugars to into_iter() + while let loop
             Expr::For {
                 pattern,
                 container,
                 body,
                 ..
             } => self.compile_for(pattern, container, body),
+            // IfLet — pattern match with single arm, compile via compile_if_let
             Expr::IfLet {
                 pattern,
                 scrutinee,
@@ -8302,9 +8518,11 @@ impl<'ctx> CodeGen<'ctx> {
                 else_block,
                 ..
             } => self.compile_if_let(pattern, scrutinee, then_block, else_block),
+            // Match — pattern matching via sequential arm checking + gen_pattern_check
             Expr::Match {
                 scrutinee, arms, ..
             } => self.compile_match(scrutinee, arms),
+            // Block — scoped block with new scope, saved/restored symbols
             Expr::Block(block, ..) => {
                 let saved_symbols = self.symbols.clone();
                 let saved_moved_vars = self.moved_vars.clone();
@@ -8453,6 +8671,8 @@ impl<'ctx> CodeGen<'ctx> {
         }
     }
 
+    /// Compile a `for` loop: desugars to `IntoIterator` conversion + while-let over `.next()`.
+    /// Temporarily allocates a `__for_loop_iter` binding for the iterator state.
     fn compile_for(
         &mut self,
         pattern: &Pattern,
@@ -9291,6 +9511,11 @@ impl<'ctx> CodeGen<'ctx> {
         }
     }
 
+    /// Evaluate an associated constant for a type, caching the result.
+    ///
+    /// Looks up the constant definition in `associated_const_defs`, evaluates
+    /// it via [`const_eval`], and caches the result in `associated_const_values`.
+    /// This is used for both trait associated constants and inherent impl constants.
     fn eval_associated_const(
         &self,
         type_name: &str,
@@ -9313,6 +9538,16 @@ impl<'ctx> CodeGen<'ctx> {
         Ok(val)
     }
 
+    /// Evaluate an expression at compile time for `const` declarations.
+    ///
+    /// Supports integer/float/bool literals, named constants, enum literals
+    /// (unit variants that resolve to associated constants), qualified calls
+    /// (module-level associated constants), binary/unary arithmetic, cast, and
+    /// `.len()` on string literals.
+    ///
+    /// # Errors
+    /// Returns `CodegenError` for unsupported expressions (function calls,
+    /// non-constant method calls, string literals, etc.).
     fn const_eval(&self, expr: &Expr) -> Result<ConstValue, CodegenError> {
         match expr {
             Expr::BoolLit(val, ..) => Ok(ConstValue::Bool(*val)),
@@ -9601,6 +9836,20 @@ impl<'ctx> CodeGen<'ctx> {
         Ok(fat_ptr.into_struct_value().into())
     }
 
+    /// Emit LLVM cast instructions between types.
+    ///
+    /// Handles the full matrix of numeric conversions:
+    /// - int-to-int (truncate or zero-extend/sign-extend)
+    /// - int-to-float / float-to-int
+    /// - float-to-float (f32 <-> f64)
+    /// - int/float to bool (truncate or compare with zero)
+    /// - `Never` type produces an undef value (unreachable branch)
+    /// - Array/fat-pointer coercions for array-to-slice
+    ///
+    /// If `from_type == to_type`, the value is returned unchanged.
+    ///
+    /// # Errors
+    /// Returns `CodegenError` if the cast combination is unsupported.
     fn emit_cast(
         &self,
         val: BasicValueEnum<'ctx>,

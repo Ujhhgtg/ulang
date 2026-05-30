@@ -1,3 +1,31 @@
+//! CLI pipeline, module resolution, stdlib loading, and compilation orchestration.
+//!
+//! # Pipeline
+//!
+//! 1. **CLI parsing** — [`Cli`] via clap; determines script vs. project mode.
+//! 2. **Lexing & parsing** — [`lex_and_parse()`] produces a [`Program`].
+//! 3. **Module resolution** — [`resolve_modules()`] / [`flatten_module()`] load inline
+//!    `mod` declarations from `.u` files and inline their contents into a flat AST.
+//! 4. **Use resolution** — [`resolve_uses()`] loads stdlib modules (`core/`, `std/`),
+//!    processes `use` declarations, builds an overload map for function overloading.
+//! 5. **Codegen** — inkwell JIT or native object compilation, followed by linker
+//!    invocation ([`do_build()`]).
+//!
+//! # Compilation Modes
+//!
+//! - `run` — JIT-compile and execute.
+//! - `build` — compile to native executable via linker.
+//! - `build-run` — compile, link, then run.
+//! - `emit-ir` — print LLVM IR to stdout.
+//! - `new` — scaffold a new project directory.
+//! - `lsp` — start the language server.
+//!
+//! # Stdlib Loading
+//!
+//! Located via [`find_stdlib_root()`]: `$ULANG_ROOT`, `./root/`, `/usr/share/ulang/`.
+//! The `core/` and `std/` directories are scanned for `mod.u` manifests. Modules are
+//! cached in [`all_stdlib_progs`] during use-resolution.
+//!
 mod ast;
 mod codegen;
 mod error;
@@ -21,6 +49,15 @@ type OverloadMap = HashMap<String, Vec<(String, Vec<Type>)>>;
 use crate::token::{Span, Token};
 use inkwell::targets::TargetTriple;
 
+/// | Variant    | LLVM Level | Typical CLI flag |
+/// Compiler optimization level, mapped directly to LLVM's [`inkwell::OptimizationLevel`].
+///
+/// | Variant      | LLVM Level   | Typical CLI flag |
+/// |------------|------------|------------------|
+/// | `None`     | None       | `-o 0` / `-o none` |
+/// | `Default`  | Default    | `-o 2` / `-o default` |
+/// | `Less`     | Less       | `-o 1` / `-o less` |
+/// | `Aggressive`| Aggressive | `-o 3` / `-o aggressive` |
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum OptLevel {
     None,
@@ -30,6 +67,11 @@ enum OptLevel {
     Aggressive,
 }
 
+/// Accepts `"0"`/`"none"`, `"1"`/`"less"`, `"2"`/`"default"`, `"3"`/`"aggressive"`.
+/// Parse an optimization level string into an [`OptLevel`].
+///
+/// Accepts `"0"`/`"none"`, `"1"`/`"less"`, `"2"`/`"default"`, `"3"`/`"aggressive"`.
+/// Returns `Err` with a descriptive message listing valid values on mismatch.
 fn parse_opt_level(s: &str) -> Result<OptLevel, String> {
     match s {
         "0" | "none" => Ok(OptLevel::None),
@@ -64,6 +106,15 @@ impl From<OptLevel> for inkwell::OptimizationLevel {
     }
 }
 
+/// Linker backend for producing native executables.
+///
+/// | Variant   | Binary invoked | Use case |
+/// |-----------|----------------|----------|
+/// | `Gcc`     | `gcc`          | Default on many Linux systems. |
+/// | `Clang`   | `clang`        | Default when available. |
+/// | `Cosmocc` | `cosmocc`      | Builds fat binaries (cosmopolitan); compiles for x86_64 and aarch64. |
+/// | `Zig`     | `zig cc`       | Zig's C frontend as linker. |
+/// | `Tcc`     | `tcc`          | Tiny C compiler — fast but limited optimization. |
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Linker {
     Gcc,
@@ -74,6 +125,11 @@ enum Linker {
     Tcc,
 }
 
+/// Accepts `"gcc"`, `"clang"`, `"cosmocc"`, `"zig"`, or `"tcc"`.
+/// Parse a linker name string into a [`Linker`].
+///
+/// Accepts `"gcc"`, `"clang"`, `"cosmocc"`, `"zig"`, or `"tcc"`.
+/// Returns `Err` with a descriptive message on invalid values.
 fn parse_linker(s: &str) -> Result<Linker, String> {
     match s {
         "gcc" => Ok(Linker::Gcc),
@@ -361,7 +417,13 @@ fn main() {
         .usage(AnsiColor::Cyan.on_default() | Effects::BOLD)
         .literal(AnsiColor::BrightCyan.on_default() | Effects::BOLD)
         .placeholder(AnsiColor::Cyan.on_default()))]
+/// Defines top-level flags and dispatches to a [`Command`] subcommand.
+/// CLI entry point for the ulang compiler.
+///
+/// Defines top-level flags and dispatches to a [`Command`] subcommand.
+/// The `--no-std` flag is global and disables standard library loading.
 struct Cli {
+    /// Subcommand determining compilation mode
     #[command(subcommand)]
     command: Command,
     /// Disable loading of the standard library
@@ -369,6 +431,12 @@ struct Cli {
     no_std: bool,
 }
 
+/// Each variant corresponds to a distinct pipeline stage or output mode.
+/// Compilation subcommands accepted by the CLI.
+///
+/// Each variant corresponds to a distinct pipeline stage or output mode.
+/// Subcommands that accept a source file fall back to project mode when
+/// a `ulang.toml` is found in an ancestor directory.
 #[derive(Subcommand)]
 enum Command {
     /// Compile and run the source file via JIT
@@ -453,6 +521,15 @@ enum Command {
     Lsp,
 }
 
+/// | Variant    | Description |
+/// Internal compilation mode, derived from the CLI [`Command`] combined with project config.
+///
+/// | Variant    | Description |
+/// |------------|-------------|
+/// | `Run`      | JIT-compile and execute. |
+/// | `Build`    | Compile to native executable via linker. |
+/// | `BuildRun` | Compile, link, then run the resulting executable. |
+/// | `EmitIr`   | Print LLVM IR to stdout. |
 enum Mode {
     Run {
         opt: OptLevel,
@@ -476,6 +553,21 @@ enum Mode {
 
 /// Compile the module to an object file, link it, and return the executable path.
 /// Exits the process on failure.
+///
+/// # Linking Pipeline
+///
+/// 1. **Codegen to object** — [`CodeGen::compile_to_object`] emits a `.o` file.
+///    For [`Linker::Cosmocc`], a second object is compiled for `aarch64-linux-gnu`
+///    into a `.aarch64/` subdirectory to produce fat binaries.
+/// 2. **Linker invocation** — The linker binary (`gcc`/`clang`/`cosmocc`/`zig cc`/`tcc`)
+///    is called via [`CodeGen::link_executable`] with the object file, output path,
+///    and any user-supplied `linker_flags`.
+/// 3. **Cleanup** — Temporary `.o` files (and the `.aarch64/` directory for cosmocc)
+///    are removed. The linker flags are passed as-is to the external linker.
+///
+/// # Panics
+///
+/// Exits the process on codegen or link failure after emitting diagnostics.
 fn do_build(
     codegen: &mut codegen::CodeGen<'_>,
     output: Option<String>,
@@ -487,6 +579,7 @@ fn do_build(
 
     match linker {
         Linker::Cosmocc => {
+            // Stage 1: compile for x86_64 target
             if let Err(msg) = codegen.compile_to_object_for_triple(
                 &TargetTriple::create("x86_64-pc-linux-gnu"),
                 Path::new(&obj_path),
@@ -501,6 +594,7 @@ fn do_build(
                 process::exit(1);
             }
 
+            // Stage 1b: create .aarch64/ directory and compile for aarch64 target
             let obj_dir = Path::new(&obj_path)
                 .parent()
                 .unwrap_or_else(|| Path::new("."));
@@ -527,6 +621,7 @@ fn do_build(
                 process::exit(1);
             }
 
+            // Stage 2: link the two object files into a single fat binary via cosmocc
             let cc_args: &[&str] = &["cosmocc"];
             if let Err(msg) = codegen::CodeGen::link_executable(
                 cc_args,
@@ -550,6 +645,7 @@ fn do_build(
             let _ = fs::remove_file(&obj_path);
         }
         _ => {
+            // Stage 1: compile native object file (single target)
             if let Err(msg) = codegen.compile_to_object(Path::new(&obj_path)) {
                 error::emit_error_opt(
                     &codegen.source,
@@ -561,6 +657,7 @@ fn do_build(
                 process::exit(1);
             }
 
+            // Stage 2: invoke linker (gcc/clang/zig cc/tcc) to produce executable
             let cc_str = linker.to_string();
             let cc_args: &[&str] = match linker {
                 Linker::Zig => &["zig", "cc"],
@@ -587,6 +684,7 @@ fn do_build(
         }
     }
 
+    // Return the path to the linked executable
     exe_path
 }
 
@@ -624,6 +722,10 @@ fn lex_and_parse(source: &str, path: &str) -> Program {
 /// Returns (processed_functions, overload_entries) where:
 /// - processed_functions has duplicates mangled with `$N` suffix
 /// - overload_entries maps base name -> { arg_count -> mangled_name }
+///
+/// Functions with duplicate names are disambiguated by appending `$<counter>`
+/// (e.g. `print$0`, `print$1`). The overload map records each mangled form
+/// alongside its parameter types for dispatch at call sites.
 fn process_stdlib_functions(funcs: Vec<Function>) -> (Vec<Function>, OverloadMap) {
     let mut name_counts: HashMap<String, usize> = HashMap::new();
     for func in &funcs {
@@ -654,6 +756,12 @@ fn process_stdlib_functions(funcs: Vec<Function>) -> (Vec<Function>, OverloadMap
 }
 
 /// Process a stdlib module's internal use declarations recursively.
+///
+/// Walks `use` declarations inside a stdlib [`Program`], resolving cross-module
+/// references (e.g. `use core::slice` inside `std::string`). Imports structs,
+/// enums, functions, impls, and overload registrations from each dependency into
+/// the caller's global maps. Uses a [`HashSet`] of currently-resolving module
+/// names to guard against infinite cycles.
 fn resolve_module_uses(
     program: &Program,
     all_stdlib_progs: &HashMap<String, Program>,
@@ -767,6 +875,35 @@ fn collect_struct_deps(ty: &Type) -> Vec<String> {
 /// Resolve `use` directives, loading standard library modules as needed.
 /// Returns a new Program with empty uses and a merged function list,
 /// plus a map of function name overloads.
+///
+/// # Algorithm Phases
+///
+/// 1. **Seed collections** — Insert the user program's own funcs, structs, enums,
+///    traits, impls, and type aliases into the global name maps.
+/// 2. **Stdlib preloading** — Discover `core/` and `std/` directories via
+///    [`find_stdlib_root()`]. Read each `mod.u` manifest and lex/parse every
+///    declared submodule, caching the resulting [`Program`]s and building a
+///    `canonical_struct_sources` map (struct name → owning module name).
+/// 3. **Fixed-point use resolution** — Iterate over all `use` declarations until
+///    no more can be resolved. For each declaration:
+///    - **Stdlib path** — `use std::X` or `use core::X`: load the module, resolve
+///      its own transitive uses via [`resolve_module_uses()`], then process
+///      functions through [`process_stdlib_functions()`] for overload mangling.
+///      Handles namespace imports (`use std::string` → all items qualified)
+///      and direct imports (`use std::string::String`, `use std::io::println`).
+///    - **Local path** — `use crate::foo::bar` or relative paths: lookup already-
+///      registered names, copy them into the current scope with the imported name.
+///      Supports wildcard/namespace re-exports by copying all children matching
+///      a prefix.
+/// 4. **Autoload** — Automatically load `slice`, `string`, `num` stdlib modules
+///    so that primitive-type impls (e.g. `impl str`, `impl [T]`) are always available.
+/// 5. **Return** — A new `Program` with empty `uses`/`modules` and all items merged,
+///    plus the accumulated overload map.
+///
+/// # Errors
+///
+/// Exits the process if a referenced stdlib module or item is not found,
+/// or if `--no-std` is used with a `std::` import.
 fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program, OverloadMap) {
     let mut all_funcs: HashMap<String, Function> = HashMap::new();
     let mut all_overloads: OverloadMap = HashMap::new();
@@ -801,11 +938,13 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
     let mut all_stdlib_progs: HashMap<String, Program> = HashMap::new();
     // Map from struct name to canonical source module (e.g., "String" → "string")
     let mut canonical_struct_sources: HashMap<String, String> = HashMap::new();
+    // Resolve stdlib root path: tries $ULANG_ROOT, ./root/stdlib, /usr/share/ulang/stdlib
     let stdlib_root_dir = find_stdlib_root();
     let std_dir = stdlib_root_dir.join("std");
     let core_dir = stdlib_root_dir.join("core");
 
     // Helper closure to load a root mod and its submodules
+    // Reads <dir>/mod.u, iterates declared submodules, reads each <dir>/<name>.u
     let load_stdlib_dir = |dir: &std::path::Path,
                            all_progs: &mut HashMap<String, Program>,
                            sources: &mut HashMap<String, String>| {
@@ -850,12 +989,15 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
     );
 
     // Resolve each use declaration using a fixed-point loop to support transitive re-exports and nested uses
+    // Outer loop: keep iterating until no more progress is made (handles re-exports that
+    // depend on previously resolved imports)
     let mut pending = program.uses.clone();
     let mut progress = true;
     while !pending.is_empty() && progress {
         progress = false;
         let mut unresolved = Vec::new();
 
+        // Inner loop: attempt to resolve every pending use declaration
         for use_decl in pending {
             let path = &use_decl.path;
             if path.is_empty() {
@@ -864,6 +1006,7 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
 
             let is_std = path[0] == "std";
             let is_core = path[0] == "core";
+            // --- Stdlib import branch ---
             if is_std || is_core {
                 if is_std && no_std {
                     eprintln!(
@@ -873,6 +1016,7 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
                     process::exit(1);
                 }
 
+                // Resolve the module file: core/<name>.u or std/<name>.u (fallback to core/)
                 // Resolve stdlib/module_name.u
                 let module_name = &path[1];
                 let stdlib_path = if is_core {
@@ -899,11 +1043,13 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
                     }
                 };
 
+                // Lex and parse the stdlib module
                 let stdlib_prog = lex_and_parse(&stdlib_src, &stdlib_path.to_string_lossy());
                 all_stdlib_progs
                     .entry(module_name.clone())
                     .or_insert_with(|| stdlib_prog.clone());
 
+                // Resolve this module's own transitive use declarations (recursive)
                 // Recursively resolve this module's internal use declarations
                 let mut resolving_modules = HashSet::new();
                 resolving_modules.insert(module_name.clone());
@@ -919,6 +1065,7 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
                     &mut resolving_modules,
                 );
 
+                // Mangle duplicate function names with $N suffix and build overload map
                 // Process duplicates and build overload map for this module
                 let (module_funcs, module_overloads) =
                     process_stdlib_functions(stdlib_prog.funcs.clone());
@@ -930,6 +1077,8 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
                 };
 
                 if path.len() == 2 {
+                    // Namespace import: use std::string;
+                    // All items are imported qualified as <module>::<name>
                     // Namespace import: use std::string;
                     let imported_module_name = if prefix.is_empty() {
                         module_name.clone()
@@ -1015,6 +1164,8 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
                         }
                     }
                 } else {
+                    // Direct import: use std::string::String or std::io::println
+                    // Single item lookup: struct, enum, trait, overloaded function, or plain function
                     // Direct import: use std::string::String or std::io::println
                     let target_name = &path[2];
 
@@ -1334,7 +1485,10 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
                 }
                 progress = true;
             } else {
+                // --- Local import branch ---
+                // Resolve names already registered from earlier stdlib loads or prior loops.
                 // Local import!
+                // Determine the source name (resolving "crate" prefix and module-path context)
                 let source_name_segs = if path[0] == "crate" {
                     path[1..].to_vec()
                 } else if !use_decl.module_path.is_empty() {
@@ -1353,6 +1507,7 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
                     last_seg.clone()
                 };
 
+                // Check what kind of item the source name refers to
                 let has_overloads = all_overloads.contains_key(&source_name);
                 let has_funcs = all_funcs.contains_key(&source_name)
                     || all_funcs
@@ -1363,6 +1518,7 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
                 let has_traits = all_traits.contains_key(&source_name);
                 let has_aliases = all_aliases.contains_key(&source_name);
 
+                // Also check if source_name acts as a namespace (has children with :: prefix)
                 let prefix_match = format!("{}::", source_name);
                 let is_namespace = all_funcs.keys().any(|k| k.starts_with(&prefix_match))
                     || all_structs.keys().any(|k| k.starts_with(&prefix_match))
@@ -1452,6 +1608,7 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
                 if is_namespace {
                     found_any = true;
 
+                    // Copy functions (including overloads)
                     // Functions
                     let matching_funcs: Vec<(String, Function)> = all_funcs
                         .iter()
@@ -1467,6 +1624,7 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
                         all_funcs.insert(new_name, new_func);
                     }
 
+                    // Copy overload registrations with remapped names
                     // Overloads
                     let matching_overloads: Vec<(String, Vec<(String, Vec<Type>)>)> = all_overloads
                         .iter()
@@ -1558,7 +1716,11 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
         pending = unresolved;
     }
 
+    // --- Autoload step ---
+    // Ensure standard impls for primitive types are always accessible
     // Automatically load standard library slice, string (for str impl), and num (for primitive impls) modules
+    // These modules provide trait impls for built-in types; they are always needed
+    // even if not explicitly imported.
     let autoload_modules = vec!["slice", "string", "num"];
     for &mod_name in &autoload_modules {
         if let Some(prog) = all_stdlib_progs.get(mod_name) {
@@ -1607,6 +1769,7 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
         }
     }
 
+    // Build the final Program with all resolved items and empty uses/modules
     (
         Program {
             uses: Vec::new(), // cleared after resolution
@@ -1985,6 +2148,14 @@ fn main() {
     }
 }
 
+///
+/// For each module without an inline body, the function searches for
+/// `<parent>/<name>.u` (single-file module) or `<parent>/<name>/mod.u` (directory module).
+/// Loaded modules are stored inline in the [`Program`] tree, then recursively resolved.
+///
+/// # Errors
+///
+/// Exits the process if neither file variant is found for a declared module.
 fn resolve_modules(program: &mut Program, source_path: &str) {
     for m in &mut program.modules {
         if m.body.is_none() {
@@ -2015,6 +2186,11 @@ fn resolve_modules(program: &mut Program, source_path: &str) {
     }
 }
 
+///
+/// Walks the [`Type`] tree recursively. When a `Struct`, `GenericInstance`,
+/// `Alias`, or `ImplTrait` bound name appears in `local_types`, it is rewritten
+/// from `Foo` to `<prefix>::Foo`. Container types (tuples, pointers, references,
+/// arrays, slices) are traversed transparently.
 fn qualify_type(ty: &mut Type, local_types: &HashSet<String>, prefix: &str) {
     if prefix.is_empty() {
         return;
@@ -2067,6 +2243,11 @@ fn qualify_type(ty: &mut Type, local_types: &HashSet<String>, prefix: &str) {
     }
 }
 
+///
+/// For [`Pattern::EnumVariant`], the `enum_name` field is prefixed if it matches
+/// a local type. Multi-segment paths (e.g. `crate::foo::Bar`) are resolved relative
+/// to the current module hierarchy: `crate` strips the crate prefix, submodule paths
+/// are prepended with `current_path`, and top-level module paths are left as-is.
 fn qualify_pattern(
     pattern: &mut crate::ast::Pattern,
     local_types: &HashSet<String>,
@@ -2112,6 +2293,15 @@ fn qualify_pattern(
     }
 }
 
+/// with module paths.
+///
+/// For each expression variant:
+/// - `Call` — prefixes the callee if it matches a local function name.
+/// - `QualifiedCall` — resolves the module portion against the current hierarchy
+///   (`crate::`, submodule paths, top-level modules).
+/// - `StructLit` / `EnumLit` — prefixes the type name if local, then resolves
+///   multi-segment paths via the same hierarchy logic.
+/// - All nested expressions and blocks are recursively qualified.
 fn qualify_expr(
     expr: &mut crate::ast::Expr,
     local_funcs: &HashSet<String>,
@@ -2607,6 +2797,10 @@ fn qualify_expr(
     }
 }
 
+///
+/// Delegates to [`qualify_type()`] for type annotations in `let`/`const` statements,
+/// and to [`qualify_expr()`] for all expression statements, return/break values,
+/// and the block's tail expression.
 fn qualify_block(
     block: &mut crate::ast::Block,
     local_funcs: &HashSet<String>,
@@ -2699,6 +2893,19 @@ fn qualify_block(
     }
 }
 
+///
+/// # Algorithm
+///
+/// 1. Recursively flatten all sub-modules first (depth-first), merging their items
+///    into `root_program`.
+/// 2. Gather local types, functions, imported names, and submodule names from the
+///    current module.
+/// 3. Qualify all local items by prepending `current_path` (e.g. `mod foo` → `foo::bar`).
+///    The `main` function is exempt from prefixing.
+/// 4. Push use-declarations upward with their `module_path` set for later resolution.
+///
+/// After flattening, the root program contains all items from every module qualified
+/// by their full path, and the module tree is discarded.
 fn flatten_module(
     program: Program,
     current_path: Vec<String>,
@@ -2878,6 +3085,13 @@ fn flatten_module(
     }
 }
 
+///
+/// This is the entry point for module processing, called before use-resolution.
+/// Steps:
+/// 1. [`resolve_modules()`] — load all `mod` declarations from disk.
+/// 2. Build a set of top-level module names for path disambiguation.
+/// 3. [`flatten_module()`] — inline all nested modules into a single flat
+///    [`Program`] with fully qualified item names.
 fn resolve_and_flatten_modules(mut program: Program, source_path: &str) -> Program {
     // 1. Recursive load all mod files
     resolve_modules(&mut program, source_path);

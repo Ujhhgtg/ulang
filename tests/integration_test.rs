@@ -1,6 +1,24 @@
+//! Integration tests for the ulang compiler.
+//!
+//! Tests run the ulang binary as a subprocess (`ulang run <path>.u`), exercising
+//! the full pipeline: lexing, parsing, type-checking, codegen, and runtime.
+//! Each test writes a `.u` source file to a temporary directory, invokes the
+//! compiler, and checks the exit status. Helper functions abstract away the
+//! common setup boilerplate so each test reads as a focused scenario.
+//!
+//! The file is organized into named groups covering every language feature:
+//! literals, expressions, control flow, structs, enums, traits, generics,
+//! standard library bindings, arrays, iterators, modules, FFI, attributes,
+//! move semantics, error handling, operator overloading, and full-program
+//! integration tests.
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Resolve the path to the compiled `ulang` binary.
+///
+/// Uses `env!("CARGO_MANIFEST_DIR")` which is baked in at compile time,
+/// so it points at `target/debug/ulang` regardless of the working directory.
 fn ulang_binary() -> String {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("target")
@@ -9,6 +27,10 @@ fn ulang_binary() -> String {
     path.to_string_lossy().to_string()
 }
 
+/// Create a temporary test directory under `target/tmp_integration/<name>`.
+///
+/// Each test group gets its own subdirectory so artifacts from different
+/// tests don't collide. The directory is created on demand.
 fn test_dir(name: &str) -> PathBuf {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("target")
@@ -18,6 +40,9 @@ fn test_dir(name: &str) -> PathBuf {
     dir
 }
 
+/// Write a `.u` source file into the test directory and return its path.
+///
+/// The file is placed under `target/tmp_integration/<name>/<name>.u`.
 fn write_test(src: &str, name: &str) -> PathBuf {
     let dir = test_dir(name);
     let path = dir.join(format!("{}.u", name));
@@ -25,6 +50,10 @@ fn write_test(src: &str, name: &str) -> PathBuf {
     path
 }
 
+/// Run `ulang run` on a source snippet and return whether it succeeded.
+///
+/// Writes the source through `write_test`, spawns `ulang run`, and returns
+/// `true` when the subprocess exits with status 0.
 fn run_test(name: &str, src: &str) -> bool {
     let path = write_test(src, name);
     let output = Command::new(ulang_binary())
@@ -34,6 +63,10 @@ fn run_test(name: &str, src: &str) -> bool {
     output.status.success()
 }
 
+/// Run `ulang run` on a source snippet that is expected to fail.
+///
+/// Returns `true` when the subprocess exits with a non-zero status.
+/// Use this for tests that verify compiler error reporting.
 fn run_test_expect_error(name: &str, src: &str) -> bool {
     let path = write_test(src, name);
     let output = Command::new(ulang_binary())
@@ -43,8 +76,11 @@ fn run_test_expect_error(name: &str, src: &str) -> bool {
     !output.status.success()
 }
 
+// === Basic expressions and types ===
+
 #[test]
 fn test_run_calc() {
+    // Full-program integration: the calc.u example.
     let calc_u = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("examples")
         .join("calc.u");
@@ -61,12 +97,16 @@ fn test_run_calc() {
     );
 }
 
+// === Control flow (basic) ===
+
+// Minimal valid program: empty main function.
 #[test]
 fn test_run_empty_source() {
     assert!(run_test("empty", "fn main() {}\n"));
 }
 
 #[test]
+// let mut allows rebinding a variable.
 fn test_mutable_var_reassign() {
     assert!(run_test(
         "mut_reassign",
@@ -299,6 +339,8 @@ fn test_lsp_completion_path_prefix_vec() {
     child.kill().ok();
 }
 
+// === Constants and variables ===
+
 #[test]
 fn test_const_declaration() {
     assert!(run_test(
@@ -319,6 +361,8 @@ fn test_assign_to_immutable_errors() {
 fn test_typed_let_declaration() {
     assert!(run_test("typed_let", "fn main() { let x: i32 = 42; }"));
 }
+
+// === Type literals and casts ===
 
 #[test]
 fn test_float_literal() {
@@ -357,6 +401,7 @@ fn test_print_cast() {
     ));
 }
 
+// as binds tighter than arithmetic operators.
 #[test]
 fn test_as_cast_precedence() {
     assert!(run_test(
@@ -390,6 +435,8 @@ fn test_suffix_float_f32() {
     assert!(run_test("suffix_f32", "fn main() { let x = 1.5f32; }"));
 }
 
+// === String operations ===
+
 #[test]
 fn test_run_str_len_literal() {
     assert!(run_test("str_len_lit", "fn main() { \"hello\".len(); }\n"));
@@ -403,6 +450,8 @@ fn test_run_str_len_variable() {
     ));
 }
 
+// === Parse errors ===
+
 #[test]
 fn test_run_parse_error() {
     assert!(run_test_expect_error(
@@ -410,6 +459,8 @@ fn test_run_parse_error() {
         "fn main() { missing_semicolon }\n"
     ));
 }
+
+// === Structs ===
 
 #[test]
 fn test_struct_create() {
@@ -426,6 +477,8 @@ fn test_struct_method_call() {
         "struct Point { x: i32, y: i32, }\nimpl Point {\n    fn new(x: i32, y: i32) -> Point { Point { x: x, y: y }; }\n    fn area(&self) -> i32 { self.x * self.y; }\n}\nfn main() {\n    let p = Point { x: 3, y: 4 };\n    p.area();\n}\n"
     ));
 }
+
+// === Traits and generics ===
 
 #[test]
 fn test_builtin_trait_methods() {
@@ -466,6 +519,8 @@ fn test_trait_default_method_mixed() {
         "use std::panic::panic;\ntrait Animal { fn noise(&self) -> i32 { 42 } fn legs(&self) -> i32; }\nstruct Dog {}\nimpl Animal for Dog { fn legs(&self) -> i32 { 4 } }\nfn main() {\n    let d = Dog {};\n    let n = d.noise();\n    let l = d.legs();\n    if n != 42 { panic(\"expected 42\"); };\n    if l != 4 { panic(\"expected 4\"); }\n}\n"
     ));
 }
+
+// === Control flow (if, while, loop, return) ===
 
 #[test]
 fn test_if_expression() {
@@ -516,6 +571,8 @@ fn test_loop_keyword() {
     ));
 }
 
+// === Standard library (String) ===
+
 #[test]
 fn test_string_new() {
     assert!(run_test(
@@ -564,6 +621,8 @@ fn test_string_is_empty() {
     ));
 }
 
+// === I/O (print, println, to_string) ===
+
 #[test]
 fn test_print_str() {
     assert!(run_test(
@@ -588,6 +647,7 @@ fn test_print_string_utf8() {
     ));
 }
 
+// UTF-8 multi-byte characters in a string literal.
 #[test]
 fn test_print_str_utf8() {
     assert!(run_test(
@@ -596,6 +656,7 @@ fn test_print_str_utf8() {
     ));
 }
 
+// Convert a &str to a String via .to_string().
 #[test]
 fn test_str_to_string() {
     assert!(run_test(
@@ -603,6 +664,8 @@ fn test_str_to_string() {
         "use std::string::String;\nfn main() -> i32 { let s = \"hello, world\".to_string(); let len = s.len(); if len != 12 { return 1; }; 0 }\n"
     ));
 }
+
+// === Panic ===
 
 #[test]
 fn test_panic_str() {
@@ -620,6 +683,9 @@ fn test_panic_string() {
     ));
 }
 
+// === Type aliases ===
+
+// Type aliases create a new name for an existing type.
 #[test]
 fn test_type_alias() {
     assert!(run_test(
@@ -652,6 +718,7 @@ fn test_array_mutation() {
     ));
 }
 
+// Type annotation on array literal.
 #[test]
 fn test_array_typed() {
     assert!(run_test(
@@ -660,6 +727,7 @@ fn test_array_typed() {
     ));
 }
 
+// Multi-dimensional arrays.
 #[test]
 fn test_nested_array() {
     assert!(run_test(
@@ -668,6 +736,7 @@ fn test_nested_array() {
     ));
 }
 
+// [val] syntax creates a single-element array.
 #[test]
 fn test_single_element_array() {
     assert!(run_test(
@@ -675,6 +744,8 @@ fn test_single_element_array() {
         "use std::io::println;\nfn main() { let a = [42]; println(a[0]); }\n"
     ));
 }
+
+// === Option and Result ===
 
 #[test]
 fn test_option_stdlib() {
@@ -710,6 +781,7 @@ fn test_option_expect_some() {
     ));
 }
 
+// Option::expect panics on None with a custom message.
 #[test]
 fn test_option_expect_none() {
     assert!(run_test_expect_error(
@@ -744,6 +816,7 @@ fn test_result_stdlib() {
     ));
 }
 
+// Unchecked unwrap skips the None check.
 #[test]
 fn test_option_unwrap_unchecked() {
     assert!(run_test(
@@ -759,6 +832,7 @@ fn test_option_unwrap_unchecked() {
     ));
 }
 
+// Unchecked unwrap on Result::Ok skips the error check.
 #[test]
 fn test_result_unwrap_unchecked() {
     assert!(run_test(
@@ -777,6 +851,8 @@ fn test_result_unwrap_unchecked() {
     ));
 }
 
+// === Logical operators ===
+
 #[test]
 fn test_logical_and_or() {
     assert!(run_test(
@@ -793,6 +869,8 @@ fn test_logical_and_or() {
         }"#
     ));
 }
+
+// === Standard library (Command/process) ===
 
 #[test]
 fn test_command_stdlib() {
@@ -821,6 +899,7 @@ fn test_command_stdlib() {
     ));
 }
 
+// Method chaining returns &mut self for builder-style calls.
 #[test]
 fn test_command_args_chaining() {
     assert!(run_test(
@@ -838,6 +917,7 @@ fn test_command_args_chaining() {
     ));
 }
 
+// Non-existent binary returns exit code 127.
 #[test]
 fn test_command_invalid_path() {
     assert!(run_test(
@@ -890,6 +970,8 @@ fn test_operator_overloading_custom() {
     ));
 }
 
+// === Operator overloading ===
+
 #[test]
 fn test_operator_overloading_ord() {
     assert!(run_test(
@@ -929,6 +1011,9 @@ fn test_operator_overloading_ord() {
     ));
 }
 
+// === Empty structs ===
+
+// Unit-like struct with zero fields can still have impl methods.
 #[test]
 fn test_empty_struct() {
     assert!(run_test(
@@ -947,6 +1032,8 @@ fn main() {
 "#,
     ));
 }
+
+// === Shadowing ===
 
 #[test]
 fn test_same_scope_shadowing() {
@@ -1033,6 +1120,9 @@ fn test_inline_modules() {
     ));
 }
 
+// === Modules and visibility ===
+
+// Write the helper file directly in the temporary directory
 #[test]
 fn test_file_modules() {
     // Write the helper file directly in the temporary directory
@@ -1076,6 +1166,7 @@ fn test_directory_module_mod_u() {
     ));
 }
 
+// Calling a private function outside its module is a compile error.
 #[test]
 fn test_visibility_failures() {
     // 1. Private function call failure
@@ -1092,6 +1183,7 @@ fn test_visibility_failures() {
     ));
 }
 
+// Verifies pub field access succeeds, private field construction/access fails.
 #[test]
 fn test_pub_struct_literal_construction() {
     // Successful construction and field access when fields are pub
@@ -1150,6 +1242,9 @@ fn test_pub_struct_literal_construction() {
     ));
 }
 
+// === Extern functions and FFI ===
+
+// Extern "C" function declaration without a body.
 #[test]
 fn test_single_extern_functions() {
     assert!(run_test(
@@ -1163,6 +1258,7 @@ fn test_single_extern_functions() {
     ));
 }
 
+// Extern function declared pub inside a module and re-exported via use.
 #[test]
 fn test_pub_extern_functions() {
     assert!(run_test(
@@ -1178,6 +1274,10 @@ fn test_pub_extern_functions() {
         "#
     ));
 }
+
+// === Iterators ===
+
+// === Iterators ===
 
 #[test]
 fn test_array_iter() {
@@ -1321,6 +1421,8 @@ fn test_vec_iter_mut() {
     ));
 }
 
+// === For loops and iterators ===
+
 #[test]
 fn test_for_loop_array() {
     assert!(run_test(
@@ -1402,6 +1504,9 @@ fn test_for_loop_nested() {
     ));
 }
 
+// === Static method calls ===
+
+// Calling methods via Type::method(&self) syntax.
 #[test]
 fn test_static_method_calls() {
     assert!(run_test(
@@ -1433,6 +1538,8 @@ fn test_static_method_calls() {
         }"#
     ));
 }
+
+// === Wildcard patterns ===
 
 #[test]
 fn test_wildcard_let_integration() {
@@ -1474,6 +1581,9 @@ fn test_wildcard_let_integration() {
     ));
 }
 
+// === Emit IR subcommand ===
+
+// The emit-ir subcommand dumps LLVM IR for a source file.
 #[test]
 fn test_emit_ir_subcommand() {
     let path = write_test("fn main() { let x = 42; }", "emit_ir_test");
@@ -1487,6 +1597,9 @@ fn test_emit_ir_subcommand() {
     assert!(ir.contains("store i32 42, ptr %x"));
 }
 
+// === Let patterns (refutable, irrefutable) ===
+
+// Refutable pattern (Option::Some) in let is rejected at compile time.
 #[test]
 fn test_non_exhaustive_let_pattern() {
     assert!(run_test_expect_error(
@@ -1507,6 +1620,8 @@ fn test_irrefutable_let_pattern_wildcard() {
         "fn main() { let _ = 42; }"
     ));
 }
+
+// === Generic bounds ===
 
 #[test]
 fn test_generic_bounds_functions_and_structs() {
@@ -1564,6 +1679,8 @@ fn test_generic_bounds_functions_and_structs() {
     ));
 }
 
+// === IntoIterator impl ===
+
 #[test]
 fn test_impl_into_iterator_args() {
     assert!(run_test(
@@ -1610,6 +1727,9 @@ fn test_impl_into_iterator_args() {
     ));
 }
 
+// === Move and copy semantics ===
+
+// Non-Copy struct is consumed on assignment; second use fails.
 #[test]
 fn test_move_non_copy_struct() {
     assert!(run_test_expect_error(
@@ -1629,6 +1749,7 @@ fn test_move_non_copy_struct() {
     ));
 }
 
+// Primitive types (i32) implement Copy, so they survive reassignment.
 #[test]
 fn test_copy_primitive() {
     assert!(run_test(
@@ -1644,6 +1765,7 @@ fn test_copy_primitive() {
     ));
 }
 
+// Bool implements Copy.
 #[test]
 fn test_bool_copy() {
     assert!(run_test(
@@ -1681,6 +1803,8 @@ fn test_move_into_fn_by_value() {
     ));
 }
 
+// Non-Copy value consumed by function call; using again fails.
+// Copy types can be passed to functions multiple times.
 #[test]
 fn test_copy_to_fn_by_value() {
     assert!(run_test(
@@ -1700,6 +1824,7 @@ fn test_copy_to_fn_by_value() {
     ));
 }
 
+// #[derive(Clone, Copy)] on a struct enables copy semantics.
 #[test]
 fn test_derive_copy_struct() {
     assert!(run_test(
@@ -1721,6 +1846,7 @@ fn test_derive_copy_struct() {
     ));
 }
 
+// std::mem::drop explicitly drops a value.
 #[test]
 fn test_std_mem_drop() {
     assert!(run_test(
@@ -1739,6 +1865,7 @@ fn test_std_mem_drop() {
     ));
 }
 
+// Accessing a field of a moved value is a compile error.
 #[test]
 fn test_use_after_move_expr() {
     assert!(run_test_expect_error(
@@ -1756,6 +1883,7 @@ fn test_use_after_move_expr() {
     ));
 }
 
+// Calling Drop::drop directly on a value is forbidden.
 #[test]
 fn test_no_direct_drop_call() {
     assert!(run_test_expect_error(
@@ -1781,6 +1909,7 @@ fn test_no_direct_drop_call() {
     ));
 }
 
+// #[derive(Copy)] without Clone causes a compile error.
 #[test]
 fn test_derive_copy_without_clone_error() {
     assert!(run_test_expect_error(
@@ -1796,6 +1925,9 @@ fn test_derive_copy_without_clone_error() {
     ));
 }
 
+// === Continue and break ===
+
+// loop with break, continue, and accumulator.
 #[test]
 fn test_continue_break_loop() {
     assert!(run_test(
@@ -1816,6 +1948,9 @@ fn test_continue_break_loop() {
     ));
 }
 
+// === Never type ===
+
+// If/else where both arms diverge (return) yields never type.
 #[test]
 fn test_never_type_blocks_diverge() {
     assert!(run_test(
@@ -1829,6 +1964,7 @@ fn test_never_type_blocks_diverge() {
     ));
 }
 
+// Never type (!) coerces to any type (exit() in else arm).
 #[test]
 fn test_never_type_coercion() {
     assert!(run_test(
@@ -1842,6 +1978,8 @@ fn test_never_type_coercion() {
         "#
     ));
 }
+
+// === Enums and pattern matching ===
 
 #[test]
 fn test_match_single_expression() {
@@ -1889,6 +2027,8 @@ fn test_match_single_expression_custom_enum() {
     ));
 }
 
+// === Use paths and imports ===
+
 #[test]
 fn test_use_direct_import_blocks_qualified_call() {
     // use std::io::println should NOT make io::println callable
@@ -1930,6 +2070,8 @@ fn main() {
     ));
 }
 
+// === Vec as slice ===
+
 #[test]
 fn test_vec_as_slice() {
     assert!(run_test(
@@ -1954,6 +2096,8 @@ fn test_vec_as_slice() {
     ));
 }
 
+// Vec::as_slice provides shared read access to the elements.
+// Vec::as_mut_slice provides mutable access and mutation propagates.
 #[test]
 fn test_vec_as_mut_slice() {
     assert!(run_test(
@@ -1989,6 +2133,9 @@ fn test_vec_as_mut_slice() {
     ));
 }
 
+// === Turbofish ::<> ===
+
+// Turbofish ::<> syntax for explicit type parameters on function calls.
 #[test]
 fn test_turbofish_generic_functions() {
     assert!(run_test(
@@ -2029,6 +2176,7 @@ fn test_turbofish_generic_functions() {
     ));
 }
 
+// _ wildcard in turbofish lets inference fill in unspecified params.
 #[test]
 fn test_turbofish_wildcard_infer() {
     assert!(run_test(
@@ -2055,6 +2203,8 @@ fn test_turbofish_wildcard_infer() {
         "#
     ));
 }
+
+// === Inline attributes ===
 
 #[test]
 fn test_inline_attributes() {
@@ -2170,6 +2320,8 @@ fn test_inline_on_struct_enum_errors() {
     ));
 }
 
+// === Associated constants ===
+
 #[test]
 fn test_associated_constants() {
     assert!(run_test(
@@ -2197,6 +2349,7 @@ fn test_associated_constants() {
     ));
 }
 
+// Primitive type constants: i32::MIN/MAX, u8::MAX, f32::NAN/INFINITY.
 #[test]
 fn test_primitive_constants() {
     assert!(run_test(
@@ -2227,6 +2380,9 @@ fn test_primitive_constants() {
     ));
 }
 
+// === Prelude autoload ===
+
+// Prelude symbols (i32::MAX, array.len, str.len) are auto-imported.
 #[test]
 fn test_autoload_prelude() {
     assert!(run_test(
@@ -2251,6 +2407,10 @@ fn test_autoload_prelude() {
     ));
 }
 
+// === Trait associated constants ===
+
+// Mix of default and required associated consts in one trait.
+// Trait with a required associated const must be provided in the impl.
 #[test]
 fn test_trait_associated_const_required() {
     assert!(run_test(
@@ -2291,6 +2451,7 @@ fn test_trait_associated_const_default() {
     ));
 }
 
+// Impl can override a trait's default associated const.
 #[test]
 fn test_trait_associated_const_override_default() {
     assert!(run_test(
@@ -2312,6 +2473,7 @@ fn test_trait_associated_const_override_default() {
     ));
 }
 
+// Missing required associated const in impl causes compile error.
 #[test]
 fn test_trait_associated_const_missing_required() {
     assert!(run_test_expect_error(
@@ -2327,6 +2489,8 @@ fn test_trait_associated_const_missing_required() {
     ));
 }
 
+// Trait providing a default const; impl can skip it.
+// Mix of default and required associated consts in one trait.
 #[test]
 fn test_trait_associated_const_mixed() {
     assert!(run_test(

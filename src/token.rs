@@ -1,14 +1,35 @@
+//! Token types and span tracking for the ulang compiler.
+//!
+//! This module defines [`Span`], a byte-offset range used throughout the compiler
+//! for error reporting, and [`Token`], the complete set of lexical tokens produced
+//! by the lexer and consumed by the parser. Every variant of [`Token`] corresponds
+//! to a single syntactic element in a ulang source program.
+
+/// A byte-offset range in source code, used for error reporting.
+///
+/// `Span` records the start (`lo`) and end (`hi`) byte positions of a syntactic element
+/// within the source text. It is a zero-copy, `Copy`-able type that all AST nodes carry
+/// so that diagnostics can point to the relevant source locations.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Span {
+    /// Inclusive starting byte offset of the span.
     pub lo: usize,
+    /// Exclusive ending byte offset of the span (one past the last byte).
     pub hi: usize,
 }
 
 impl Span {
+    /// Creates a new span from the given byte-offset bounds.
+    ///
+    /// `lo` is the inclusive starting byte offset and `hi` is the exclusive ending
+    /// byte offset. Both are expected to be valid byte positions within the source text.
     pub fn new(lo: usize, hi: usize) -> Self {
         Self { lo, hi }
     }
 
+    /// Creates a zero-width span at the given byte position.
+    ///
+    /// Useful for synthetic elements or error recovery where no real source range exists.
     pub fn empty(pos: usize) -> Self {
         Self { lo: pos, hi: pos }
     }
@@ -114,100 +135,190 @@ mod tests {
     }
 }
 
+/// A lexical token produced by the lexer and consumed by the parser.
+///
+/// Each variant corresponds to a keyword, literal, identifier, operator, or piece of
+/// punctuation in a ulang source program. Tokens carrying payload data (e.g. [`IntLit`],
+/// [`StrLit`], [`Ident`]) store the parsed value directly.
+///
+/// [`IntLit`]: Token::IntLit
+/// [`StrLit`]: Token::StrLit
+/// [`Ident`]: Token::Ident
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
     // Keywords
+    /// The `fn` keyword — function declaration.
     Fn,
+    /// The `let` keyword — variable binding.
     Let,
+    /// The `mut` keyword — mutable binding or mutable reference.
     Mut,
+    /// The `const` keyword — constant declaration.
     Const,
+    /// The `if` keyword — conditional expression.
     If,
+    /// The `else` keyword — alternative branch.
     Else,
+    /// The `loop` keyword — infinite loop.
     Loop,
+    /// The `while` keyword — condition-loop.
     While,
+    /// The `return` keyword — return from function.
     Return,
+    /// The `continue` keyword — skip to next loop iteration.
     Continue,
+    /// The `break` keyword — exit a loop.
     Break,
+    /// The `mod` keyword — module declaration.
     Mod,
     // Literals
+    /// The `bool` type keyword.
     Bool,
+    /// The `true` literal keyword.
     True,
+    /// The `false` literal keyword.
     False,
+    /// An integer literal (e.g. `42`, `0xFF`).
     IntLit(i64),
+    /// A floating-point literal (e.g. `3.14`).
     FloatLit(f64),
+    /// An integer literal with a type suffix (e.g. `42u32`).
     IntSuffixLit(i64, Box<Token>),
+    /// A floating-point literal with a type suffix (e.g. `3.14f64`).
     FloatSuffixLit(f64, Box<Token>),
     // Identifiers
+    /// A user-defined identifier (e.g. variable name, function name).
     Ident(String),
     // Operators & Punctuation
+    /// The `+` operator — addition.
     Plus,
+    /// The `:` punctuation — type annotation separator.
     Colon,
+    /// The `-` operator — subtraction.
     Minus,
+    /// The `*` operator — multiplication.
     Star,
+    /// The `/` operator — division.
     Slash,
+    /// The `,` punctuation — item separator.
     Comma,
+    /// The `=` operator — assignment.
     Eq,
+    /// The `;` punctuation — statement terminator.
     Semicolon,
+    /// The `(` punctuation — opening parenthesis.
     LParen,
+    /// The `)` punctuation — closing parenthesis.
     RParen,
+    /// The `{` punctuation — opening brace (block start).
     LBrace,
+    /// The `}` punctuation — closing brace (block end).
     RBrace,
     // Keywords (cont.)
+    /// The `as` keyword — type cast.
     As,
+    /// The `use` keyword — import declaration.
     Use,
+    /// The `extern` keyword — external function declaration.
     Extern,
     // Literals (cont.)
+    /// A string literal (e.g. `"hello"`).
     StrLit(String),
     // Operators & Punctuation (cont.)
+    /// The `::` punctuation — path separator for qualified names.
     DoubleColon, // ::
-    RArrow,      // ->
-    Ellipsis,    // ...
+    /// The `->` punctuation — return type arrow.
+    RArrow, // ->
+    /// The `...` punctuation — spread/rest pattern.
+    Ellipsis, // ...
     // Type name tokens
+    /// The `i8` type keyword — 8-bit signed integer.
     I8,
+    /// The `str` type keyword — string slice.
     Str,
+    /// The `i16` type keyword — 16-bit signed integer.
     I16,
+    /// The `i32` type keyword — 32-bit signed integer.
     I32,
+    /// The `i64` type keyword — 64-bit signed integer.
     I64,
+    /// The `u8` type keyword — 8-bit unsigned integer.
     U8,
+    /// The `u16` type keyword — 16-bit unsigned integer.
     U16,
+    /// The `u32` type keyword — 32-bit unsigned integer.
     U32,
+    /// The `u64` type keyword — 64-bit unsigned integer.
     U64,
+    /// The `usize` type keyword — pointer-width unsigned integer.
     Usize,
+    /// The `isize` type keyword — pointer-width signed integer.
     Isize,
+    /// The `f32` type keyword — 32-bit floating point.
     F32,
+    /// The `f64` type keyword — 64-bit floating point.
     F64,
-    Bang,      // !
-    BangEq,    // !=
+    /// The `!` operator — logical not or never type annotation.
+    Bang, // !
+    /// The `!=` operator — inequality comparison.
+    BangEq, // !=
+    /// The `&` operator — reference creation.
     Ampersand, // &
-    Dot,       // .
+    /// The `.` punctuation — member access.
+    Dot, // .
     // Struct / Impl / Trait / Type / Enum keywords
+    /// The `pub` keyword — public visibility.
     Pub,
+    /// The `struct` keyword — struct declaration.
     Struct,
+    /// The `enum` keyword — enum declaration.
     Enum,
+    /// The `impl` keyword — implementation block.
     Impl,
+    /// The `trait` keyword — trait declaration.
     Trait,
+    /// The `type` keyword — type alias declaration.
     Type,
+    /// The `for` keyword — for-loop and trait impl binding.
     For,
+    /// The `in` keyword — for-loop iteration source.
     In,
+    /// The `Self` keyword — the implementing type in an impl block.
     Self_,
+    /// The `Self` type keyword — the implementing type used as a type.
     SelfType,
+    /// The `_` pattern — wildcard (matches anything, binds nothing).
     Underscore,
     // New punctuation
-    Pound,    // #
+    /// The `#` punctuation — attribute marker.
+    Pound, // #
+    /// The `[` punctuation — opening bracket (array, generic).
     LBracket, // [
+    /// The `]` punctuation — closing bracket.
     RBracket, // ]
     // Operators (cont.)
-    EqEq,   // ==
-    Lt,     // <
-    Gt,     // >
-    Le,     // <=
-    Ge,     // >=
+    /// The `==` operator — equality comparison.
+    EqEq, // ==
+    /// The `<` operator — less-than comparison.
+    Lt, // <
+    /// The `>` operator — greater-than comparison.
+    Gt, // >
+    /// The `<=` operator — less-than-or-equal comparison.
+    Le, // <=
+    /// The `>=` operator — greater-than-or-equal comparison.
+    Ge, // >=
+    /// The `&&` operator — logical AND.
     AndAnd, // &&
-    OrOr,   // ||
-    Pipe,   // |
+    /// The `||` operator — logical OR.
+    OrOr, // ||
+    /// The `|` operator — bitwise OR or pattern alternatives.
+    Pipe, // |
     // Pattern matching
+    /// The `match` keyword — pattern matching expression.
     Match,
+    /// The `=>` punctuation — match arm arrow.
     FatArrow, // =>
     // Special
+    /// End-of-file sentinel — emitted when the lexer reaches the end of input.
     Eof,
 }

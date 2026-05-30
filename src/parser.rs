@@ -1,3 +1,21 @@
+//! Recursive descent parser for the ulang programming language.
+//!
+//! This module implements a hand-written recursive descent parser that
+//! converts a token stream (produced by the lexer) into an AST [`Program`].
+//!
+//! # Approach
+//!
+//! - **Recursive descent**: each grammar rule has a corresponding `parse_*` method.
+//! - **Operator precedence**: expression parsing uses a precedence ladder via
+//!   chained method calls (`parse_assign` → `parse_logical_or` → `parse_logical_and`
+//!   → `parse_comparison` → `parse_additive` → `parse_term` → `parse_primary_as`
+//!   → `parse_prefix` → `parse_postfix` → `parse_primary`).
+//! - **Name tracking**: the parser maintains symbol tables (`struct_defs`,
+//!   `type_aliases`, `struct_names`, `enum_names`) for name conflict detection
+//!   and struct literal disambiguation at parse time.
+//! - **Error recovery**: empty bodies and malformed declarations are parsed
+//!   where possible to enable reporting multiple errors per compilation.
+
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::{
@@ -7,24 +25,46 @@ use crate::ast::{
 };
 use crate::token::{Span, Token};
 
+///
+/// Contains the [`Span`] of the erroneous region and a human-readable
+/// message describing the problem.
 #[derive(Debug)]
 pub struct ParseError {
     pub span: Span,
     pub msg: String,
 }
 
+/// Recursive descent parser for the ulang programming language.
+///
+/// Wraps a borrowed token slice and the current position. Maintains
+/// symbol tables for name resolution, struct literal disambiguation,
+/// and type alias resolution at the module level.
 pub struct Parser<'a> {
+    /// Borrowed slice of (token, span) pairs from the lexer.
     tokens: &'a [(Token, Span)],
+    /// Current position in the token stream.
     pos: usize,
+    /// Map from struct name to its field definitions, used for struct literal
+    /// parsing and member access resolution.
     struct_defs: HashMap<String, Vec<StructField>>,
+    /// Map from type alias name to its generic parameters and aliased type.
+    /// Populated during parsing so that generic type arguments can be
+    /// recognized when they appear in type position.
     type_aliases: HashMap<String, (Vec<GenericParam>, Type)>,
+    /// Set of struct names declared in the current module, used for
+    /// name conflict detection.
     struct_names: HashSet<String>,
+    /// Set of enum names declared in the current module, used for
+    /// name conflict detection.
     enum_names: HashSet<String>,
     /// When true, `Ident { ... }` is NOT parsed as a struct literal.
     suppress_struct_lit: bool,
 }
 
 impl<'a> Parser<'a> {
+    /// Creates a new `Parser` from a borrowed token slice.
+    ///
+    /// Initializes position to 0 and all symbol tables to empty.
     pub fn new(tokens: &'a [(Token, Span)]) -> Self {
         Self {
             tokens,
@@ -37,6 +77,29 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Top-level entry point for parsing a complete ulang program.
+    ///
+    /// Loops until `Eof`, dispatching on the leading token for each declaration kind:
+    ///
+    /// | Token   | Declaration            |
+    /// |---------|------------------------|
+    /// | `use`   | Use imports            |
+    /// | `mod`   | Module declarations    |
+    /// | `extern`| External FFI bindings  |
+    /// | `enum`  | Enum declarations      |
+    /// | `struct`| Struct declarations    |
+    /// | `trait` | Trait declarations     |
+    /// | `impl`  | Impl blocks            |
+    /// | `type`  | Type aliases           |
+    /// | _       | Function declarations  |
+    ///
+    /// After parsing, type aliases in the resulting program are resolved
+    /// via [`resolve_type_aliases`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `ParseError` on name conflicts (duplicate struct, enum, or
+    /// type alias names), stray `pub` without a declaration, or `pub` on `impl` blocks.
     pub fn parse_program(&mut self) -> Result<Program, ParseError> {
         let mut uses = Vec::new();
         let mut modules = Vec::new();
@@ -84,7 +147,7 @@ impl<'a> Parser<'a> {
                 Token::Enum => {
                     let mut decl = self.parse_enum_decl(attribs)?;
                     decl.is_pub = is_pub;
-                    // Check for duplicate name
+                    // Prevent enum name from conflicting with an existing struct or type alias.
                     if self.struct_names.contains(&decl.name)
                         || self.type_aliases.contains_key(&decl.name)
                     {
@@ -102,7 +165,7 @@ impl<'a> Parser<'a> {
                 Token::Struct => {
                     let mut decl = self.parse_struct_decl(attribs)?;
                     decl.is_pub = is_pub;
-                    // Check for duplicate name with existing type alias
+                    // Prevent struct name from shadowing a type alias in the same module.
                     if self.type_aliases.contains_key(&decl.name) {
                         return Err(ParseError {
                             span: decl.span,
@@ -139,7 +202,7 @@ impl<'a> Parser<'a> {
                 Token::Type => {
                     let mut decl = self.parse_type_alias()?;
                     decl.is_pub = is_pub;
-                    // Check for duplicate name with existing struct
+                    // Prevent type alias name from conflicting with struct, function, or trait names.
                     if self.struct_names.contains(&decl.name)
                         || funcs.iter().any(|f| f.name == decl.name)
                         || traits.iter().any(|t| t.name == decl.name)
@@ -182,6 +245,21 @@ impl<'a> Parser<'a> {
         Ok(program)
     }
 
+    /// Parse a `mod` declaration: `mod name;` or `mod name { ... }`.
+    ///
+    /// # Preconditions
+    ///
+    /// Current token is `Mod`.
+    ///
+    /// # Postconditions
+    ///
+    /// Consumes the entire module declaration up to and including `;` or `}`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ParseError` if the module name is missing or `{`/
+    /// `}` are mismatched. Nested declarations are validated as in
+    /// [`parse_program`].
     fn parse_mod_decl(&mut self, is_pub: bool) -> Result<ModuleDecl, ParseError> {
         let lo = self.current_span_lo();
         self.expect(&Token::Mod)?;
@@ -317,6 +395,22 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// Parse zero or more attribute groups: `#[name(args)]`.
+    ///
+    /// Each attribute starts with `#[` and ends with `]`. Arguments
+    /// are a parenthesized comma-separated list of identifiers.
+    ///
+    /// # Preconditions
+    ///
+    /// Any position. Only consumes if current tokens begin with `# [`.
+    ///
+    /// # Postconditions
+    ///
+    /// Advances past all contiguous `#[ ... ]` groups. Returns empty vec if none.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ParseError` if the attribute name is missing or `]` is absent.
     fn parse_attrs(&mut self) -> Result<Vec<Attribute>, ParseError> {
         let mut attrs = Vec::new();
         let default = (Token::Eof, Span::empty(0));
@@ -393,6 +487,23 @@ impl<'a> Parser<'a> {
         Ok(attrs)
     }
 
+    /// Parse a `use` declaration: `use path::to::item;`.
+    ///
+    /// Supports brace groups (`use a::{b, c};`) and `self` imports,
+    /// all flattened into multiple `Use` entries at parse time.
+    ///
+    /// # Preconditions
+    ///
+    /// Current token is `Use`.
+    ///
+    /// # Postconditions
+    ///
+    /// Consumes `Use` through the terminating `;`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ParseError` if the path has fewer than 2 segments or the
+    /// terminating `;` is missing.
     fn parse_use_decl(&mut self, is_pub: bool) -> Result<Vec<Use>, ParseError> {
         let lo = self.current_span_lo();
         self.expect(&Token::Use)?;
@@ -508,6 +619,24 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
+    /// Parse an `extern` block: `extern "C" { ... }` or `extern "C" fn name(...);`.
+    ///
+    /// FFI declarations are always `extern "C"`. May contain multiple
+    /// function declarations inside braces or a single one outside.
+    ///
+    /// # Preconditions
+    ///
+    /// Current token is `Extern`.
+    ///
+    /// # Postconditions
+    ///
+    /// Consumes the entire `extern` declaration. Parsed functions are
+    /// appended to `funcs`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ParseError` if the ABI string is not `"C"` or if `pub`
+    /// is applied to a block-level extern.
     fn parse_extern(&mut self, is_pub: bool, funcs: &mut Vec<Function>) -> Result<(), ParseError> {
         self.expect(&Token::Extern)?;
         // Expect "C" string literal
@@ -557,6 +686,14 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
+    /// Parse a single extern function declaration: `fn name(params) -> RetType;`.
+    ///
+    /// Used inside `extern "C" { ... }` blocks or standalone `extern "C" fn ...;`.
+    /// Supports optional variadic `...` parameter.
+    ///
+    /// # Preconditions
+    ///
+    /// Current token is `Fn` (the caller has consumed `extern` and its ABI string).
     fn parse_extern_fn(&mut self) -> Result<Function, ParseError> {
         let lo = self.current_span_lo();
         self.expect(&Token::Fn)?;
@@ -616,6 +753,22 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// Parse generic type parameters: `<T: Bound1 + Bound2, U, const N: usize>`.
+    ///
+    /// Supports trait bounds on type parameters and type annotations on `const` params.
+    ///
+    /// # Preconditions
+    ///
+    /// Current token is `Lt`.
+    ///
+    /// # Postconditions
+    ///
+    /// Consumes through the matching `Gt`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ParseError` if a parameter name is missing or bounds/type annotations
+    /// are malformed.
     fn parse_generic_params(&mut self) -> Result<Vec<GenericParam>, ParseError> {
         let mut params = Vec::new();
         self.expect(&Token::Lt)?;
@@ -705,6 +858,24 @@ impl<'a> Parser<'a> {
         Ok(params)
     }
 
+    /// Parse a `struct` declaration: `struct Name { field: Type, ... }`
+    /// or `struct Name;` for a unit-like struct.
+    ///
+    /// Fields may carry individual `pub` visibility. Generic type
+    /// parameters are supported after the struct name.
+    ///
+    /// # Preconditions
+    ///
+    /// Current token is `Struct`.
+    ///
+    /// # Postconditions
+    ///
+    /// Consumes through the closing `}` or terminating `;`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ParseError` if the struct name is missing, a field name
+    /// is missing, or `{` / `}` are mismatched.
     fn parse_struct_decl(&mut self, attribs: Vec<Attribute>) -> Result<StructDecl, ParseError> {
         let lo = self.current_span_lo();
         self.expect(&Token::Struct)?;
@@ -791,6 +962,23 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// Parse an `enum` declaration: `enum Name { Var1(Type), Var2, ... }`.
+    ///
+    /// Variants may carry an optional parenthesized payload type.
+    /// Generic type parameters are supported after the enum name.
+    ///
+    /// # Preconditions
+    ///
+    /// Current token is `Enum`.
+    ///
+    /// # Postconditions
+    ///
+    /// Consumes through the closing `}`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ParseError` if the enum name is missing, `{` is absent,
+    /// or a variant name is missing.
     fn parse_enum_decl(&mut self, attribs: Vec<Attribute>) -> Result<EnumDecl, ParseError> {
         let lo = self.current_span_lo();
         self.expect(&Token::Enum)?;
@@ -863,6 +1051,19 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// Parse a `type` alias declaration: `type Name<Params> = Type;`.
+    ///
+    /// # Preconditions
+    ///
+    /// Current token is `Type`.
+    ///
+    /// # Postconditions
+    ///
+    /// Consumes through the terminating `;`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ParseError` if the alias name, `=`, or type is missing.
     fn parse_type_alias(&mut self) -> Result<TypeAliasDecl, ParseError> {
         let lo = self.current_span_lo();
         self.expect(&Token::Type)?;
@@ -899,6 +1100,23 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// Parse an `impl` block: `impl Type { ... }` or `impl Trait for Type { ... }`.
+    ///
+    /// Uses one-token lookahead to distinguish inherent impls from trait impls
+    /// (detecting the `for` keyword after an optional generic parameter list).
+    /// Contains methods and associated constants.
+    ///
+    /// # Preconditions
+    ///
+    /// Current token is `Impl`.
+    ///
+    /// # Postconditions
+    ///
+    /// Consumes through the closing `}`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ParseError` if braces or item bodies are malformed.
     fn parse_impl_decl(&mut self) -> Result<ImplDecl, ParseError> {
         let lo = self.current_span_lo();
         self.expect(&Token::Impl)?;
@@ -1042,6 +1260,24 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// Parse a `trait` declaration: `trait Name { fn method(...); fn method(...) { ... } ... }`.
+    ///
+    /// Supports associated constants (`const NAME: Type [= expr];`)
+    /// and methods with optional default bodies.
+    /// Generic type parameters are supported after the trait name.
+    ///
+    /// # Preconditions
+    ///
+    /// Current token is `Trait`.
+    ///
+    /// # Postconditions
+    ///
+    /// Consumes through the closing `}`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ParseError` if the trait name is missing, `{`/`}` are
+    /// mismatched, or a method/constant item is malformed.
     fn parse_trait_decl(&mut self) -> Result<TraitDecl, ParseError> {
         let lo = self.current_span_lo();
         self.expect(&Token::Trait)?;
@@ -1153,6 +1389,25 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// Parse a function declaration: `fn name<Params>(params) -> RetType { body }`.
+    ///
+    /// Supports generic type parameters, a parameter list, optional return type,
+    /// and a block body. Intrinsic functions (marked `#[ulang_intrinsic]`) use
+    /// a semicolon instead of a body.
+    ///
+    /// # Preconditions
+    ///
+    /// Current token is `Fn` (already consumed by the caller in dispatch; this
+    /// method is called from the `_ =>` arm of `parse_program` or from `parse_impl_decl`
+    /// where the `fn` keyword has already been consumed).
+    ///
+    /// # Postconditions
+    ///
+    /// Consumes through the closing `}` or `;`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ParseError` if the function name, parameters, or body are malformed.
     fn parse_function(&mut self, attribs: Vec<Attribute>) -> Result<Function, ParseError> {
         let lo = self.current_span_lo();
         self.expect(&Token::Fn)?;
@@ -1314,6 +1569,22 @@ impl<'a> Parser<'a> {
         Ok(params)
     }
 
+    /// Parse a block: `{ stmt; ... tail_expr }`.
+    ///
+    /// A block is a sequence of statements optionally followed by a
+    /// tail expression (an expression without a trailing semicolon).
+    ///
+    /// # Preconditions
+    ///
+    /// Current token is `LBrace`.
+    ///
+    /// # Postconditions
+    ///
+    /// Consumes through the matching `RBrace`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ParseError` if the closing `}` is missing (Eof).
     fn parse_block(&mut self) -> Result<Block, ParseError> {
         let lo = match self.current() {
             Some((_, span)) => span.lo,
@@ -1357,6 +1628,19 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// Parse a single statement.
+    ///
+    /// Dispatches on the leading token:
+    /// - `let` → let binding (with optional `mut`, pattern, type annotation, init)
+    /// - `const` → const declaration
+    /// - `return` → return statement (with optional value)
+    /// - `continue` / `break` → loop control flow
+    /// - _ → expression statement (expression terminated by `;`)
+    ///
+    /// # Errors
+    ///
+    /// Returns `ParseError` for non-exhaustive (refutable) patterns in let,
+    /// or if `;` is missing for expression statements.
     fn parse_stmt(&mut self) -> Result<Stmt, ParseError> {
         match self.peek_token() {
             Token::Let => {
@@ -1479,10 +1763,26 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Entry point for expression parsing.
+    ///
+    /// Delegates directly to [`parse_assign`], which starts the precedence ladder.
     fn parse_expr(&mut self) -> Result<Expr, ParseError> {
         self.parse_assign()
     }
 
+    // Precedence ladder: assignment is the lowest-precedence expression.
+    // Higher levels: logical-or > logical-and > comparison > additive > term > cast > prefix > postfix.
+    /// Parse assignment (lowest precedence binary operator).
+    ///
+    /// Grammar: `left = right` where `right` is parsed right-associatively
+    /// via recursive call to `parse_assign`. The left-hand side must be an
+    /// identifier, dereference, field access, or index expression.
+    ///
+    /// Delegates to [`parse_logical_or`] when no `=` is present.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ParseError` if the left-hand side is not a valid assignment target.
     fn parse_assign(&mut self) -> Result<Expr, ParseError> {
         let lhs = self.parse_logical_or()?;
         if *self.peek_token() == Token::Eq {
@@ -1513,6 +1813,12 @@ impl<'a> Parser<'a> {
         }
     }
 
+    // Precedence: logical OR (||) — one level above assignment, one below logical AND.
+    /// Parse logical OR (`||`), left-associative.
+    ///
+    /// Delegates to [`parse_logical_and`] for operands.
+    ///
+    /// Precedence level: assignment < **logical or** < logical and < comparison.
     fn parse_logical_or(&mut self) -> Result<Expr, ParseError> {
         let mut lhs = self.parse_logical_and()?;
         loop {
@@ -1533,6 +1839,12 @@ impl<'a> Parser<'a> {
         Ok(lhs)
     }
 
+    // Precedence: logical AND (&&) — one level above OR, one below comparison.
+    /// Parse logical AND (`&&`), left-associative.
+    ///
+    /// Delegates to [`parse_comparison`] for operands.
+    ///
+    /// Precedence level: logical or < **logical and** < comparison.
     fn parse_logical_and(&mut self) -> Result<Expr, ParseError> {
         let mut lhs = self.parse_comparison()?;
         loop {
@@ -1553,6 +1865,12 @@ impl<'a> Parser<'a> {
         Ok(lhs)
     }
 
+    // Precedence: comparison (==, !=, <, >, <=, >=) — one level above additive.
+    /// Parse comparison operators (`==`, `!=`, `<`, `>`, `<=`, `>=`), left-associative.
+    ///
+    /// Delegates to [`parse_additive`] for operands.
+    ///
+    /// Precedence level: logical and < **comparison** < additive.
     fn parse_comparison(&mut self) -> Result<Expr, ParseError> {
         let mut lhs = self.parse_additive()?;
         loop {
@@ -1578,6 +1896,12 @@ impl<'a> Parser<'a> {
         Ok(lhs)
     }
 
+    // Precedence: additive (+, -) — one level above term (multiplicative).
+    /// Parse additive operators (`+`, `-`), left-associative.
+    ///
+    /// Delegates to [`parse_term`] for operands.
+    ///
+    /// Precedence level: comparison < **additive** < term (multiplicative).
     fn parse_additive(&mut self) -> Result<Expr, ParseError> {
         let mut lhs = self.parse_term()?;
         loop {
@@ -1610,6 +1934,7 @@ impl<'a> Parser<'a> {
         Ok(lhs)
     }
 
+    // Precedence: postfix ([], ., ()) — tightest binding, one level above primary.
     /// Parse a primary expression followed by postfix operators:
     /// - `.N` tuple member access
     /// - `.ident(args)` method call
@@ -1708,6 +2033,7 @@ impl<'a> Parser<'a> {
         Ok(expr)
     }
 
+    // Precedence: prefix unary (&, *, !, -) — one level above postfix.
     /// Parse a primary expression followed by zero or more `as Type` casts.
     /// This binds tighter than binary operators: `a * b as i32` → `a * (b as i32)`
     fn parse_prefix(&mut self) -> Result<Expr, ParseError> {
@@ -1752,6 +2078,7 @@ impl<'a> Parser<'a> {
         self.parse_postfix()
     }
 
+    // Precedence: cast (as) — one level above prefix.
     /// Parse a primary expression followed by zero or more `as Type` casts.
     /// This binds tighter than binary operators: `a * b as i32` → `a * (b as i32)`
     fn parse_primary_as(&mut self) -> Result<Expr, ParseError> {
@@ -1769,6 +2096,12 @@ impl<'a> Parser<'a> {
         Ok(expr)
     }
 
+    // Precedence: multiplicative (*, /) — one level above cast.
+    /// Parse multiplicative operators (`*`, `/`), left-associative.
+    ///
+    /// Delegates to [`parse_primary_as`] for operands.
+    ///
+    /// Precedence level: additive < **term** < cast < prefix.
     fn parse_term(&mut self) -> Result<Expr, ParseError> {
         let mut lhs = self.parse_primary_as()?;
         loop {
@@ -1801,6 +2134,23 @@ impl<'a> Parser<'a> {
         Ok(lhs)
     }
 
+    /// Parse a type annotation.
+    ///
+    /// Handles:
+    /// - `impl Trait1 + Trait2` (anonymous impl trait)
+    /// - `&Type` and `&mut Type` (references)
+    /// - `*const Type` and `*mut Type` (raw pointers)
+    /// - `(Type1, Type2)` (tuple types) and `()` (unit)
+    /// - `[Type; N]` (fixed-size arrays), `[Type; Ident]` (const generic arrays),
+    ///   `[Type]` (slices)
+    /// - Primitive types (`i32`, `bool`, `str`, etc.)
+    /// - Named types (`StructName`, `module::Type`)
+    /// - Generic instances (`Name<Arg1, Arg2>`)
+    /// - Type aliases (`Alias<Arg1>`)
+    ///
+    /// # Errors
+    ///
+    /// Returns `ParseError` if the token does not form a valid type.
     fn parse_type(&mut self) -> Result<Type, ParseError> {
         if *self.peek_token() == Token::Impl {
             self.advance();
@@ -2017,6 +2367,15 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Parse a tuple or parenthesized type: `(Type)` or `(Type1, Type2, ...)` or `()`.
+    ///
+    /// # Preconditions
+    ///
+    /// Current token is `LParen` (already consumed in [`parse_type`]).
+    ///
+    /// # Postconditions
+    ///
+    /// Consumes through the matching `RParen`.
     fn parse_tuple_type(&mut self) -> Result<Type, ParseError> {
         self.expect(&Token::LParen)?;
         // Empty parens → Unit
@@ -2045,6 +2404,9 @@ impl<'a> Parser<'a> {
         Ok(first)
     }
 
+    /// Convert a primitive type token to its corresponding `Type` variant.
+    ///
+    /// Returns `None` for non-primitive tokens.
     fn token_to_type(token: &Token) -> Option<Type> {
         match token {
             Token::Bool => Some(Type::Bool),
@@ -2065,6 +2427,15 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Parse a parenthesized argument list: `(expr, expr, ...)`.
+    ///
+    /// # Preconditions
+    ///
+    /// Current token is `LParen`.
+    ///
+    /// # Postconditions
+    ///
+    /// Consumes through the matching `RParen`.
     fn parse_call_args(&mut self) -> Result<Vec<Expr>, ParseError> {
         self.expect(&Token::LParen)?;
         let mut args = Vec::new();
@@ -2082,6 +2453,11 @@ impl<'a> Parser<'a> {
         Ok(args)
     }
 
+    /// Parse turbofish type arguments: `::<Type1, Type2, ...>`.
+    ///
+    /// # Preconditions
+    ///
+    /// Current token is `Lt` (the `::` has been consumed by the caller).
     fn parse_turbofish_types(&mut self) -> Result<Vec<Type>, ParseError> {
         self.expect(&Token::Lt)?;
         let mut types = Vec::new();
@@ -2100,6 +2476,18 @@ impl<'a> Parser<'a> {
         Ok(types)
     }
 
+    /// Parse a struct literal expression: `StructName { field: value, ... }`.
+    ///
+    /// Supports shorthand field syntax: `field` expands to `field: field`.
+    ///
+    /// # Preconditions
+    ///
+    /// The opening `LBrace` has NOT yet been consumed (this method expects
+    /// the current token to be `LBrace`).
+    ///
+    /// # Postconditions
+    ///
+    /// Consumes through the closing `}`.
     fn parse_struct_lit(&mut self, struct_name: &str, start_lo: usize) -> Result<Expr, ParseError> {
         self.expect(&Token::LBrace)?;
         let mut fields = Vec::new();
@@ -2142,6 +2530,28 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// Parse a primary expression (atoms, literals, identifiers, block expressions).
+    ///
+    /// Handles:
+    /// - Integer, float, string, and boolean literals
+    /// - Integer and float literals with type suffixes (e.g. `42u32`)
+    /// - Identifiers, possibly qualified via `::` paths
+    /// - Struct literals (`Name { field: value, ... }`) and empty struct literals
+    /// - Enum literals (`Enum::Variant(val)`, `Enum::Variant`)
+    /// - Qualified calls (`Module::func(args)`)
+    /// - Array and tuple literals
+    /// - Parenthesized expressions
+    /// - `if`, `if let`, `loop`, `while`, `for`, and `match` expressions
+    /// - Block expressions (`{ ... }`)
+    ///
+    /// # Preconditions
+    ///
+    /// Positioned at or before the first token of the primary expression.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ParseError` for unexpected tokens, empty array literals, or
+    /// incomplete constructs.
     fn parse_primary(&mut self) -> Result<Expr, ParseError> {
         let is_primitive_type = match self.peek_token() {
             Token::Bool
@@ -2544,6 +2954,24 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Parse an `if` or `if let` expression.
+    ///
+    /// Detects `if let` by checking for the `let` keyword after `if`.
+    /// Regular `if` expressions support `else if` chains and a final `else` block.
+    ///
+    /// # Preconditions
+    ///
+    /// Current token is `If`.
+    ///
+    /// # Postconditions
+    ///
+    /// Consumes through the last `}` of the `if`/`else` chain.
+    ///
+    /// # Suppress struct lit
+    ///
+    /// `suppress_struct_lit` is enabled while parsing the condition to prevent
+    /// an identifier followed by `{` from being parsed as a struct literal when
+    /// the `{` should start the then-block.
     fn parse_if_expr(&mut self) -> Result<Expr, ParseError> {
         let lo = self.current_span_lo();
         self.expect(&Token::If)?;
@@ -2623,6 +3051,11 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// Parse a `loop` expression: `loop { body }`.
+    ///
+    /// # Preconditions
+    ///
+    /// Current token is `Loop`.
     fn parse_loop_expr(&mut self) -> Result<Expr, ParseError> {
         let lo = self.current_span_lo();
         self.expect(&Token::Loop)?;
@@ -2634,6 +3067,16 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// Parse a `while` expression: `while cond { body }`.
+    ///
+    /// # Preconditions
+    ///
+    /// Current token is `While`.
+    ///
+    /// # Suppress struct lit
+    ///
+    /// `suppress_struct_lit` is enabled while parsing the condition for the
+    /// same reason as in [`parse_if_expr`].
     fn parse_while_expr(&mut self) -> Result<Expr, ParseError> {
         let lo = self.current_span_lo();
         self.expect(&Token::While)?;
@@ -2649,6 +3092,16 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// Parse a `for` expression: `for pattern in container { body }`.
+    ///
+    /// # Preconditions
+    ///
+    /// Current token is `For`.
+    ///
+    /// # Suppress struct lit
+    ///
+    /// `suppress_struct_lit` is enabled while parsing the container expression
+    /// to avoid ambiguity with the body block.
     fn parse_for_expr(&mut self) -> Result<Expr, ParseError> {
         let lo = self.current_span_lo();
         self.expect(&Token::For)?;
@@ -2836,6 +3289,12 @@ impl<'a> Parser<'a> {
         Ok(Pattern::Binding(name))
     }
 
+    /// Check whether a pattern is refutable (non-exhaustive).
+    ///
+    /// Returns `true` for enum variants, integer, and boolean literal patterns;
+    /// `false` for bindings and wildcards.
+    ///
+    /// Refutable patterns are rejected in `let` bindings.
     fn is_refutable_pattern(pattern: &Pattern) -> bool {
         match pattern {
             Pattern::Binding(_) | Pattern::Wildcard => false,
@@ -2843,21 +3302,31 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Return the current token without consuming it.
+    ///
+    /// Clamps `pos` to the last token to safely handle end-of-stream.
     fn peek_token(&self) -> &Token {
         let idx = self.pos.min(self.tokens.len().saturating_sub(1));
         &self.tokens[idx].0
     }
 
+    /// Return the current (token, span) pair, or `None` at end of stream.
     fn current(&self) -> Option<&(Token, Span)> {
         self.tokens.get(self.pos)
     }
 
+    /// Advance to the next token, consuming the current one.
     fn advance(&mut self) {
         if self.pos < self.tokens.len() {
             self.pos += 1;
         }
     }
 
+    /// Assert the current token matches `expected`, consuming it.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ParseError` with a descriptive message on mismatch.
     fn expect(&mut self, expected: &Token) -> Result<(), ParseError> {
         if self.peek_token() == expected {
             self.advance();
@@ -2872,6 +3341,9 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Return the end position (`hi`) of the most recently consumed token.
+    ///
+    /// Returns 0 if no tokens have been consumed yet.
     fn last_span_end(&self) -> usize {
         if self.pos == 0 {
             return 0;
@@ -3104,6 +3576,9 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
+    /// Return the start position (`lo`) of the current token.
+    ///
+    /// Falls back to `last_span_end()` when no current token exists.
     fn current_span_lo(&self) -> usize {
         match self.current() {
             Some((_, span)) => span.lo,

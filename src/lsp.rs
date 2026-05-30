@@ -1,3 +1,45 @@
+//! # ulang Language Server Protocol Implementation
+//!
+//! This module implements the [LSP](https://microsoft.github.io/language-server-protocol/) server for the ulang
+//! programming language. It communicates with editors over stdio using the JSON-RPC-based LSP protocol.
+//!
+//! ## Server Lifecycle
+//!
+//! [`run_server()`] initializes the connection, negotiates capabilities, loads the standard library cache,
+//! and enters the main message loop. The [`main_loop()`] dispatches incoming requests and notifications:
+//!
+//! - **Requests** — `textDocument/hover`, `textDocument/definition`, `textDocument/completion`,
+//!   `textDocument/semanticTokens/full` — are handled by the corresponding `handle_*` functions.
+//! - **Notifications** — `textDocument/didOpen`, `textDocument/didChange`, `textDocument/didClose` —
+//!   update the document state and publish diagnostics.
+//!
+//! ## Capabilities
+//!
+//! The server advertises:
+//! - **Full text document sync** — the editor sends the entire file content on every change.
+//! - **Semantic tokens** — fine-grained syntax highlighting via the `SemanticTokensFullRequest` protocol,
+//!   using a delta-encoded token format (see [`build_semantic_map()`] and [`collect_semantic_tokens()`]).
+//! - **Hover** — type information and declaration signatures displayed on hover.
+//! - **Go-to-definition** — jumps to a symbol's definition, supporting both local and stdlib resolution.
+//! - **Completions** — keyword, attribute, local symbol, project file, and standard library completions.
+//!
+//! ## Diagnostics
+//!
+//! Diagnostics are produced by [`get_diagnostics()`] which runs the lexer and parser on the current
+//! document text and reports any syntax or parse errors. The server re-computes diagnostics on every
+//! `didOpen` and `didChange` notification via [`update_document()`] and pushes them to the editor
+//! via [`publish_diagnostics()`].
+//!
+//! ## State Management
+//!
+//! Open documents are tracked in a `HashMap<Url, DocumentState>`. Each entry holds the current source
+//! text and, if parsing succeeded, the last valid AST. This dual state allows the server to provide
+//! semantic analysis (hover, go-to-definition, semantic tokens) even while the user is editing
+//! temporarily invalid code — the stale AST is reused until parsing succeeds again.
+//!
+//! The standard library is pre-loaded at startup into [`StdlibCache`] so that cross-module hover,
+//! go-to-definition, and completions work without re-parsing stdlib files on every request.
+
 use crate::ast::Type;
 use crate::ast::{Block, Expr, Pattern, Program, Stmt};
 use crate::lexer::Lexer;
@@ -20,7 +62,6 @@ use lsp_types::{
 };
 use std::collections::HashMap;
 use url::Url;
-
 // ---------------------------------------------------------------------------
 // Semantic Tokens
 // ---------------------------------------------------------------------------
@@ -154,7 +195,16 @@ fn walk_expr_for_lets(expr: &Expr, map: &mut SemanticMap) {
 }
 
 /// Build the semantic map from a parsed Program AST.
-/// Returns entries of (name, type_index, modifier_bitmask, scope_span).
+///
+/// Iterates over every top-level item in the program — functions, structs, enums, traits,
+/// type aliases — and records each declaration with its semantic token type and modifier
+/// bitmask. Recursively walks function bodies to collect `let`-binding variable declarations
+/// (see [`walk_block_stmts()`]).
+///
+/// The result is a [`SemanticMap`] — a flat list of `(name, type_index, modifier_bitmask,
+/// scope_span)` tuples. The `scope_span` is used by [`lookup_semantic_map()`] to determine
+/// whether a reference at a given position falls within a declaration's scope, enabling
+/// correct shadowing resolution.
 fn build_semantic_map(program: &Program) -> SemanticMap {
     let mut map = Vec::new();
 
@@ -240,7 +290,21 @@ fn lookup_semantic_map(name: &str, token_span: &Span, map: &SemanticMap) -> Opti
 }
 
 /// Collect semantic tokens by walking the token stream and resolving identifiers
-/// against the semantic map. Returns delta-encoded SemanticTokens.
+/// against the semantic map.
+///
+/// Walks every token and assigns a semantic type based on token kind. Identifiers are looked up
+/// in the [`SemanticMap`] to determine whether they represent a function call, variable reference,
+/// type usage, etc. Non-identifier tokens (keywords, literals, built-in type names) are assigned
+/// directly from the token kind.
+///
+/// # Returns
+///
+/// A `Vec<SemanticToken>` in **delta-encoded** format: each token's position is expressed as a
+/// delta from the previous token (line offset, then column offset when on the same line). This is
+/// required by the [LSP semantic tokens protocol](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocument_semanticTokens).
+///
+/// Internally the function first collects absolute-positioned `(line, col, length, type_idx, mods)`
+/// tuples, sorts them by position, and then delta-encodes them into the final result.
 fn collect_semantic_tokens(
     tokens: &[(Token, Span)],
     source: &str,
@@ -362,7 +426,9 @@ fn collect_semantic_tokens(
     // Sort by (line, col)
     raw.sort_by_key(|&(l, c, _, _, _)| (l, c));
 
-    // Delta-encode
+    // Delta-encode: LSP requires semantic tokens in delta-encoded format rather than absolute
+    // positions. Each token's position is expressed as an offset from the previous token so that
+    // repeated tokens on the same line can omit redundant line/column data, keeping the payload small.
     let mut result = Vec::with_capacity(raw.len());
     let mut prev_line = 0u32;
     let mut prev_col = 0u32;
@@ -385,6 +451,11 @@ fn collect_semantic_tokens(
 }
 
 /// Handle a `textDocument/semanticTokens/full` request.
+///
+/// Given a document URI, retrieves the document state, lexes the source, builds a semantic map
+/// from the last valid AST, and produces delta-encoded semantic tokens. If the document has no
+/// valid parse (no `last_valid_program`), an empty semantic map is used so keyword and literal
+/// highlighting still works.
 fn handle_semantic_tokens(
     documents: &HashMap<Url, DocumentState>,
     params: lsp_types::SemanticTokensParams,
@@ -421,17 +492,27 @@ fn handle_semantic_tokens(
         data,
     }))
 }
-
+/// Holds the current state of an open document.
+///
+/// The server keeps one `DocumentState` per open file. The `source` field always contains the
+/// latest editor-provided text. The `last_valid_program` field is only updated when parsing succeeds;
+/// during transient syntax errors the stale AST is preserved so semantic features still work.
 struct DocumentState {
     source: String,
     last_valid_program: Option<Program>,
 }
 
+/// A single parsed standard library module.
 struct StdlibEntry {
     source: String,
     program: Program,
 }
 
+/// Pre-loaded standard library modules.
+///
+/// Loaded once at server startup. Cached to avoid re-parsing stdlib files on every hover,
+/// go-to-definition, or completion request. Parsing hundreds of lines of stdlib source for
+/// every keystroke would make the editor unresponsive.
 struct StdlibCache {
     entries: Vec<(Url, StdlibEntry)>,
 }
@@ -647,6 +728,7 @@ fn type_to_string(ty: &crate::ast::Type) -> String {
     }
 }
 
+/// Entry point for hover text lookup: delegates to [`get_hover_text_recursive()`].
 fn get_hover_text_from_program(
     program: &Program,
     name: &str,
@@ -655,6 +737,15 @@ fn get_hover_text_from_program(
     get_hover_text_recursive(program, name, struct_context)
 }
 
+/// Recursively search a parsed [`Program`] for a symbol's declaration and format its
+/// signature as a Markdown code block.
+///
+/// Searches in order: functions → structs → struct fields → enums → enum variants →
+/// traits → trait associated constants → type aliases → impl methods → impl associated
+/// constants → modules → then recursively into submodules.
+///
+/// When `struct_context` is `Some`, field/variant/method searches are scoped to that type,
+/// enabling correct hover for `obj.field` expressions.
 fn get_hover_text_recursive(
     program: &Program,
     name: &str,
@@ -905,6 +996,10 @@ fn get_hover_text_recursive(
     None
 }
 
+/// Walk backward from a token index to collect path segments before `::` separators.
+///
+/// For example, given `std::collections::HashMap` and clicking on `HashMap`, this returns
+/// `["std", "collections"]`. Used by hover and go-to-definition to resolve module-relative paths.
 fn get_path_prefix(tokens: &[(Token, Span)], clicked_idx: usize) -> Vec<String> {
     let mut segments = Vec::new();
     let mut idx = clicked_idx;
@@ -979,6 +1074,12 @@ fn get_struct_context(tokens: &[(Token, Span)], clicked_idx: usize) -> Option<St
     None
 }
 
+/// Resolve a bare module path prefix (e.g. `["option"]`) to a full path using the file's `use` declarations.
+///
+/// If the first segment is `"std"` or `"core"`, it is already fully qualified and returned as-is.
+/// Otherwise, searches the program's `use` declarations for an import ending with the first segment
+/// and prepends the import's full path. This enables resolution of shorthand paths like `Option` →
+/// `["std", "option", "Option"]` when the file has `use std::option::Option`.
 fn resolve_prefix_to_full_path(uses: &[crate::ast::Use], prefix: &[String]) -> Vec<String> {
     if prefix.is_empty() {
         return Vec::new();
@@ -1151,6 +1252,21 @@ fn collect_generic_scopes(tokens: &[(Token, Span)]) -> Vec<(usize, usize, Vec<Ge
     scopes
 }
 
+/// Find the [`Span`] of a symbol's definition by scanning a token stream.
+///
+/// This is the core resolution algorithm for go-to-definition. It searches in several passes:
+///
+/// 1. **Local backward search** — starting from the hover position, walk backward through tokens to
+///    find a `let` or `mut` binding for the given name. Stops at the enclosing `fn` boundary and
+///    also checks parameter names within the function signature.
+/// 2. **Generic parameter search** — find the innermost enclosing scope (`<…>`) that declares the
+///    name as a type parameter.
+/// 3. **Global forward search** — scan all top-level constructs (`fn`, `struct`, `enum`, `type`,
+///    `const`, `mod`, `trait`, `impl`) for declarations matching the name. When a `struct_context`
+///    is provided, field/variant/method searches are scoped to the named type, enabling resolution
+///    of `obj.field` syntax.
+///
+/// The `hover_offset` is used to locate the cursor position in the token stream for pass 1.
 fn find_definition_span(
     tokens: &[(Token, Span)],
     name: &str,
@@ -1555,6 +1671,13 @@ fn find_definition_span(
     None
 }
 
+/// Run the lexer and parser on source text to produce LSP diagnostics.
+///
+/// Returns a `Vec<Diagnostic>` containing any lex or parse errors found. Lex errors are returned
+/// immediately (stopping further processing) since the source cannot be meaningfully parsed after a
+/// lex failure. Parse errors are cumulative — the parser attempts recovery and may report multiple
+/// errors within a single source. If both lexing and parsing succeed, an empty diagnostics vector is
+/// returned.
 fn get_diagnostics(source: &str) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
     let mut lexer = Lexer::new(source);
@@ -1641,6 +1764,9 @@ fn update_document(
 
     if let Some(doc) = documents.get_mut(&url) {
         doc.source = text;
+        // Only update the cached AST on successful parses. If the user is mid-edit and the
+        // code doesn't parse, we keep the last valid program so semantic features (hover,
+        // go-to-definition, semantic tokens) remain functional despite transient errors.
         if parse_success {
             doc.last_valid_program = valid_prog;
         }
@@ -1649,6 +1775,9 @@ fn update_document(
             url,
             DocumentState {
                 source: text,
+                // For the initial insert, store the parsed AST even if None (first open).
+                // If parsing failed, semantic features report no info, which is acceptable
+                // since the user just opened a broken file.
                 last_valid_program: valid_prog,
             },
         );
@@ -1657,6 +1786,10 @@ fn update_document(
     diags
 }
 
+/// Publish a `textDocument/publishDiagnostics` notification to the client.
+///
+/// Wraps the diagnostics into an LSP notification and sends it over the connection.
+/// Called after every `didOpen` and `didChange` to keep the editor's problem list in sync.
 fn publish_diagnostics(
     connection: &Connection,
     url: Url,
@@ -1671,6 +1804,17 @@ fn publish_diagnostics(
     Ok(())
 }
 
+/// Handle a `textDocument/hover` request.
+///
+/// Lexes the document, finds the token at the cursor position, and returns type/signature
+/// information for the hovered symbol. Resolution follows a three-tier fallback:
+///
+/// 1. **Path-prefixed reference** — if the token is part of a `::`-separated path (e.g. `std::option::Option`),
+///    resolve the path prefix via [`resolve_prefix_to_full_path()`] and search the stdlib entry at that path.
+/// 2. **Local search** — search the current file's AST via [`get_hover_text_from_program()`].
+/// 3. **Stdlib search** — search the entire standard library cache via [`get_hover_text_from_stdlib()`].
+///
+/// The result is a Markdown-formatted code block showing the symbol's declaration signature.
 fn handle_hover(
     documents: &HashMap<Url, DocumentState>,
     stdlib_cache: &StdlibCache,
@@ -1869,6 +2013,20 @@ fn get_hover_text_from_stdlib(
     None
 }
 
+/// Handle a `textDocument/definition` (go-to-definition) request.
+///
+/// Lexes the document, finds the token at the cursor position, and resolves the definition
+/// location for the clicked symbol. Resolution follows a three-tier fallback:
+///
+/// 1. **`mod` declaration** — if the token follows `mod` and precedes `;`, open the corresponding
+///    `mod_name.u` or `mod_name/mod.u` file.
+/// 2. **Path-prefixed reference** — if the token is part of a `::`-separated path, resolve the
+///    prefix via [`resolve_prefix_to_full_path()`] and search the stdlib entry at that path using
+///    [`find_definition_span()`].
+/// 3. **Local search** — search the current file's token stream via [`find_definition_span()`].
+/// 4. **Stdlib search** — search the entire stdlib cache via [`find_stdlib_definition()`].
+///
+/// Returns a `Location` with the target file URI and definition range.
 fn handle_definition(
     documents: &HashMap<Url, DocumentState>,
     stdlib_cache: &StdlibCache,
@@ -2029,6 +2187,12 @@ struct ProjectCache {
     entries: Vec<(Url, StdlibEntry)>,
 }
 
+/// Build a cache of parsed project files for cross-file completions.
+///
+/// Walks the workspace directory tree collecting `.u` files, parses them, and stores the
+/// results in a [`ProjectCache`]. Skips files already open in the editor (uses the editor's
+/// source) and files belonging to the standard library (handled by [`StdlibCache`] instead).
+/// Skips `target/` directories and hidden directories.
 fn build_project_cache(
     workspace_root: &std::path::Path,
     documents: &HashMap<Url, DocumentState>,
@@ -2085,6 +2249,7 @@ fn build_project_cache(
     ProjectCache { entries }
 }
 
+/// Recursively collect all `.u` files under a directory, skipping `target/` and hidden dirs.
 fn collect_u_files(
     root: &std::path::Path,
     dir: &std::path::Path,
@@ -2930,6 +3095,23 @@ fn get_attribute_context(
     None
 }
 
+/// Handle a `textDocument/completion` request.
+///
+/// Provides completions from multiple sources depending on context:
+///
+/// - **Attribute context** — if the cursor is inside `#[…]`, suggests attribute names (`derive`,
+///   `inline`), derive trait names (`Default`, `Clone`, `Eq`, etc.), or inline arguments
+///   (`always`, `never`).
+/// - **Path prefix present** — if the cursor follows a `::` path (e.g. `std::option::`), narrows
+///   completions to symbols from the resolved stdlib or project module at that path.
+/// - **No path prefix** — collects from all sources:
+///   - Local symbols (current file's [`collect_local_symbols()`])
+///   - Project symbols (other `.u` files in the workspace via [`collect_project_symbols()`])
+///   - Standard library symbols (via [`collect_stdlib_symbols()`])
+///
+/// Results are sorted by source priority (local first, then project, then stdlib) and filtered
+/// by the word prefix. Function and method completions automatically append `()` snippet placeholders.
+/// `use` insertion positions are computed via [`find_use_insertion_position()`].
 fn handle_completion(
     documents: &HashMap<Url, DocumentState>,
     stdlib_cache: &StdlibCache,
@@ -3166,6 +3348,21 @@ fn handle_completion(
     }
 }
 
+/// Main LSP message loop.
+///
+/// Receives messages from the client via `connection.receiver` and dispatches them by method name.
+/// Maintains a `HashMap<Url, DocumentState>` of open documents.
+///
+/// **Requests handled:**
+/// - `textDocument/hover`
+/// - `textDocument/definition`
+/// - `textDocument/completion`
+/// - `textDocument/semanticTokens/full`
+///
+/// **Notifications handled:**
+/// - `textDocument/didOpen` — parse and store new document, publish initial diagnostics.
+/// - `textDocument/didChange` — re-parse and update document state, publish updated diagnostics.
+/// - `textDocument/didClose` — remove document from state.
 fn main_loop(
     connection: Connection,
     stdlib_cache: StdlibCache,
@@ -4817,12 +5014,14 @@ mod tests {
         }));
 
         // Parameters: a, b
-        assert!(map.iter().any(|(name, ty, _, _)| {
-            name == "a" && *ty == T_PARAMETER
-        }));
-        assert!(map.iter().any(|(name, ty, _, _)| {
-            name == "b" && *ty == T_PARAMETER
-        }));
+        assert!(
+            map.iter()
+                .any(|(name, ty, _, _)| { name == "a" && *ty == T_PARAMETER })
+        );
+        assert!(
+            map.iter()
+                .any(|(name, ty, _, _)| { name == "b" && *ty == T_PARAMETER })
+        );
 
         // Type parameters: T
         assert!(map.iter().any(|(name, ty, mods, _)| {
@@ -4845,23 +5044,30 @@ mod tests {
         }));
 
         // Local variable: result
-        assert!(map.iter().any(|(name, ty, mods, _)| {
-            name == "result" && *ty == T_VARIABLE && *mods == 0
-        }));
+        assert!(
+            map.iter()
+                .any(|(name, ty, mods, _)| { name == "result" && *ty == T_VARIABLE && *mods == 0 })
+        );
 
         // Collect semantic tokens
         let tokens_data = collect_semantic_tokens(&tokens, src, &map);
 
         // Verify we got some tokens
-        assert!(!tokens_data.is_empty(), "expected at least one semantic token");
+        assert!(
+            !tokens_data.is_empty(),
+            "expected at least one semantic token"
+        );
 
         // Verify delta encoding is valid: first token's delta_line should be 0
         // (line 0), delta_start should be >= 0
         // Just check the data is well-formed
         for token in &tokens_data {
             // All fields should be valid
-            assert!(token.token_type < TOKEN_TYPES.len() as u32,
-                    "token type {} out of range", token.token_type);
+            assert!(
+                token.token_type < TOKEN_TYPES.len() as u32,
+                "token type {} out of range",
+                token.token_type
+            );
         }
     }
 }

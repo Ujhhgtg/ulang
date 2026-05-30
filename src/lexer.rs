@@ -1,20 +1,66 @@
+//! Tokenizer for the ulang compiler.
+//!
+//! This module implements a hand-written, character-at-a-time lexer with
+//! single-character lookahead. The pipeline:
+//! 1. Skip whitespace and `//` line comments.
+//! 2. Dispatch on the current character to recognize single-/multi-character
+//!    tokens (operators, punctuation, string/char/number literals, identifiers).
+//! 3. Return a `(Token, Span)` pair for each call to [`Lexer::next_token`].
+//!
+//! Spans record the byte range of each token in the source, enabling precise
+//! error messages from the parser and code generator.
+
 use crate::token::{Span, Token};
 
+/// A hand-written lexer that tokenizes a ulang source string.
+///
+/// Borrows the source text via `&'a str` — no copying or allocation beyond
+/// what the token types themselves require (string literal contents, identifiers).
+/// `pos` tracks the current byte offset into `source`; it always points at
+/// the next character to examine, or at `source.len()` when exhausted.
 pub struct Lexer<'a> {
     source: &'a str,
     pos: usize,
 }
 
 impl<'a> Lexer<'a> {
+    /// Creates a new `Lexer` that borrows `source` and begins tokenizing at
+    /// position 0. No copying or preprocessing of the source is performed.
     pub fn new(source: &'a str) -> Self {
         Self { source, pos: 0 }
     }
 
-    /// Return the current byte position in source (for error reporting)
+    /// Returns the current byte offset into the source text.
+    ///
+    /// Used by the parser and error reporting infrastructure to associate
+    /// each token with its location in the original source.
     pub fn pos(&self) -> usize {
         self.pos
     }
 
+    /// Returns the next `(Token, Span)` from the source text.
+    ///
+    /// This is the core lexer loop. On each call it:
+    /// - Skips leading whitespace.
+    /// - Returns `Token::Eof` when the source is exhausted.
+    /// - Handles `//` line comments by consuming to end of line and recursing.
+    /// - Dispatches on the current character to recognize:
+    ///   - Single-character tokens: `+`, `-`, `*`, `/`, `;`, `.`, `(`, `)`, `{`, `}`,
+    ///     `[`, `]`, `,`, `#`
+    ///   - Multi-character compound tokens: `->`, `::`, `==`, `=>`, `..` (error on
+    ///     two dots, `...` for variadic), `&&`, `||`, `!=`, `<=`, `>=`
+    ///   - String literals (`"…"`) via [`Lexer::read_string`]
+    ///   - Numeric literals (integer and float) via [`Lexer::read_number_or_float`]
+    ///   - Identifiers and keywords via [`Lexer::read_identifier`]
+    ///
+    /// The returned `Span` records the byte range `[lo, hi)` of the token in
+    /// the source text, enabling precise error messages downstream.
+    ///
+    /// # Errors
+    /// Returns `Err` with a descriptive message for:
+    /// - Unterminated or malformed string literals
+    /// - Invalid numeric literals or type suffixes
+    /// - Unexpected characters that match no token pattern
     pub fn next_token(&mut self) -> Result<(Token, Span), String> {
         self.skip_whitespace();
 
@@ -26,7 +72,9 @@ impl<'a> Lexer<'a> {
         let lo = self.pos;
         let c = self.current_char().unwrap();
 
-        // Single-line comments
+        // Line comment: recurse instead of accumulating tokens.
+        // A recursive call is simpler than a loop over comment tokens since
+        // comments carry no semantic value — we just skip and re-enter.
         if c == '/' && self.peek_next() == Some('/') {
             self.advance(); // skip first /
             self.advance(); // skip second /
@@ -36,6 +84,10 @@ impl<'a> Lexer<'a> {
             return self.next_token();
         }
 
+        // Manual character matching rather than a lookup table.
+        // The ulang character set is small and stable, so explicit match arms
+        // are clearer and just as fast as table-driven dispatch.
+        // Spans are constructed after the match using `lo` and the advanced `pos`.
         let token = match c {
             '+' => {
                 self.advance();
@@ -239,6 +291,8 @@ impl<'a> Lexer<'a> {
         Ok((token, Span::new(lo, hi)))
     }
 
+    /// Skips whitespace characters (space, tab, newline, carriage return).
+    /// Stops at the first non-whitespace character or end of source.
     fn skip_whitespace(&mut self) {
         while self.pos < self.source.len() {
             let c = self.current_char().unwrap();
@@ -250,6 +304,19 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// Parses a numeric literal starting with an ASCII digit.
+    ///
+    /// Currently only handles decimal integer and float literals. Float detection
+    /// requires a `.` followed by at least one digit (avoiding confusion with
+    /// method/property access syntax). An optional `e`/`E` exponent with an
+    /// optional sign is recognized for float literals.
+    ///
+    /// If the digits are followed by a type suffix (e.g. `i32`, `u64`, `f32`),
+    /// the suffix is consumed by [`Self::try_read_type_suffix`] and the result
+    /// is wrapped in `IntSuffixLit` or `FloatSuffixLit`.
+    ///
+    /// # Errors
+    /// Returns an error if the digit sequence cannot be parsed as an `i64` or `f64`.
     fn read_number_or_float(&mut self) -> Result<Token, String> {
         let lo = self.pos;
         while self.pos < self.source.len() && self.current_char().unwrap().is_ascii_digit() {
@@ -310,9 +377,14 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    /// After reading the numeric part, check if the upcoming chars form a type name suffix.
-    /// If yes, consume them and return the corresponding type name token.
-    /// If no, return None without advancing the position.
+    /// Checks whether the upcoming characters form a recognized type suffix.
+    ///
+    /// Consumes and returns a `Token` for known type names (`i8`–`i64`, `u8`–`u64`,
+    /// `usize`, `isize`, `f32`, `f64`). If the identifier is not a type name,
+    /// restores `pos` to its saved position and returns `None`.
+    ///
+    /// Precondition: the caller has consumed the numeric part; this method reads
+    /// an identifier starting at the current position.
     fn try_read_type_suffix(&mut self) -> Option<Token> {
         let saved = self.pos;
         let ident = self.read_identifier();
@@ -337,6 +409,19 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// Reads a quoted string literal starting after the opening `"`.
+    ///
+    /// Handles the following escape sequences:
+    /// - `\\n` → newline
+    /// - `\\\\` → backslash
+    /// - `\\"` → double quote (so literals can contain `"`)
+    ///
+    /// Any other character following a backslash produces an error. Unterminated
+    /// strings (EOF before closing `"`) also produce an error.
+    ///
+    /// # Errors
+    /// - Invalid escape sequence.
+    /// - Unterminated string literal (EOF or backslash at end of input).
     fn read_string(&mut self) -> Result<String, String> {
         let mut s = String::new();
         loop {
@@ -379,6 +464,15 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// Reads an identifier or keyword starting at the current position.
+    ///
+    /// Consumes characters matching `[a-zA-Z0-9_]` (ASCII alphanumeric + underscore).
+    /// Note: this includes leading digits, so callers must ensure the first
+    /// character is a letter or underscore before dispatching here. No allocation
+    /// beyond the returned `String`.
+    ///
+    /// The caller (`next_token`) distinguishes keywords from plain identifiers
+    /// after the string is assembled.
     fn read_identifier(&mut self) -> String {
         let lo = self.pos;
         while self.pos < self.source.len() {
@@ -392,16 +486,31 @@ impl<'a> Lexer<'a> {
         self.source[lo..self.pos].to_string()
     }
 
+    /// Returns the current character at `pos`, or `None` if at end of source.
+    ///
+    /// Precondition: `pos <= source.len()`. Uses the Unicode-aware `.chars()`
+    /// iterator to handle multi-byte characters correctly.
     fn current_char(&self) -> Option<char> {
         self.source[self.pos..].chars().next()
     }
 
+    /// Returns the character following the current position, without advancing.
+    ///
+    /// Used for single-character lookahead (e.g. checking `//` for comments,
+    /// `->` for arrow tokens). Returns `None` if fewer than 2 characters remain.
+    ///
+    /// Safety: always returns `None` at EOF — no bounds check needed from caller.
     fn peek_next(&self) -> Option<char> {
         let mut chars = self.source[self.pos..].chars();
         chars.next()?;
         chars.next()
     }
 
+    /// Advances `pos` past the current UTF-8 character.
+    ///
+    /// Caller must have verified that `pos < source.len()`. The advance is
+    /// computed from the character's byte length, so multi-byte characters
+    /// are handled correctly.
     fn advance(&mut self) {
         if self.pos < self.source.len() {
             self.pos += self.current_char().unwrap().len_utf8();

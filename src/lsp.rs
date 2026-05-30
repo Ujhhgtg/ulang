@@ -1263,6 +1263,37 @@ fn handle_definition(
     let clicked_token = &tokens[clicked_idx];
 
     if let Token::Ident(ref name) = clicked_token.0 {
+        if clicked_idx > 0
+            && tokens[clicked_idx - 1].0 == Token::Mod
+            && clicked_idx + 1 < tokens.len()
+            && tokens[clicked_idx + 1].0 == Token::Semicolon
+        {
+            if let Ok(file_path) = url.to_file_path() {
+                if let Some(parent_dir) = file_path.parent() {
+                    let mod_path_file = parent_dir.join(format!("{}.u", name));
+                    let mod_path_dir = parent_dir.join(name).join("mod.u");
+
+                    let target_path = if mod_path_file.exists() {
+                        Some(mod_path_file)
+                    } else if mod_path_dir.exists() {
+                        Some(mod_path_dir)
+                    } else {
+                        None
+                    };
+
+                    if let Some(path) = target_path {
+                        if let Ok(target_url) = Url::from_file_path(path) {
+                            let target_uri = target_url.to_string().parse::<Uri>().unwrap();
+                            let range = Range::new(Position::new(0, 0), Position::new(0, 0));
+                            return Some(GotoDefinitionResponse::Scalar(Location::new(
+                                target_uri, range,
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+
         let struct_context = get_struct_context(&tokens, clicked_idx);
 
         // 1. Try to resolve path prefix if one exists
@@ -3857,4 +3888,62 @@ mod tests {
             panic!("Expected CompletionResponse::Array");
         }
     }
+
+    #[test]
+    fn test_mod_decl_definition_navigation() {
+        let cache = load_stdlib_cache();
+        let mut documents = HashMap::new();
+
+        let temp_dir = std::env::temp_dir();
+        let main_file_path = temp_dir.join("main_test_mod_decl_definition_navigation.u");
+        let mymod_file_path = temp_dir.join("mymod_test_mod_decl_definition_navigation.u");
+
+        std::fs::write(&main_file_path, "mod mymod_test_mod_decl_definition_navigation;").unwrap();
+        std::fs::write(&mymod_file_path, "pub fn hello() {}").unwrap();
+
+        let doc_url = Url::from_file_path(&main_file_path).unwrap();
+        update_document(
+            &mut documents,
+            doc_url.clone(),
+            "mod mymod_test_mod_decl_definition_navigation;".to_string(),
+        );
+
+        let position = Position::new(0, 4);
+        let params = GotoDefinitionParams {
+            text_document_position_params: lsp_types::TextDocumentPositionParams {
+                text_document: lsp_types::TextDocumentIdentifier {
+                    uri: doc_url.to_string().parse().unwrap(),
+                },
+                position,
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+
+        let response = handle_definition(&documents, &cache, params);
+
+        let _ = std::fs::remove_file(&main_file_path);
+        let _ = std::fs::remove_file(&mymod_file_path);
+
+        assert!(
+            response.is_some(),
+            "Should find definition for mymod"
+        );
+        if let Some(GotoDefinitionResponse::Scalar(location)) = response {
+            let url = Url::parse(location.uri.as_str()).unwrap();
+            let path = url.to_file_path().unwrap();
+            assert_eq!(
+                path,
+                mymod_file_path,
+                "Should navigate to mymod.u"
+            );
+            assert_eq!(
+                location.range.start,
+                Position::new(0, 0)
+            );
+        } else {
+            panic!("Expected Scalar response");
+        }
+    }
 }
+

@@ -2394,7 +2394,8 @@ impl<'ctx> CodeGen<'ctx> {
             Type::Ref { inner, .. }
             | Type::Ptr { inner, .. }
             | Type::Array { inner, .. }
-            | Type::GenericArray { inner, .. } => {
+            | Type::GenericArray { inner, .. }
+            | Type::Slice { inner, .. } => {
                 Self::substitute_type_params(inner, params, args);
             }
             Type::Tuple(elems) => {
@@ -2472,6 +2473,9 @@ impl<'ctx> CodeGen<'ctx> {
                 }
             }
             (Type::Array { inner: p_inner, .. }, Type::Array { inner: a_inner, .. }) => {
+                self.infer_type_mappings(p_inner, a_inner, type_params, mappings);
+            }
+            (Type::Slice { inner: p_inner }, Type::Slice { inner: a_inner }) => {
                 self.infer_type_mappings(p_inner, a_inner, type_params, mappings);
             }
             (Type::GenericInstance(p_name, p_args), Type::GenericInstance(a_name, a_args)) => {
@@ -8512,6 +8516,38 @@ impl<'ctx> CodeGen<'ctx> {
                 }
                 None
             }
+            "__builtin_slice_from_raw_parts" if args.len() == 2 => {
+                let ptr_ty = self.expr_type(&args[0]);
+                if let Type::Ptr {
+                    inner: elem_ty,
+                    is_mut: _,
+                } = &ptr_ty
+                {
+                    return Some(Type::Ref {
+                        inner: Box::new(Type::Slice {
+                            inner: elem_ty.clone(),
+                        }),
+                        is_mut: false,
+                    });
+                }
+                None
+            }
+            "__builtin_slice_from_raw_parts_mut" if args.len() == 2 => {
+                let ptr_ty = self.expr_type(&args[0]);
+                if let Type::Ptr {
+                    inner: elem_ty,
+                    is_mut: _,
+                } = &ptr_ty
+                {
+                    return Some(Type::Ref {
+                        inner: Box::new(Type::Slice {
+                            inner: elem_ty.clone(),
+                        }),
+                        is_mut: true,
+                    });
+                }
+                None
+            }
             _ => None,
         }
     }
@@ -8630,6 +8666,30 @@ impl<'ctx> CodeGen<'ctx> {
                         CodegenError::new(format!("failed to build bitcast for as_ptr: {}", e))
                     })?;
                 Ok(Some(ptr))
+            }
+            "__builtin_slice_from_raw_parts" | "__builtin_slice_from_raw_parts_mut"
+                if args.len() == 2 =>
+            {
+                let ptr_val = self.compile_expr(&args[0])?;
+                let len_val = self.compile_expr(&args[1])?;
+                let len_int = len_val.into_int_value();
+                let ptr = ptr_val.into_pointer_value();
+
+                let elems: [BasicTypeEnum; 2] = [
+                    self.context.ptr_type(AddressSpace::default()).into(),
+                    self.i64_type.into(),
+                ];
+                let struct_ty = self.context.struct_type(&elems, false);
+                let fat_ptr = struct_ty.get_undef();
+                let fat_ptr = self
+                    .builder
+                    .build_insert_value(fat_ptr, ptr, 0, "fat_ptr")
+                    .map_err(|e| CodegenError::new(format!("failed to build fat ptr: {}", e)))?;
+                let fat_ptr = self
+                    .builder
+                    .build_insert_value(fat_ptr, len_int, 1, "fat_len")
+                    .map_err(|e| CodegenError::new(format!("failed to build fat len: {}", e)))?;
+                Ok(Some(fat_ptr.into_struct_value().into()))
             }
             _ => Ok(None),
         }

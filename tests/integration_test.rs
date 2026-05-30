@@ -1898,3 +1898,77 @@ fn main() {
         "#
     ));
 }
+
+
+#[test]
+fn test_vec_as_slice() {
+    assert!(run_test(
+        "vec_as_slice",
+        r#"
+        use std::vec::Vec;
+        use std::option::Option;
+        use std::iter::IntoIterator;
+        use std::iter::IntoIteratorMut;
+        use std::iter::Iterator;
+        use std::iter::Iter;
+        use std::iter::IterMut;
+
+        fn main() -> i32 {
+            let mut v: Vec<i32> = Vec::new();
+            v.push(10);
+            v.push(20);
+            v.push(30);
+
+            let s = v.as_slice();
+            if s[0] != 10 { return 1; };
+            if s[1] != 20 { return 1; };
+            if s[2] != 30 { return 1; };
+
+            v.drop();
+            0
+        }
+        "#
+    ));
+}
+
+#[test]
+fn test_vec_as_mut_slice() {
+    assert!(run_test(
+        "vec_as_mut_slice",
+        r#"
+        use std::vec::Vec;
+        use std::option::Option;
+        use std::iter::IntoIterator;
+        use std::iter::IntoIteratorMut;
+        use std::iter::Iterator;
+        use std::iter::Iter;
+        use std::iter::IterMut;
+
+        fn main() -> i32 {
+            let mut v: Vec<i32> = Vec::new();
+            v.push(10);
+            v.push(20);
+            v.push(30);
+
+            // Read through shared slice first
+            let s = v.as_slice();
+            if s[0] != 10 { return 1; };
+            if s[1] != 20 { return 1; };
+            if s[2] != 30 { return 1; };
+
+            // Mutate through mutable slice
+            let ms = v.as_mut_slice();
+            ms[0] = 99;
+            ms[1] = 88;
+
+            // Verify mutation via shared slice
+            if s[0] != 99 { return 1; };
+            if s[1] != 88 { return 1; };
+            if s[2] != 30 { return 1; };
+
+            v.drop();
+            0
+        }
+        "#
+    ));
+}

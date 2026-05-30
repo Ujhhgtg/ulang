@@ -1370,12 +1370,11 @@ fn build_project_cache(
 
     for path in &paths {
         // Skip files that belong to the standard library
-        if let Some(ref stdlib) = stdlib_root {
-            if let Ok(canonical_path) = std::fs::canonicalize(path) {
-                if canonical_path.starts_with(stdlib) {
-                    continue;
-                }
-            }
+        if let Some(ref stdlib) = stdlib_root
+            && let Ok(canonical_path) = std::fs::canonicalize(path)
+            && canonical_path.starts_with(stdlib)
+        {
+            continue;
         }
 
         if let Ok(url) = Url::from_file_path(path) {

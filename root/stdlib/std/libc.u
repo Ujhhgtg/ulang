@@ -9,4 +9,13 @@ extern "C" {
     pub fn fork() -> i32;
     pub fn execvp(file: *const u8, argv: *const *mut u8) -> i32;
     pub fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
+    pub fn posix_spawnp(
+        pid: *mut i32,
+        file: *const u8,
+        file_actions: *mut u8,
+        attrp: *mut u8,
+        argv: *const *mut u8,
+        envp: *const *mut u8,
+    ) -> i32;
+    pub fn dlsym(handle: *mut u8, symbol: *const u8) -> *mut u8;
 }

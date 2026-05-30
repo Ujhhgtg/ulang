@@ -3,7 +3,7 @@ use std::option::Option;
 use std::alloc::malloc;
 use std::alloc::free;
 use std::alloc::memcpy;
-use std::libc::{_Exit, fork, execvp, waitpid};
+use std::libc::{_Exit, waitpid, posix_spawnp, dlsym};
 use std::intrinsics::size_of;
 
 pub fn exit() -> ! {
@@ -58,48 +58,60 @@ impl Command {
     }
 
     pub fn spawn(&mut self) {
-        let pid = fork();
-        if pid == 0 {
-            let argc = self.args.len();
-            let argv_size = (argc + 1) * size_of(0 as *mut u8);
-            let argv = malloc(argv_size) as *mut *mut u8;
-            let mut i = 0;
-            while i < argc {
-                let elem_ptr = (self.args.as_ptr() as usize + i * size_of(0 as *mut u8)) as *const *mut u8;
-                let dest = (argv as usize + i * size_of(0 as *mut u8)) as *mut *mut u8;
-                *dest = *elem_ptr;
-                i = i + 1;
-            };
-            let dest_null = (argv as usize + argc * size_of(0 as *mut u8)) as *mut *mut u8;
-            *dest_null = 0 as *mut u8;
+        let argc = self.args.len();
+        let argv_size = (argc + 1) * size_of(0 as *mut u8);
+        let argv = malloc(argv_size) as *mut *mut u8;
+        let mut i = 0;
+        while i < argc {
+            let elem_ptr = (self.args.as_ptr() as usize + i * size_of(0 as *mut u8)) as *const *mut u8;
+            let dest = (argv as usize + i * size_of(0 as *mut u8)) as *mut *mut u8;
+            *dest = *elem_ptr;
+            i = i + 1;
+        };
+        let dest_null = (argv as usize + argc * size_of(0 as *mut u8)) as *mut *mut u8;
+        *dest_null = 0 as *mut u8;
 
-            execvp(self.program, argv);
-            _Exit(127);
-        }
+        let env_ptr = dlsym(0 as *mut u8, "environ".0);
+        let envp = if (env_ptr as usize) == 0 {
+            0 as *mut *mut u8
+        } else {
+            *(env_ptr as *mut *mut *mut u8)
+        };
+
+        let mut pid = 0;
+        posix_spawnp(&mut pid, self.program, 0 as *mut u8, 0 as *mut u8, argv, envp);
+        free(argv as *mut u8);
     }
 
     pub fn status(&mut self) -> i32 {
-        let pid = fork();
-        if pid == 0 {
-            let argc = self.args.len();
-            let argv_size = (argc + 1) * size_of(0 as *mut u8);
-            let argv = malloc(argv_size) as *mut *mut u8;
-            let mut i = 0;
-            while i < argc {
-                let elem_ptr = (self.args.as_ptr() as usize + i * size_of(0 as *mut u8)) as *const *mut u8;
-                let dest = (argv as usize + i * size_of(0 as *mut u8)) as *mut *mut u8;
-                *dest = *elem_ptr;
-                i = i + 1;
-            };
-            let dest_null = (argv as usize + argc * size_of(0 as *mut u8)) as *mut *mut u8;
-            *dest_null = 0 as *mut u8;
-
-            execvp(self.program, argv);
-            _Exit(127);
+        let argc = self.args.len();
+        let argv_size = (argc + 1) * size_of(0 as *mut u8);
+        let argv = malloc(argv_size) as *mut *mut u8;
+        let mut i = 0;
+        while i < argc {
+            let elem_ptr = (self.args.as_ptr() as usize + i * size_of(0 as *mut u8)) as *const *mut u8;
+            let dest = (argv as usize + i * size_of(0 as *mut u8)) as *mut *mut u8;
+            *dest = *elem_ptr;
+            i = i + 1;
         };
-        if pid < 0 {
+        let dest_null = (argv as usize + argc * size_of(0 as *mut u8)) as *mut *mut u8;
+        *dest_null = 0 as *mut u8;
+
+        let env_ptr = dlsym(0 as *mut u8, "environ".0);
+        let envp = if (env_ptr as usize) == 0 {
+            0 as *mut *mut u8
+        } else {
+            *(env_ptr as *mut *mut *mut u8)
+        };
+
+        let mut pid: i32 = 0;
+        let spawn_res = posix_spawnp(&mut pid, self.program, 0 as *mut u8, 0 as *mut u8, argv, envp);
+        free(argv as *mut u8);
+
+        if spawn_res != 0 {
             return -1;
         };
+
         let mut status_val = 0;
         let wait_res = waitpid(pid, &mut status_val, 0);
         if wait_res < 0 {

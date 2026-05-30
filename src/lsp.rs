@@ -3883,7 +3883,10 @@ mod tests {
         if let Some(CompletionResponse::Array(items)) = response2 {
             let derive_item = items.iter().find(|i| i.label == "derive").unwrap();
             assert_eq!(derive_item.insert_text, Some("derive($0)".to_string()));
-            assert_eq!(derive_item.insert_text_format, Some(InsertTextFormat::SNIPPET));
+            assert_eq!(
+                derive_item.insert_text_format,
+                Some(InsertTextFormat::SNIPPET)
+            );
         } else {
             panic!("Expected CompletionResponse::Array");
         }
@@ -3898,7 +3901,11 @@ mod tests {
         let main_file_path = temp_dir.join("main_test_mod_decl_definition_navigation.u");
         let mymod_file_path = temp_dir.join("mymod_test_mod_decl_definition_navigation.u");
 
-        std::fs::write(&main_file_path, "mod mymod_test_mod_decl_definition_navigation;").unwrap();
+        std::fs::write(
+            &main_file_path,
+            "mod mymod_test_mod_decl_definition_navigation;",
+        )
+        .unwrap();
         std::fs::write(&mymod_file_path, "pub fn hello() {}").unwrap();
 
         let doc_url = Url::from_file_path(&main_file_path).unwrap();
@@ -3925,25 +3932,14 @@ mod tests {
         let _ = std::fs::remove_file(&main_file_path);
         let _ = std::fs::remove_file(&mymod_file_path);
 
-        assert!(
-            response.is_some(),
-            "Should find definition for mymod"
-        );
+        assert!(response.is_some(), "Should find definition for mymod");
         if let Some(GotoDefinitionResponse::Scalar(location)) = response {
             let url = Url::parse(location.uri.as_str()).unwrap();
             let path = url.to_file_path().unwrap();
-            assert_eq!(
-                path,
-                mymod_file_path,
-                "Should navigate to mymod.u"
-            );
-            assert_eq!(
-                location.range.start,
-                Position::new(0, 0)
-            );
+            assert_eq!(path, mymod_file_path, "Should navigate to mymod.u");
+            assert_eq!(location.range.start, Position::new(0, 0));
         } else {
             panic!("Expected Scalar response");
         }
     }
 }
-

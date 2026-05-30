@@ -19,8 +19,7 @@ impl String {
     }
 
     pub fn len(&self) -> usize {
-        let v = self.vec;
-        v.len()
+        self.vec.len()
     }
 
     pub fn capacity(&self) -> usize {
@@ -29,14 +28,11 @@ impl String {
     }
     
     pub fn is_empty(&self) -> bool {
-        let v = self.vec;
-        v.is_empty()
+        self.vec.is_empty()
     }
 
     pub fn clear(&mut self) {
-        let mut v = self.vec;
-        v.clear();
-        self.vec = v;
+        self.vec.clear()
     }
 
     pub fn push_str(&mut self, s: &str) {
@@ -61,19 +57,15 @@ impl String {
     }
 
     pub fn as_ptr(&self) -> *const u8 {
-        let v = self.vec;
-        v.as_ptr()
+        self.vec.as_ptr()
     }
 
     pub fn as_str(&self) -> &str {
-        let v = self.vec;
-        transmute::<&[u8], &str>(v.as_slice())
+        transmute::<&[u8], &str>(self.vec.as_slice())
     }
 
     pub fn drop(&mut self) {
-        let mut v = self.vec;
-        v.drop();
-        self.vec = v;
+        self.vec.drop()
     }
 }
 

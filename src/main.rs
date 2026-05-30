@@ -66,8 +66,8 @@ impl From<OptLevel> for inkwell::OptimizationLevel {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Cc {
-    #[default]
     Gcc,
+    #[default]
     Clang,
     Cosmocc,
     Zig,
@@ -325,7 +325,7 @@ opt-level = "0"
 opt-level = "3"
 
 [build]
-cc = "gcc"
+cc = "clang"
 "#,
         name
     );
@@ -418,7 +418,7 @@ enum Command {
         #[arg(short = 'o', long = "opt", default_value_t = OptLevel::Default, value_parser = parse_opt_level)]
         opt: OptLevel,
         /// C compiler to use for linking (gcc, clang, cosmocc, zig, tcc)
-        #[arg(long = "cc", default_value_t = Cc::Gcc, value_parser = parse_cc)]
+        #[arg(long = "cc", default_value_t = Default::default(), value_parser = parse_cc)]
         cc: Cc,
         /// Run as a single file script, even if inside a project
         #[arg(long = "script")]
@@ -1120,7 +1120,10 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
                         }
                         // Also import non-struct impls (e.g., impl str, impl [T]) from same module
                         for decl in &stdlib_prog.impls {
-                            if matches!(&decl.impl_type, Type::Struct(_) | Type::GenericInstance(_, _)) {
+                            if matches!(
+                                &decl.impl_type,
+                                Type::Struct(_) | Type::GenericInstance(_, _)
+                            ) {
                                 continue; // already handled above
                             }
                             all_impls.push(decl.clone());
@@ -1602,7 +1605,7 @@ fn main() {
                 } => Mode::Build {
                     output: output.clone(),
                     opt: opt.unwrap_or(OptLevel::Default),
-                    cc: cc.unwrap_or(Cc::Gcc),
+                    cc: cc.unwrap_or(Default::default()),
                 },
                 Command::BuildRun {
                     output, opt, cc, ..
@@ -1747,7 +1750,7 @@ fn main() {
             } => Mode::Build {
                 output: output.clone(),
                 opt: opt.unwrap_or(OptLevel::Default),
-                cc: cc.unwrap_or(Cc::Gcc),
+                cc: cc.unwrap_or(Default::default()),
             },
             Command::BuildRun {
                 output, opt, cc, ..

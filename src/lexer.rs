@@ -9,6 +9,7 @@ impl<'a> Lexer<'a> {
     pub fn new(source: &'a str) -> Self {
         Self { source, pos: 0 }
     }
+
     /// Return the current byte position in source (for error reporting)
     pub fn pos(&self) -> usize {
         self.pos

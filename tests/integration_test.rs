@@ -745,6 +745,39 @@ fn test_result_stdlib() {
 }
 
 #[test]
+fn test_option_unwrap_unchecked() {
+    assert!(run_test(
+        "option_unwrap_unchecked",
+        r#"use std::option::Option;
+        fn main() -> i32 {
+            let opt = Option::Some(42);
+            if opt.unwrap_unchecked() == 42 {
+                return 0;
+            };
+            return 1;
+        }"#
+    ));
+}
+
+#[test]
+fn test_result_unwrap_unchecked() {
+    assert!(run_test(
+        "result_unwrap_unchecked",
+        r#"use std::result::Result;
+        fn main() -> i32 {
+            let r: Result<i32, i32> = Result::Ok(42);
+            let e: Result<i32, i32> = Result::Err(100);
+            if r.unwrap_unchecked() == 42 {
+                if e.unwrap_err_unchecked() == 100 {
+                    return 0;
+                }
+            };
+            return 1;
+        }"#
+    ));
+}
+
+#[test]
 fn test_logical_and_or() {
     assert!(run_test(
         "logical_and_or",

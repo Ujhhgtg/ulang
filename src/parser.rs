@@ -1,9 +1,9 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::{
-    Attribute, BinOp, Block, EnumDecl, EnumVariant, Expr, Function, GenericParam, ImplDecl,
-    MatchArm, ModuleDecl, Param, Pattern, Program, Stmt, StructDecl, StructField, TraitBound,
-    TraitDecl, TraitMethodDef, Type, TypeAliasDecl, Use,
+    AssociatedConst, Attribute, BinOp, Block, EnumDecl, EnumVariant, Expr, Function, GenericParam,
+    ImplDecl, MatchArm, ModuleDecl, Param, Pattern, Program, Stmt, StructDecl, StructField,
+    TraitBound, TraitConst, TraitDecl, TraitMethodDef, Type, TypeAliasDecl, Use,
 };
 use crate::token::{Span, Token};
 
@@ -900,6 +900,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_impl_decl(&mut self) -> Result<ImplDecl, ParseError> {
+        let lo = self.current_span_lo();
         self.expect(&Token::Impl)?;
         // Parse optional generic type parameters: <T, U, ...>
         // Parse optional generic type parameters: <T: Trait1 + Trait2, U, ...>
@@ -981,20 +982,54 @@ impl<'a> Parser<'a> {
 
         self.expect(&Token::LBrace)?;
         let mut methods = Vec::new();
+        let mut consts = Vec::new();
         while *self.peek_token() != Token::RBrace && *self.peek_token() != Token::Eof {
             let attribs = self.parse_attrs()?;
-            let is_method_pub = if *self.peek_token() == Token::Pub {
+            let is_pub = if *self.peek_token() == Token::Pub {
                 self.advance();
                 true
             } else {
                 false
             };
-            let mut func = self.parse_function(attribs)?;
-            func.is_pub = is_method_pub;
-            func.is_method = true;
-            methods.push(func);
+            if *self.peek_token() == Token::Const {
+                let lo = self.current_span_lo();
+                self.advance(); // consume const
+                let name = match self.peek_token() {
+                    Token::Ident(s) => {
+                        let s = s.clone();
+                        self.advance();
+                        s
+                    }
+                    _ => {
+                        let (_, span) = self.current().unwrap();
+                        return Err(ParseError {
+                            span: *span,
+                            msg: "expected constant name after 'const'".to_string(),
+                        });
+                    }
+                };
+                self.expect(&Token::Colon)?;
+                let ty = self.parse_type()?;
+                self.expect(&Token::Eq)?;
+                let value = self.parse_expr()?;
+                self.expect(&Token::Semicolon)?;
+                let hi = self.last_span_end();
+                consts.push(AssociatedConst {
+                    name,
+                    ty,
+                    value,
+                    is_pub,
+                    span: Span::new(lo, hi),
+                });
+            } else {
+                let mut func = self.parse_function(attribs)?;
+                func.is_pub = is_pub;
+                func.is_method = true;
+                methods.push(func);
+            }
         }
         self.expect(&Token::RBrace)?;
+        let hi = self.last_span_end();
         Ok(ImplDecl {
             impl_type,
             trait_name,
@@ -1002,6 +1037,8 @@ impl<'a> Parser<'a> {
             type_params,
             const_params,
             methods,
+            consts,
+            span: Span::new(lo, hi),
         })
     }
 
@@ -1030,43 +1067,79 @@ impl<'a> Parser<'a> {
         };
         self.expect(&Token::LBrace)?;
         let mut methods = Vec::new();
+        let mut consts = Vec::new();
         while *self.peek_token() != Token::RBrace && *self.peek_token() != Token::Eof {
-            self.expect(&Token::Fn)?;
-            let method_name = match self.peek_token() {
-                Token::Ident(s) => {
-                    let s = s.clone();
-                    self.advance();
-                    s
-                }
-                _ => {
-                    let (_, span) = self.current().unwrap();
-                    return Err(ParseError {
-                        span: *span,
-                        msg: "expected trait method name".to_string(),
-                    });
-                }
-            };
-            self.expect(&Token::LParen)?;
-            let params = self.parse_fn_params(false)?;
-            self.expect(&Token::RParen)?;
-            let return_type = if *self.peek_token() == Token::RArrow {
-                self.advance();
-                Some(self.parse_type()?)
-            } else {
-                None
-            };
-            let body = if *self.peek_token() == Token::LBrace {
-                Some(self.parse_block()?)
-            } else {
+            if *self.peek_token() == Token::Const {
+                let const_lo = self.current_span_lo();
+                self.advance(); // consume 'const'
+                let const_name = match self.peek_token() {
+                    Token::Ident(s) => {
+                        let s = s.clone();
+                        self.advance();
+                        s
+                    }
+                    _ => {
+                        let (_, span) = self.current().unwrap();
+                        return Err(ParseError {
+                            span: *span,
+                            msg: "expected associated constant name".to_string(),
+                        });
+                    }
+                };
+                self.expect(&Token::Colon)?;
+                let ty = self.parse_type()?;
+                let default_value = if *self.peek_token() == Token::Eq {
+                    self.advance(); // consume '='
+                    Some(self.parse_expr()?)
+                } else {
+                    None
+                };
                 self.expect(&Token::Semicolon)?;
-                None
-            };
-            methods.push(TraitMethodDef {
-                name: method_name,
-                params,
-                return_type,
-                body,
-            });
+                let const_hi = self.last_span_end();
+                consts.push(TraitConst {
+                    name: const_name,
+                    ty,
+                    default_value,
+                    span: Span::new(const_lo, const_hi),
+                });
+            } else {
+                self.expect(&Token::Fn)?;
+                let method_name = match self.peek_token() {
+                    Token::Ident(s) => {
+                        let s = s.clone();
+                        self.advance();
+                        s
+                    }
+                    _ => {
+                        let (_, span) = self.current().unwrap();
+                        return Err(ParseError {
+                            span: *span,
+                            msg: "expected trait method name".to_string(),
+                        });
+                    }
+                };
+                self.expect(&Token::LParen)?;
+                let params = self.parse_fn_params(false)?;
+                self.expect(&Token::RParen)?;
+                let return_type = if *self.peek_token() == Token::RArrow {
+                    self.advance();
+                    Some(self.parse_type()?)
+                } else {
+                    None
+                };
+                let body = if *self.peek_token() == Token::LBrace {
+                    Some(self.parse_block()?)
+                } else {
+                    self.expect(&Token::Semicolon)?;
+                    None
+                };
+                methods.push(TraitMethodDef {
+                    name: method_name,
+                    params,
+                    return_type,
+                    body,
+                });
+            }
         }
         self.expect(&Token::RBrace)?;
         let hi = self.last_span_end();
@@ -1074,6 +1147,7 @@ impl<'a> Parser<'a> {
             name,
             type_params,
             methods,
+            consts,
             is_pub: false,
             span: Span::new(lo, hi),
         })

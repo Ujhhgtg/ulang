@@ -2169,3 +2169,183 @@ fn test_inline_on_struct_enum_errors() {
         "#
     ));
 }
+
+#[test]
+fn test_associated_constants() {
+    assert!(run_test(
+        "assoc_consts",
+        r#"
+        use std::panic::panic;
+        struct Point {
+            x: i32,
+            y: i32,
+        }
+        impl Point {
+            pub const ORIGIN_X: i32 = 0;
+            const ORIGIN_Y: i32 = 10 - 10;
+        }
+        fn main() -> i32 {
+            const P_X: i32 = Point::ORIGIN_X;
+            const P_Y: i32 = Point::ORIGIN_Y;
+            if P_X != 0 { panic("expected P_X == 0"); };
+            if P_Y != 0 { panic("expected P_Y == 0"); };
+            if Point::ORIGIN_X != 0 { panic("expected Point::ORIGIN_X == 0"); };
+            if Point::ORIGIN_Y != 0 { panic("expected Point::ORIGIN_Y == 0"); };
+            0
+        }
+        "#
+    ));
+}
+
+#[test]
+fn test_primitive_constants() {
+    assert!(run_test(
+        "prim_consts",
+        r#"
+        use std::panic::panic;
+        fn main() -> i32 {
+            // Check integer limits
+            if i32::MIN != -2147483648 { panic("expected i32::MIN"); };
+            if i32::MAX != 2147483647 { panic("expected i32::MAX"); };
+            if u8::MAX != 255 { panic("expected u8::MAX"); };
+
+            // Check floats (infinity and nan)
+            let f_nan: f32 = f32::NAN;
+            let f_inf: f32 = f32::INFINITY;
+            let f_neginf: f32 = f32::NEG_INFINITY;
+
+            // IEEE 754 NaN is not equal to anything, including itself
+            if f_nan == f_nan { panic("expected nan != nan"); };
+
+            // Infinity checks
+            if f_inf != 1.0f32 / 0.0f32 { panic("expected inf == 1/0"); };
+            if f_neginf != -1.0f32 / 0.0f32 { panic("expected neginf == -1/0"); };
+
+            0
+        }
+        "#
+    ));
+}
+
+#[test]
+fn test_autoload_prelude() {
+    assert!(run_test(
+        "autoload_prelude",
+        r#"
+        use std::panic::panic;
+        fn main() -> i32 {
+            // 1. Primitive constants autoloaded
+            if i32::MAX != 2147483647 { panic("expected i32::MAX"); };
+
+            // 2. Slice/array methods/impls autoloaded
+            let arr = [1, 2, 3];
+            if arr.len() != 3 { panic("expected array len == 3"); };
+
+            // 3. Str methods autoloaded
+            let s = "hello";
+            if s.len() != 5 { panic("expected str len == 5"); };
+
+            0
+        }
+        "#
+    ));
+}
+
+#[test]
+fn test_trait_associated_const_required() {
+    assert!(run_test(
+        "trait_const_required",
+        r#"
+        use std::panic::panic;
+        trait HasConst {
+            const VALUE: i32;
+        }
+        struct MyStruct {}
+        impl HasConst for MyStruct {
+            const VALUE: i32 = 42;
+        }
+        fn main() -> i32 {
+            if MyStruct::VALUE != 42 { panic("expected 42"); };
+            0
+        }
+        "#
+    ));
+}
+
+#[test]
+fn test_trait_associated_const_default() {
+    assert!(run_test(
+        "trait_const_default",
+        r#"
+        use std::panic::panic;
+        trait HasDefaultConst {
+            const ANSWER: i32 = 42;
+        }
+        struct MyStruct {}
+        impl HasDefaultConst for MyStruct {}
+        fn main() -> i32 {
+            if MyStruct::ANSWER != 42 { panic("expected 42"); };
+            0
+        }
+        "#
+    ));
+}
+
+#[test]
+fn test_trait_associated_const_override_default() {
+    assert!(run_test(
+        "trait_const_override",
+        r#"
+        use std::panic::panic;
+        trait HasDefaultConst {
+            const ANSWER: i32 = 42;
+        }
+        struct MyStruct {}
+        impl HasDefaultConst for MyStruct {
+            const ANSWER: i32 = 99;
+        }
+        fn main() -> i32 {
+            if MyStruct::ANSWER != 99 { panic("expected 99"); };
+            0
+        }
+        "#
+    ));
+}
+
+#[test]
+fn test_trait_associated_const_missing_required() {
+    assert!(run_test_expect_error(
+        "trait_const_missing",
+        r#"
+        trait HasConst {
+            const VALUE: i32;
+        }
+        struct MyStruct {}
+        impl HasConst for MyStruct {}
+        fn main() -> i32 { 0 }
+        "#
+    ));
+}
+
+#[test]
+fn test_trait_associated_const_mixed() {
+    assert!(run_test(
+        "trait_const_mixed",
+        r#"
+        use std::panic::panic;
+        trait Numbers {
+            const ONE: i32 = 1;
+            const TWO: i32;
+        }
+        struct MyStruct {}
+        impl Numbers for MyStruct {
+            const TWO: i32 = 2;
+        }
+        fn main() -> i32 {
+            if MyStruct::ONE != 1 { panic("expected 1"); };
+            if MyStruct::TWO != 2 { panic("expected 2"); };
+            0
+        }
+        "#
+    ));
+}

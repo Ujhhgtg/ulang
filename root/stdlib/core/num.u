@@ -1,0 +1,70 @@
+impl i8 {
+    pub const MIN: i8 = -128;
+    pub const MAX: i8 = 127;
+}
+
+impl i16 {
+    pub const MIN: i16 = -32768;
+    pub const MAX: i16 = 32767;
+}
+
+impl i32 {
+    pub const MIN: i32 = -2147483648;
+    pub const MAX: i32 = 2147483647;
+}
+
+impl i64 {
+    pub const MIN: i64 = -9223372036854775807 - 1;
+    pub const MAX: i64 = 9223372036854775807;
+}
+
+impl isize {
+    pub const MIN: isize = -9223372036854775807 - 1;
+    pub const MAX: isize = 9223372036854775807;
+}
+
+impl u8 {
+    pub const MIN: u8 = 0;
+    pub const MAX: u8 = 255;
+}
+
+impl u16 {
+    pub const MIN: u16 = 0;
+    pub const MAX: u16 = 65535;
+}
+
+impl u32 {
+    pub const MIN: u32 = 0;
+    pub const MAX: u32 = 4294967295;
+}
+
+impl u64 {
+    pub const MIN: u64 = 0;
+    pub const MAX: u64 = -1 as u64;
+}
+
+impl usize {
+    pub const MIN: usize = 0;
+    pub const MAX: usize = -1 as usize;
+}
+
+impl f32 {
+    pub const MIN: f32 = -3.40282347e+38f32;
+    pub const MAX: f32 = 3.40282347e+38f32;
+    pub const NAN: f32 = 0.0f32 / 0.0f32;
+    pub const INFINITY: f32 = 1.0f32 / 0.0f32;
+    pub const NEG_INFINITY: f32 = -1.0f32 / 0.0f32;
+}
+
+impl f64 {
+    pub const MIN: f64 = -1.7976931348623157e+308f64;
+    pub const MAX: f64 = 1.7976931348623157e+308f64;
+    pub const NAN: f64 = 0.0f64 / 0.0f64;
+    pub const INFINITY: f64 = 1.0f64 / 0.0f64;
+    pub const NEG_INFINITY: f64 = -1.0f64 / 0.0f64;
+}
+
+impl bool {
+    pub const FALSE: bool = false;
+    pub const TRUE: bool = true;
+}

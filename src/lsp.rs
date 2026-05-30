@@ -390,6 +390,27 @@ fn get_hover_text_recursive(
         ));
     }
 
+    // Search trait associated constants
+    for tr in &program.traits {
+        let matches_context = match struct_context {
+            Some(ctx) => tr.name == ctx,
+            None => true,
+        };
+        if matches_context && let Some(tc) = tr.consts.iter().find(|c| c.name == name) {
+            let default_str = match &tc.default_value {
+                Some(_) => " = ...",
+                None => "",
+            };
+            return Some(format!(
+                "```rust\ntrait {} {{\n    const {}: {}{};\n}}\n```",
+                tr.name,
+                tc.name,
+                type_to_string(&tc.ty),
+                default_str
+            ));
+        }
+    }
+
     // 5. Search type aliases
     if let Some(ta) = program.type_aliases.iter().find(|t| t.name == name) {
         let pub_str = if ta.is_pub { "pub " } else { "" };
@@ -405,7 +426,11 @@ fn get_hover_text_recursive(
 
     // 6. Search impl methods
     for imp in &program.impls {
-        if let Some(method) = imp.methods.iter().find(|m| m.name == name) {
+        let matches_context = match struct_context {
+            Some(ctx) => type_to_string(&imp.impl_type) == ctx,
+            None => true,
+        };
+        if matches_context && let Some(method) = imp.methods.iter().find(|m| m.name == name) {
             let params: Vec<String> = method
                 .params
                 .iter()
@@ -430,6 +455,29 @@ fn get_hover_text_recursive(
                 type_params,
                 params.join(", "),
                 ret
+            ));
+        }
+    }
+
+    // 6b. Search impl associated constants
+    for imp in &program.impls {
+        let matches_context = match struct_context {
+            Some(ctx) => type_to_string(&imp.impl_type) == ctx,
+            None => true,
+        };
+        if matches_context && let Some(ac) = imp.consts.iter().find(|c| c.name == name) {
+            let type_name = type_to_string(&imp.impl_type);
+            let trait_str = match &imp.trait_name {
+                Some(t) => format!("{} for ", t),
+                None => "".to_string(),
+            };
+            let pub_str = if ac.is_pub { "pub " } else { "" };
+            return Some(format!(
+                "```rust\nimpl {} {{\n    {}const {}: {};\n}}\n```",
+                format!("{}{}", trait_str, type_name),
+                pub_str,
+                name,
+                type_to_string(&ac.ty)
             ));
         }
     }
@@ -781,7 +829,7 @@ fn find_definition_span(
     let mut i = 0;
     while i < tokens.len() {
         match &tokens[i].0 {
-            Token::Fn | Token::Trait | Token::Type | Token::Mod => {
+            Token::Fn | Token::Type | Token::Mod | Token::Const => {
                 if i + 1 < tokens.len()
                     && let Token::Ident(ref id) = tokens[i + 1].0
                     && id == name
@@ -903,6 +951,189 @@ fn find_definition_span(
                                         && id == name =>
                                 {
                                     return Some(tokens[j].1);
+                                }
+                                _ => {}
+                            }
+                            j += 1;
+                        }
+                    }
+                }
+            }
+            Token::Impl => {
+                let mut j = i + 1;
+                if j < tokens.len() && tokens[j].0 == Token::Lt {
+                    let mut lt_depth = 1;
+                    j += 1;
+                    while j < tokens.len() && lt_depth > 0 {
+                        match &tokens[j].0 {
+                            Token::Lt => lt_depth += 1,
+                            Token::Gt => lt_depth -= 1,
+                            _ => {}
+                        }
+                        j += 1;
+                    }
+                }
+                let mut lbrace_idx = j;
+                while lbrace_idx < tokens.len() && tokens[lbrace_idx].0 != Token::LBrace {
+                    lbrace_idx += 1;
+                }
+                if lbrace_idx < tokens.len() {
+                    let mut for_idx = None;
+                    for k in j..lbrace_idx {
+                        if tokens[k].0 == Token::For {
+                            for_idx = Some(k);
+                            break;
+                        }
+                    }
+                    let type_start_idx = match for_idx {
+                        Some(f_idx) => f_idx + 1,
+                        None => j,
+                    };
+                    let mut type_name = None;
+                    for k in type_start_idx..lbrace_idx {
+                        match &tokens[k].0 {
+                            Token::Ident(name) => {
+                                type_name = Some(name.clone());
+                                break;
+                            }
+                            Token::Bool
+                            | Token::I8
+                            | Token::I16
+                            | Token::I32
+                            | Token::I64
+                            | Token::U8
+                            | Token::U16
+                            | Token::U32
+                            | Token::U64
+                            | Token::Usize
+                            | Token::Isize
+                            | Token::F32
+                            | Token::F64
+                            | Token::Str => {
+                                type_name = Some(format!("{:?}", tokens[k].0).to_lowercase());
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                    let matches_context = match struct_context {
+                        Some(ctx) => {
+                            if let Some(ref target) = type_name {
+                                target == ctx || (ctx == "str" && target == "str")
+                            } else {
+                                false
+                            }
+                        }
+                        None => true,
+                    };
+                    if matches_context {
+                        let mut k = lbrace_idx + 1;
+                        let mut brace_depth = 1;
+                        let mut paren_depth = 0;
+                        let mut bracket_depth = 0;
+                        let mut lt_depth = 0;
+                        while k < tokens.len() && brace_depth > 0 {
+                            match &tokens[k].0 {
+                                Token::LBrace => brace_depth += 1,
+                                Token::RBrace => brace_depth -= 1,
+                                Token::LParen => paren_depth += 1,
+                                Token::RParen => paren_depth -= 1,
+                                Token::LBracket => bracket_depth += 1,
+                                Token::RBracket => bracket_depth -= 1,
+                                Token::Lt => lt_depth += 1,
+                                Token::Gt => lt_depth -= 1,
+                                Token::Ident(id)
+                                    if brace_depth == 1
+                                        && paren_depth == 0
+                                        && bracket_depth == 0
+                                        && lt_depth == 0
+                                        && id == name =>
+                                {
+                                    let mut check_idx = k;
+                                    while check_idx > lbrace_idx + 1 {
+                                        check_idx -= 1;
+                                        match &tokens[check_idx].0 {
+                                            Token::Fn | Token::Const => {
+                                                return Some(tokens[k].1);
+                                            }
+                                            Token::Pub
+                                            | Token::Pound
+                                            | Token::LBracket
+                                            | Token::RBracket
+                                            | Token::Ident(_) => {}
+                                            _ => break,
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                            k += 1;
+                        }
+                    }
+                }
+            }
+            Token::Trait => {
+                let trait_name = if i + 1 < tokens.len() {
+                    if let Token::Ident(ref id) = tokens[i + 1].0 {
+                        Some(id.as_str())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if let Some(t_name) = trait_name
+                    && t_name == name
+                {
+                    return Some(tokens[i + 1].1);
+                }
+                let matches_context = match struct_context {
+                    Some(ctx) => trait_name == Some(ctx),
+                    None => true,
+                };
+                if matches_context {
+                    let mut j = i + 1;
+                    while j < tokens.len() && tokens[j].0 != Token::LBrace {
+                        j += 1;
+                    }
+                    if j < tokens.len() {
+                        j += 1; // move past LBrace
+                        let mut brace_depth = 1;
+                        let mut paren_depth = 0;
+                        let mut bracket_depth = 0;
+                        let mut lt_depth = 0;
+                        while j < tokens.len() && brace_depth > 0 {
+                            match &tokens[j].0 {
+                                Token::LBrace => brace_depth += 1,
+                                Token::RBrace => brace_depth -= 1,
+                                Token::LParen => paren_depth += 1,
+                                Token::RParen => paren_depth -= 1,
+                                Token::LBracket => bracket_depth += 1,
+                                Token::RBracket => bracket_depth -= 1,
+                                Token::Lt => lt_depth += 1,
+                                Token::Gt => lt_depth -= 1,
+                                Token::Ident(id)
+                                    if brace_depth == 1
+                                        && paren_depth == 0
+                                        && bracket_depth == 0
+                                        && lt_depth == 0
+                                        && id == name =>
+                                {
+                                    let mut check_idx = j;
+                                    while check_idx > i + 1 {
+                                        check_idx -= 1;
+                                        match &tokens[check_idx].0 {
+                                            Token::Fn | Token::Const => {
+                                                return Some(tokens[j].1);
+                                            }
+                                            Token::Pub
+                                            | Token::Pound
+                                            | Token::LBracket
+                                            | Token::RBracket
+                                            | Token::Ident(_) => {}
+                                            _ => break,
+                                        }
+                                    }
                                 }
                                 _ => {}
                             }
@@ -1068,20 +1299,23 @@ fn handle_hover(
 
     if let Token::Ident(ref name) = hovered_token.0 {
         let struct_context = get_struct_context(&tokens, hovered_idx);
+        let path_prefix = get_path_prefix(&tokens, hovered_idx);
+        let path_struct_context = if !path_prefix.is_empty() {
+            path_prefix.last().cloned()
+        } else {
+            None
+        };
+        let effective_context = struct_context.as_deref().or(path_struct_context.as_deref());
 
         // 1. Try to resolve path prefix if one exists
-        let path_prefix = get_path_prefix(&tokens, hovered_idx);
         if !path_prefix.is_empty() {
             let mut resolved_path = path_prefix.clone();
             if let Some(prog) = &doc.last_valid_program {
                 resolved_path = resolve_prefix_to_full_path(&prog.uses, &path_prefix);
             }
             if let Some((_, target_entry)) = find_stdlib_entry_by_path(stdlib_cache, &resolved_path)
-                && let Some(contents) = get_hover_text_from_program(
-                    &target_entry.program,
-                    name,
-                    struct_context.as_deref(),
-                )
+                && let Some(contents) =
+                    get_hover_text_from_program(&target_entry.program, name, effective_context)
             {
                 return Some(Hover {
                     contents: HoverContents::Markup(MarkupContent {
@@ -1098,7 +1332,7 @@ fn handle_hover(
 
         // 2. Fallback: Search locally in current file
         let hover_text = if let Some(prog) = &doc.last_valid_program {
-            get_hover_text_from_program(prog, name, struct_context.as_deref())
+            get_hover_text_from_program(prog, name, effective_context)
         } else {
             None
         };
@@ -1117,8 +1351,7 @@ fn handle_hover(
         }
 
         // 3. Fallback: Search globally in the standard library cache
-        if let Some(stdlib_text) =
-            get_hover_text_from_stdlib(stdlib_cache, name, struct_context.as_deref())
+        if let Some(stdlib_text) = get_hover_text_from_stdlib(stdlib_cache, name, effective_context)
         {
             return Some(Hover {
                 contents: HoverContents::Markup(MarkupContent {
@@ -1267,37 +1500,41 @@ fn handle_definition(
             && tokens[clicked_idx - 1].0 == Token::Mod
             && clicked_idx + 1 < tokens.len()
             && tokens[clicked_idx + 1].0 == Token::Semicolon
+            && let Ok(file_path) = url.to_file_path()
+            && let Some(parent_dir) = file_path.parent()
         {
-            if let Ok(file_path) = url.to_file_path() {
-                if let Some(parent_dir) = file_path.parent() {
-                    let mod_path_file = parent_dir.join(format!("{}.u", name));
-                    let mod_path_dir = parent_dir.join(name).join("mod.u");
+            let mod_path_file = parent_dir.join(format!("{}.u", name));
+            let mod_path_dir = parent_dir.join(name).join("mod.u");
 
-                    let target_path = if mod_path_file.exists() {
-                        Some(mod_path_file)
-                    } else if mod_path_dir.exists() {
-                        Some(mod_path_dir)
-                    } else {
-                        None
-                    };
+            let target_path = if mod_path_file.exists() {
+                Some(mod_path_file)
+            } else if mod_path_dir.exists() {
+                Some(mod_path_dir)
+            } else {
+                None
+            };
 
-                    if let Some(path) = target_path {
-                        if let Ok(target_url) = Url::from_file_path(path) {
-                            let target_uri = target_url.to_string().parse::<Uri>().unwrap();
-                            let range = Range::new(Position::new(0, 0), Position::new(0, 0));
-                            return Some(GotoDefinitionResponse::Scalar(Location::new(
-                                target_uri, range,
-                            )));
-                        }
-                    }
-                }
+            if let Some(path) = target_path
+                && let Ok(target_url) = Url::from_file_path(path)
+            {
+                let target_uri = target_url.to_string().parse::<Uri>().unwrap();
+                let range = Range::new(Position::new(0, 0), Position::new(0, 0));
+                return Some(GotoDefinitionResponse::Scalar(Location::new(
+                    target_uri, range,
+                )));
             }
         }
 
         let struct_context = get_struct_context(&tokens, clicked_idx);
+        let path_prefix = get_path_prefix(&tokens, clicked_idx);
+        let path_struct_context = if !path_prefix.is_empty() {
+            path_prefix.last().cloned()
+        } else {
+            None
+        };
+        let effective_context = struct_context.as_deref().or(path_struct_context.as_deref());
 
         // 1. Try to resolve path prefix if one exists
-        let path_prefix = get_path_prefix(&tokens, clicked_idx);
         if !path_prefix.is_empty() {
             let mut resolved_path = path_prefix.clone();
             if let Some(prog) = &doc.last_valid_program {
@@ -1321,7 +1558,7 @@ fn handle_definition(
                     }
                 }
                 if let Some(def_span) =
-                    find_definition_span(&target_tokens, name, 0, struct_context.as_deref())
+                    find_definition_span(&target_tokens, name, 0, effective_context)
                 {
                     let start = offset_to_position(&target_entry.source, def_span.lo);
                     let end = offset_to_position(&target_entry.source, def_span.hi);
@@ -1335,9 +1572,7 @@ fn handle_definition(
         }
 
         // 2. Fallback: Search locally in the current file
-        if let Some(def_span) =
-            find_definition_span(&tokens, name, offset, struct_context.as_deref())
-        {
+        if let Some(def_span) = find_definition_span(&tokens, name, offset, effective_context) {
             let start = offset_to_position(&doc.source, def_span.lo);
             let end = offset_to_position(&doc.source, def_span.hi);
             let range = Range::new(start, end);
@@ -1346,7 +1581,7 @@ fn handle_definition(
 
         // 3. Fallback: Search globally in the standard library cache
         if let Some((file_url, range)) =
-            find_stdlib_definition(stdlib_cache, name, struct_context.as_deref())
+            find_stdlib_definition(stdlib_cache, name, effective_context)
         {
             let file_uri = file_url.to_string().parse::<Uri>().unwrap();
             return Some(GotoDefinitionResponse::Scalar(Location::new(
@@ -3940,6 +4175,171 @@ mod tests {
             assert_eq!(location.range.start, Position::new(0, 0));
         } else {
             panic!("Expected Scalar response");
+        }
+    }
+
+    #[test]
+    fn test_associated_constant_definition_navigation() {
+        let cache = load_stdlib_cache();
+        let mut documents = HashMap::new();
+        let src = "\n            struct Foo { x: i32 }\n            impl Foo {\n                pub const MY_CONST: i32 = 42;\n            }\n            fn main() {\n                let x = Foo::MY_CONST;\n            }\n        ";
+        let url = Url::parse("file:///test_assoc_const_navigation.u").unwrap();
+        update_document(&mut documents, url.clone(), src.to_string());
+
+        let target_str = "Foo::MY_CONST";
+        let offset = src.find(target_str).unwrap() + "Foo::".len();
+        let position = offset_to_position(src, offset);
+
+        let params = GotoDefinitionParams {
+            text_document_position_params: lsp_types::TextDocumentPositionParams {
+                text_document: lsp_types::TextDocumentIdentifier {
+                    uri: url.to_string().parse().unwrap(),
+                },
+                position,
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+
+        let response = handle_definition(&documents, &cache, params);
+        assert!(response.is_some(), "Should find definition for MY_CONST");
+        if let Some(GotoDefinitionResponse::Scalar(location)) = response {
+            assert_eq!(location.uri.to_string(), url.to_string());
+            let def_offset = src.find("pub const MY_CONST").unwrap() + "pub const ".len();
+            let def_start = offset_to_position(src, def_offset);
+            assert_eq!(location.range.start, def_start);
+        } else {
+            panic!("Expected Scalar response");
+        }
+    }
+
+    #[test]
+    fn test_trait_const_definition_navigation() {
+        let cache = load_stdlib_cache();
+        let mut documents = HashMap::new();
+        let src = "\n            trait HasConst {\n                const VALUE: i32;\n            }\n            struct Foo {}\n            impl HasConst for Foo {\n                const VALUE: i32 = 42;\n            }\n            fn main() {\n                let x = Foo::VALUE;\n            }\n        ";
+        let url = Url::parse("file:///test_trait_const_nav.u").unwrap();
+        update_document(&mut documents, url.clone(), src.to_string());
+
+        let target_str = "Foo::VALUE";
+        let offset = src.find(target_str).unwrap() + "Foo::".len();
+        let position = offset_to_position(src, offset);
+
+        let params = GotoDefinitionParams {
+            text_document_position_params: lsp_types::TextDocumentPositionParams {
+                text_document: lsp_types::TextDocumentIdentifier {
+                    uri: url.to_string().parse().unwrap(),
+                },
+                position,
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+
+        let response = handle_definition(&documents, &cache, params);
+        assert!(
+            response.is_some(),
+            "Should find definition for trait const VALUE"
+        );
+        if let Some(GotoDefinitionResponse::Scalar(location)) = response {
+            assert_eq!(location.uri.to_string(), url.to_string());
+            let def_offset = src.find("const VALUE").unwrap() + "const ".len();
+            let def_start = offset_to_position(src, def_offset);
+            assert_eq!(location.range.start, def_start);
+        } else {
+            panic!("Expected Scalar response for trait const definition");
+        }
+    }
+
+    #[test]
+    fn test_trait_const_hover() {
+        let cache = load_stdlib_cache();
+        let mut documents = HashMap::new();
+        let src = "\n            trait HasConst {\n                const VALUE: i32 = 100;\n            }\n        ";
+        let url = Url::parse("file:///test_trait_const_hover.u").unwrap();
+        update_document(&mut documents, url.clone(), src.to_string());
+
+        // Find the token "VALUE" in the const declaration
+        let target_str = "const VALUE";
+        let offset = src.find(target_str).unwrap() + "const ".len();
+        let position = offset_to_position(src, offset);
+
+        let params = lsp_types::HoverParams {
+            text_document_position_params: lsp_types::TextDocumentPositionParams {
+                text_document: lsp_types::TextDocumentIdentifier {
+                    uri: url.to_string().parse().unwrap(),
+                },
+                position,
+            },
+            work_done_progress_params: Default::default(),
+        };
+
+        let response = handle_hover(&documents, &cache, params);
+        assert!(
+            response.is_some(),
+            "Should find hover for trait const VALUE"
+        );
+        if let Some(lsp_types::Hover { contents, .. }) = response {
+            match contents {
+                lsp_types::HoverContents::Markup(lsp_types::MarkupContent { value, .. }) => {
+                    assert!(
+                        value.contains("trait HasConst"),
+                        "Hover should contain trait name, got: {}",
+                        value
+                    );
+                    assert!(
+                        value.contains("const VALUE"),
+                        "Hover should contain const name, got: {}",
+                        value
+                    );
+                    assert!(
+                        value.contains("i32"),
+                        "Hover should contain type, got: {}",
+                        value
+                    );
+                }
+                _ => panic!("Expected Markup hover content"),
+            }
+        } else {
+            panic!("Expected hover response for trait const");
+        }
+    }
+
+    #[test]
+    fn test_trait_const_definition_from_default() {
+        let cache = load_stdlib_cache();
+        let mut documents = HashMap::new();
+        let src = "\n            trait HasDefaultConst {\n                const VALUE: i32 = 42;\n            }\n            struct Foo {}\n            impl HasDefaultConst for Foo {}\n            fn main() {\n                let x = Foo::VALUE;\n            }\n        ";
+        let url = Url::parse("file:///test_trait_const_def_default.u").unwrap();
+        update_document(&mut documents, url.clone(), src.to_string());
+
+        let target_str = "Foo::VALUE";
+        let offset = src.find(target_str).unwrap() + "Foo::".len();
+        let position = offset_to_position(src, offset);
+
+        let params = GotoDefinitionParams {
+            text_document_position_params: lsp_types::TextDocumentPositionParams {
+                text_document: lsp_types::TextDocumentIdentifier {
+                    uri: url.to_string().parse().unwrap(),
+                },
+                position,
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+
+        let response = handle_definition(&documents, &cache, params);
+        assert!(
+            response.is_some(),
+            "Should find definition for inherited trait const VALUE"
+        );
+        if let Some(GotoDefinitionResponse::Scalar(location)) = response {
+            assert_eq!(location.uri.to_string(), url.to_string());
+            let def_offset = src.find("const VALUE").unwrap() + "const ".len();
+            let def_start = offset_to_position(src, def_offset);
+            assert_eq!(location.range.start, def_start);
+        } else {
+            panic!("Expected Scalar response for inherited trait const definition");
         }
     }
 }

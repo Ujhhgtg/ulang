@@ -265,6 +265,28 @@ impl<'a> Lexer<'a> {
                 {
                     self.advance();
                 }
+                // Optional exponent part: [eE][+-]?digit-sequence
+                if self.pos < self.source.len()
+                    && (self.current_char() == Some('e') || self.current_char() == Some('E'))
+                {
+                    let saved_exponent = self.pos;
+                    self.advance(); // consume e/E
+                    if self.pos < self.source.len()
+                        && (self.current_char() == Some('+') || self.current_char() == Some('-'))
+                    {
+                        self.advance();
+                    }
+                    if self.pos < self.source.len() && self.current_char().unwrap().is_ascii_digit()
+                    {
+                        while self.pos < self.source.len()
+                            && self.current_char().unwrap().is_ascii_digit()
+                        {
+                            self.advance();
+                        }
+                    } else {
+                        self.pos = saved_exponent;
+                    }
+                }
                 let val: f64 = self.source[lo..self.pos].parse().map_err(|_| {
                     format!("invalid float literal '{}'", &self.source[lo..self.pos])
                 })?;

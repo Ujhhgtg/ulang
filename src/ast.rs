@@ -341,10 +341,20 @@ pub struct StructField {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
+pub struct TraitConst {
+    pub name: String,
+    pub ty: Type,
+    pub default_value: Option<Expr>,
+    pub span: Span,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
 pub struct TraitDecl {
     pub name: String,
     pub type_params: Vec<GenericParam>,
     pub methods: Vec<TraitMethodDef>,
+    pub consts: Vec<TraitConst>,
     pub is_pub: bool,
     pub span: Span,
 }
@@ -389,6 +399,16 @@ pub struct EnumVariant {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
+pub struct AssociatedConst {
+    pub name: String,
+    pub ty: Type,
+    pub value: Expr,
+    pub is_pub: bool,
+    pub span: Span,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
 pub struct ImplDecl {
     pub impl_type: Type,
     pub trait_name: Option<String>,
@@ -396,6 +416,8 @@ pub struct ImplDecl {
     pub type_params: Vec<GenericParam>,
     pub const_params: Vec<String>,
     pub methods: Vec<Function>,
+    pub consts: Vec<AssociatedConst>,
+    pub span: Span,
 }
 
 /// A pattern for destructuring in `if let` and `match`.

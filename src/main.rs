@@ -1558,6 +1558,55 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
         pending = unresolved;
     }
 
+    // Automatically load standard library slice, string (for str impl), and num (for primitive impls) modules
+    let autoload_modules = vec!["slice", "string", "num"];
+    for &mod_name in &autoload_modules {
+        if let Some(prog) = all_stdlib_progs.get(mod_name) {
+            let mut resolving_modules = HashSet::new();
+            resolving_modules.insert(mod_name.to_string());
+            resolve_module_uses(
+                prog,
+                &all_stdlib_progs,
+                &mut all_structs,
+                &mut all_enums,
+                &mut all_impls,
+                &mut all_funcs,
+                &mut all_overloads,
+                &canonical_struct_sources,
+                &mut resolving_modules,
+            );
+            for i in &prog.impls {
+                let is_always_accessible = match &i.impl_type {
+                    Type::Str
+                    | Type::Slice { .. }
+                    | Type::Array { .. }
+                    | Type::GenericArray { .. }
+                    | Type::Bool
+                    | Type::I8
+                    | Type::I16
+                    | Type::I32
+                    | Type::I64
+                    | Type::U8
+                    | Type::U16
+                    | Type::U32
+                    | Type::U64
+                    | Type::Usize
+                    | Type::Isize
+                    | Type::F32
+                    | Type::F64 => true,
+                    _ => false,
+                };
+                if is_always_accessible
+                    && !all_impls.iter().any(|existing| {
+                        existing.impl_type == i.impl_type && existing.trait_name == i.trait_name
+                    })
+                {
+                    all_impls.push(i.clone());
+                }
+            }
+        }
+    }
+
     (
         Program {
             uses: Vec::new(), // cleared after resolution
@@ -2756,6 +2805,20 @@ fn flatten_module(
                 qualify_type(ret, &local_types, &prefix);
             }
         }
+        for c in &mut t.consts {
+            qualify_type(&mut c.ty, &local_types, &prefix);
+            if let Some(ref mut val) = c.default_value {
+                qualify_expr(
+                    val,
+                    &local_funcs,
+                    &local_types,
+                    &prefix,
+                    &current_path,
+                    &submodules,
+                    top_level_modules,
+                );
+            }
+        }
         if !prefix.is_empty() {
             t.name = format!("{}::{}", prefix, t.name);
         }
@@ -2772,6 +2835,18 @@ fn flatten_module(
             }
             qualify_block(
                 &mut method.body,
+                &local_funcs,
+                &local_types,
+                &prefix,
+                &current_path,
+                &submodules,
+                top_level_modules,
+            );
+        }
+        for c in &mut i.consts {
+            qualify_type(&mut c.ty, &local_types, &prefix);
+            qualify_expr(
+                &mut c.value,
                 &local_funcs,
                 &local_types,
                 &prefix,

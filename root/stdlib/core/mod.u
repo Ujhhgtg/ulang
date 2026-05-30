@@ -9,3 +9,4 @@ pub mod result;
 pub mod slice;
 pub mod intrinsics;
 pub mod drop;
+pub mod num;

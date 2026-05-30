@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::Path;
@@ -30,6 +31,13 @@ type OverloadMap = HashMap<String, Vec<(String, Vec<Type>)>>;
 pub struct CodegenError {
     pub msg: String,
     pub span: Option<Span>,
+}
+
+#[derive(Debug, Clone)]
+pub enum ConstValue {
+    Int(i64),
+    Float(f64),
+    Bool(bool),
 }
 
 impl CodegenError {
@@ -82,7 +90,9 @@ pub struct CodeGen<'ctx> {
     f64_type: FloatType<'ctx>,
     ptr_int_type: IntType<'ctx>,
     symbols: HashMap<String, (PointerValue<'ctx>, bool, Type)>,
-    consts: HashMap<String, i64>,
+    consts: HashMap<String, (ConstValue, Type)>,
+    associated_const_defs: HashMap<(String, String), (Expr, Type)>,
+    associated_const_values: RefCell<HashMap<(String, String), ConstValue>>,
     pub overloads: OverloadMap,
     opt_level: OptimizationLevel,
     pub source: String,
@@ -106,6 +116,8 @@ pub struct CodeGen<'ctx> {
     enum_defs: HashMap<String, EnumDecl>,
     // Generic impl blocks: base name -> Vec<(type_params, ImplDecl)>
     generic_impls: HashMap<String, Vec<(Vec<GenericParam>, ImplDecl)>>,
+    // Trait definitions: name -> TraitDecl
+    trait_defs: HashMap<String, TraitDecl>,
     // Set of already-monomorphized concrete instance names
     monomorphized: HashSet<String>,
     // Current monomorphization context: (base_name, mangled_name)
@@ -172,6 +184,8 @@ impl<'ctx> CodeGen<'ctx> {
             ptr_int_type: context.i64_type(),
             symbols: HashMap::new(),
             consts: HashMap::new(),
+            associated_const_defs: HashMap::new(),
+            associated_const_values: RefCell::new(HashMap::new()),
             overloads: HashMap::new(),
             struct_fields: HashMap::new(),
             struct_types: HashMap::new(),
@@ -183,6 +197,7 @@ impl<'ctx> CodeGen<'ctx> {
             generic_enum_defs: HashMap::new(),
             generic_struct_defs: HashMap::new(),
             generic_impls: HashMap::new(),
+            trait_defs: HashMap::new(),
             monomorphized: HashSet::new(),
             current_monomorphization: None,
             monomorphized_names: HashMap::new(),
@@ -228,6 +243,8 @@ impl<'ctx> CodeGen<'ctx> {
             ptr_int_type: context.i64_type(),
             symbols: HashMap::new(),
             consts: HashMap::new(),
+            associated_const_defs: HashMap::new(),
+            associated_const_values: RefCell::new(HashMap::new()),
             overloads: HashMap::new(),
             struct_fields: HashMap::new(),
             struct_types: HashMap::new(),
@@ -239,6 +256,7 @@ impl<'ctx> CodeGen<'ctx> {
             generic_enum_defs: HashMap::new(),
             generic_struct_defs: HashMap::new(),
             generic_impls: HashMap::new(),
+            trait_defs: HashMap::new(),
             monomorphized: HashSet::new(),
             current_monomorphization: None,
             monomorphized_names: HashMap::new(),
@@ -2039,10 +2057,34 @@ impl<'ctx> CodeGen<'ctx> {
             }
             Expr::Call {
                 args: call_args, ..
-            }
-            | Expr::QualifiedCall {
-                args: call_args, ..
             } => {
+                for arg in call_args.iter_mut() {
+                    let mut inner = Box::new(arg.clone());
+                    Self::m_substitute_types_in_expr(&mut inner, params, args);
+                    *arg = *inner;
+                }
+            }
+            Expr::QualifiedCall {
+                module,
+                args: call_args,
+                ..
+            } => {
+                if let Some(pos) = params.iter().position(|p| p == module) {
+                    match args.get(pos) {
+                        Some(Type::GenericInstance(base, _)) => {
+                            *module = base.clone();
+                        }
+                        Some(Type::Struct(name)) => {
+                            *module = name.clone();
+                        }
+                        Some(arg) => {
+                            if let Some(name) = Self::primitive_type_name(arg) {
+                                *module = name.to_string();
+                            }
+                        }
+                        None => {}
+                    }
+                }
                 for arg in call_args.iter_mut() {
                     let mut inner = Box::new(arg.clone());
                     Self::m_substitute_types_in_expr(&mut inner, params, args);
@@ -2053,12 +2095,19 @@ impl<'ctx> CodeGen<'ctx> {
                 enum_name, payload, ..
             } => {
                 if let Some(pos) = params.iter().position(|p| p == enum_name) {
-                    if let Some(Type::GenericInstance(base, _)) = args.get(pos) {
-                        *enum_name = base.clone();
-                    } else if let Some(arg) = args.get(pos)
-                        && let Some(name) = Self::primitive_type_name(arg)
-                    {
-                        *enum_name = name.to_string();
+                    match args.get(pos) {
+                        Some(Type::GenericInstance(base, _)) => {
+                            *enum_name = base.clone();
+                        }
+                        Some(Type::Struct(name)) => {
+                            *enum_name = name.clone();
+                        }
+                        Some(arg) => {
+                            if let Some(name) = Self::primitive_type_name(arg) {
+                                *enum_name = name.to_string();
+                            }
+                        }
+                        None => {}
                     }
                 }
                 if let Some(inner) = payload {
@@ -3222,6 +3271,48 @@ impl<'ctx> CodeGen<'ctx> {
                     .or_default()
                     .insert(tname.clone());
             }
+            // Monomorphize and register associated constants for this concrete generic instance
+            for associated_const in &impl_decl.consts {
+                let substituted_val = associated_const.value.clone();
+                let mut substituted_ty = associated_const.ty.clone();
+                Self::m_substitute_types_in_expr(
+                    &mut Box::new(substituted_val.clone()),
+                    &param_names,
+                    args,
+                );
+                Self::substitute_type_params(&mut substituted_ty, &param_names, args);
+
+                self.associated_const_defs.insert(
+                    (mangled.clone(), associated_const.name.clone()),
+                    (substituted_val, substituted_ty),
+                );
+            }
+            // Also inherit default trait constants for this concrete generic instance
+            if let Some(ref tname) = impl_decl.trait_name
+                && let Some(trait_def) = self.trait_defs.get(tname) {
+                    for tc in &trait_def.consts {
+                        if !impl_decl.consts.iter().any(|ic| ic.name == tc.name)
+                            && let Some(ref def_val) = tc.default_value {
+                                let substituted_val = def_val.clone();
+                                let mut substituted_ty = tc.ty.clone();
+                                Self::m_substitute_types_in_expr(
+                                    &mut Box::new(substituted_val.clone()),
+                                    &param_names,
+                                    args,
+                                );
+                                Self::substitute_type_params(
+                                    &mut substituted_ty,
+                                    &param_names,
+                                    args,
+                                );
+
+                                self.associated_const_defs.insert(
+                                    (mangled.clone(), tc.name.clone()),
+                                    (substituted_val, substituted_ty),
+                                );
+                            }
+                    }
+                }
             for method in &impl_decl.methods {
                 let mut method_func = method.clone();
 
@@ -3328,6 +3419,7 @@ impl<'ctx> CodeGen<'ctx> {
         }
         for decl in &program.traits {
             self.visibility_map.insert(decl.name.clone(), decl.is_pub);
+            self.trait_defs.insert(decl.name.clone(), decl.clone());
         }
         for decl in &program.type_aliases {
             self.visibility_map.insert(decl.name.clone(), decl.is_pub);
@@ -3419,6 +3511,19 @@ impl<'ctx> CodeGen<'ctx> {
                     continue;
                 }
                 Type::Str => "str".to_string(),
+                Type::I8 => "i8".to_string(),
+                Type::I16 => "i16".to_string(),
+                Type::I32 => "i32".to_string(),
+                Type::I64 => "i64".to_string(),
+                Type::U8 => "u8".to_string(),
+                Type::U16 => "u16".to_string(),
+                Type::U32 => "u32".to_string(),
+                Type::U64 => "u64".to_string(),
+                Type::Usize => "usize".to_string(),
+                Type::Isize => "isize".to_string(),
+                Type::F32 => "f32".to_string(),
+                Type::F64 => "f64".to_string(),
+                Type::Bool => "bool".to_string(),
                 _ => {
                     return Err(format!(
                         "impl target must be a struct type, str, or Self, got {:?}",
@@ -3427,6 +3532,48 @@ impl<'ctx> CodeGen<'ctx> {
                     .into());
                 }
             };
+            for associated_const in &decl.consts {
+                self.associated_const_defs.insert(
+                    (type_name.clone(), associated_const.name.clone()),
+                    (associated_const.value.clone(), associated_const.ty.clone()),
+                );
+            }
+
+            // Trait associated constants & methods completeness validation and inheritance
+            if let Some(ref tname) = decl.trait_name
+                && let Some(trait_def) = program.traits.iter().find(|t| t.name == *tname) {
+                    for tc in &trait_def.consts {
+                        if !decl.consts.iter().any(|ic| ic.name == tc.name) {
+                            if let Some(ref def_val) = tc.default_value {
+                                // Inherit trait's default constant
+                                self.associated_const_defs.insert(
+                                    (type_name.clone(), tc.name.clone()),
+                                    (def_val.clone(), tc.ty.clone()),
+                                );
+                            } else {
+                                return Err(CodegenError::with_span(
+                                    format!(
+                                        "missing associated constant '{}' in implementation of trait '{}' for '{}'",
+                                        tc.name, tname, type_name
+                                    ),
+                                    decl.span,
+                                ));
+                            }
+                        }
+                    }
+                    for tm in &trait_def.methods {
+                        if tm.body.is_none() && !decl.methods.iter().any(|im| im.name == tm.name) {
+                            return Err(CodegenError::with_span(
+                                format!(
+                                    "missing method '{}' in implementation of trait '{}' for '{}'",
+                                    tm.name, tname, type_name
+                                ),
+                                decl.span,
+                            ));
+                        }
+                    }
+                }
+
             if !decl.type_params.is_empty() {
                 self.generic_impls
                     .entry(type_name)
@@ -3449,10 +3596,22 @@ impl<'ctx> CodeGen<'ctx> {
                 };
                 let mut method_func = method.clone();
                 method_func.name = mangled_name.clone();
-                let self_type = if type_name == "str" {
-                    Type::Str
-                } else {
-                    Type::Struct(type_name.clone())
+                let self_type = match type_name.as_str() {
+                    "str" => Type::Str,
+                    "i8" => Type::I8,
+                    "i16" => Type::I16,
+                    "i32" => Type::I32,
+                    "i64" => Type::I64,
+                    "u8" => Type::U8,
+                    "u16" => Type::U16,
+                    "u32" => Type::U32,
+                    "u64" => Type::U64,
+                    "usize" => Type::Usize,
+                    "isize" => Type::Isize,
+                    "f32" => Type::F32,
+                    "f64" => Type::F64,
+                    "bool" => Type::Bool,
+                    _ => Type::Struct(type_name.clone()),
                 };
                 Self::resolve_self_type(&mut method_func, &self_type);
                 self.declare_function(&method_func)?;
@@ -4190,8 +4349,8 @@ impl<'ctx> CodeGen<'ctx> {
                 Self::literal_type(expr)
             }
             Expr::Ident(name, ..) => {
-                if self.consts.contains_key(name) {
-                    return Type::I32;
+                if let Some((_, ty)) = self.consts.get(name) {
+                    return ty.clone();
                 }
                 if let Some((_, _, ty)) = self.symbols.get(name) {
                     return ty.clone();
@@ -4382,6 +4541,18 @@ impl<'ctx> CodeGen<'ctx> {
                 type_args,
                 ..
             } => {
+                if args.is_empty()
+                    && type_args.is_empty()
+                    && self
+                        .associated_const_defs
+                        .contains_key(&(module.clone(), callee.clone()))
+                {
+                    let (_, ty) = self
+                        .associated_const_defs
+                        .get(&(module.clone(), callee.clone()))
+                        .unwrap();
+                    return ty.clone();
+                }
                 let qualified_name = format!("{}::{}", module, callee);
                 let mangled_name = format!("{}::{}/{}", module, callee, args.len());
                 let mut name = if self.module.get_function(&qualified_name).is_some() {
@@ -4478,8 +4649,22 @@ impl<'ctx> CodeGen<'ctx> {
                 }
             }
             Expr::EnumLit {
-                enum_name, payload, ..
+                enum_name,
+                variant,
+                payload,
+                ..
             } => {
+                if payload.is_none()
+                    && self
+                        .associated_const_defs
+                        .contains_key(&(enum_name.clone(), variant.clone()))
+                {
+                    let (_, ty) = self
+                        .associated_const_defs
+                        .get(&(enum_name.clone(), variant.clone()))
+                        .unwrap();
+                    return ty.clone();
+                }
                 let actual_name: String;
                 if let Some(payload_expr) = payload {
                     if self.generic_enum_defs.contains_key(enum_name.as_str()) {
@@ -5138,9 +5323,15 @@ impl<'ctx> CodeGen<'ctx> {
                 }
                 Ok(())
             }
-            Stmt::Const { name, init, .. } => {
+            Stmt::Const {
+                name,
+                type_ann,
+                init,
+                ..
+            } => {
                 let raw = self.const_eval(init)?;
-                self.consts.insert(name.clone(), raw);
+                let ty = type_ann.clone().unwrap_or_else(|| self.expr_type(init));
+                self.consts.insert(name.clone(), (raw, ty));
                 Ok(())
             }
             Stmt::Expr(expr) => {
@@ -5969,8 +6160,8 @@ impl<'ctx> CodeGen<'ctx> {
                 if self.moved_vars.contains(name) {
                     return Err(format!("cannot use moved variable '{}'", name).into());
                 }
-                if let Some(val) = self.consts.get(name) {
-                    return Ok(self.i32_type.const_int(*val as u64, true).into());
+                if let Some((val, ty)) = self.consts.get(name) {
+                    return Ok(self.const_value_to_llvm(val, ty));
                 }
                 if let Some((ptr, _, ty)) = self.symbols.get(name) {
                     let llvm_ty = self.type_to_llvm(ty);
@@ -6475,6 +6666,19 @@ impl<'ctx> CodeGen<'ctx> {
                 type_args,
                 ..
             } => {
+                if args.is_empty()
+                    && type_args.is_empty()
+                    && self
+                        .associated_const_defs
+                        .contains_key(&(module.clone(), callee.clone()))
+                {
+                    let val = self.eval_associated_const(module, callee)?;
+                    let (_, ty) = self
+                        .associated_const_defs
+                        .get(&(module.clone(), callee.clone()))
+                        .unwrap();
+                    return Ok(self.const_value_to_llvm(&val, ty));
+                }
                 let qualified_name = format!("{}::{}", module, callee);
                 self.check_visibility_of_path(&self.current_module_path, &qualified_name)?;
                 let mangled_name = format!("{}::{}/{}", module, callee, args.len());
@@ -7975,6 +8179,18 @@ impl<'ctx> CodeGen<'ctx> {
                 payload,
                 ..
             } => {
+                if payload.is_none()
+                    && self
+                        .associated_const_defs
+                        .contains_key(&(enum_name.clone(), variant.clone()))
+                {
+                    let val = self.eval_associated_const(enum_name, variant)?;
+                    let (_, ty) = self
+                        .associated_const_defs
+                        .get(&(enum_name.clone(), variant.clone()))
+                        .unwrap();
+                    return Ok(self.const_value_to_llvm(&val, ty));
+                }
                 // Compute the actual type name. For generic enums with a payload,
                 // derive from the payload type (e.g., Option::Some(42) → Option__i32).
                 // Avoid monomorphized_names because it's a global map that gets
@@ -9050,71 +9266,211 @@ impl<'ctx> CodeGen<'ctx> {
         }
     }
 
-    fn const_eval(&self, expr: &Expr) -> Result<i64, CodegenError> {
+    fn const_value_to_llvm(&self, val: &ConstValue, ty: &Type) -> BasicValueEnum<'ctx> {
+        let llvm_ty = self.type_to_llvm(ty);
+        match val {
+            ConstValue::Int(v) => {
+                if llvm_ty.is_int_type() {
+                    llvm_ty.into_int_type().const_int(*v as u64, true).into()
+                } else if llvm_ty.is_float_type() {
+                    llvm_ty.into_float_type().const_float(*v as f64).into()
+                } else {
+                    self.i32_type.const_int(*v as u64, true).into()
+                }
+            }
+            ConstValue::Float(v) => {
+                if llvm_ty.is_float_type() {
+                    llvm_ty.into_float_type().const_float(*v).into()
+                } else {
+                    self.f64_type.const_float(*v).into()
+                }
+            }
+            ConstValue::Bool(v) => self
+                .bool_type
+                .const_int(if *v { 1 } else { 0 }, false)
+                .into(),
+        }
+    }
+
+    fn eval_associated_const(
+        &self,
+        type_name: &str,
+        const_name: &str,
+    ) -> Result<ConstValue, CodegenError> {
+        let key = (type_name.to_string(), const_name.to_string());
+        if let Some(val) = self.associated_const_values.borrow().get(&key) {
+            return Ok(val.clone());
+        }
+        let (expr, _) = self.associated_const_defs.get(&key).ok_or_else(|| {
+            CodegenError::new(format!(
+                "undefined associated constant '{}::{}'",
+                type_name, const_name
+            ))
+        })?;
+        let val = self.const_eval(expr)?;
+        self.associated_const_values
+            .borrow_mut()
+            .insert(key, val.clone());
+        Ok(val)
+    }
+
+    fn const_eval(&self, expr: &Expr) -> Result<ConstValue, CodegenError> {
         match expr {
-            Expr::BoolLit(val, ..) => Ok(if *val { 1 } else { 0 }),
-            Expr::IntLit(val, ..) => Ok(*val),
-            Expr::FloatLit(..) => Err("float literals are not supported in const initializers"
-                .to_string()
-                .into()),
+            Expr::BoolLit(val, ..) => Ok(ConstValue::Bool(*val)),
+            Expr::IntLit(val, ..) => Ok(ConstValue::Int(*val)),
+            Expr::FloatLit(val, ..) => Ok(ConstValue::Float(*val)),
             Expr::StrLit(..) => Err("string literals are not supported in const initializers"
                 .to_string()
                 .into()),
-            Expr::Ident(name, ..) => self
-                .consts
-                .get(name)
-                .copied()
-                .ok_or_else(|| CodegenError::new(format!("undefined constant '{}'", name))),
+            Expr::Ident(name, ..) => {
+                if let Some((val, _)) = self.consts.get(name) {
+                    Ok(val.clone())
+                } else {
+                    Err(CodegenError::new(format!("undefined constant '{}'", name)))
+                }
+            }
+            Expr::EnumLit {
+                enum_name,
+                variant,
+                payload: None,
+                ..
+            } => self.eval_associated_const(enum_name, variant),
+            Expr::QualifiedCall {
+                module,
+                callee,
+                args,
+                type_args,
+                ..
+            } => {
+                if args.is_empty() && type_args.is_empty() {
+                    self.eval_associated_const(module, callee)
+                } else {
+                    Err(CodegenError::new(
+                        "function calls are not supported in const initializers".to_string(),
+                    ))
+                }
+            }
             Expr::Binary { op, lhs, rhs, .. } => {
                 let lhs = self.const_eval(lhs)?;
                 let rhs = self.const_eval(rhs)?;
-                match op {
-                    BinOp::Add => Ok(lhs + rhs),
-                    BinOp::Sub => Ok(lhs - rhs),
-                    BinOp::Mul => Ok(lhs * rhs),
-                    BinOp::Div => {
-                        if rhs == 0 {
-                            Err(CodegenError::with_span(
-                                "division by zero in const expression",
-                                expr.span(),
-                            ))
-                        } else {
-                            Ok(lhs / rhs)
+                match (lhs, rhs) {
+                    (ConstValue::Int(l), ConstValue::Int(r)) => match op {
+                        BinOp::Add => Ok(ConstValue::Int(l.wrapping_add(r))),
+                        BinOp::Sub => Ok(ConstValue::Int(l.wrapping_sub(r))),
+                        BinOp::Mul => Ok(ConstValue::Int(l.wrapping_mul(r))),
+                        BinOp::Div => {
+                            if r == 0 {
+                                Err(CodegenError::with_span(
+                                    "division by zero in const expression",
+                                    expr.span(),
+                                ))
+                            } else {
+                                Ok(ConstValue::Int(l / r))
+                            }
                         }
-                    }
-                    BinOp::Eq => Ok(if lhs == rhs { 1 } else { 0 }),
-                    BinOp::Neq => Ok(if lhs != rhs { 1 } else { 0 }),
-                    BinOp::Lt => Ok(if lhs < rhs { 1 } else { 0 }),
-                    BinOp::Gt => Ok(if lhs > rhs { 1 } else { 0 }),
-                    BinOp::Le => Ok(if lhs <= rhs { 1 } else { 0 }),
-                    BinOp::Ge => Ok(if lhs >= rhs { 1 } else { 0 }),
-                    BinOp::And => Ok(if lhs != 0 && rhs != 0 { 1 } else { 0 }),
-                    BinOp::Or => Ok(if lhs != 0 || rhs != 0 { 1 } else { 0 }),
+                        BinOp::Eq => Ok(ConstValue::Bool(l == r)),
+                        BinOp::Neq => Ok(ConstValue::Bool(l != r)),
+                        BinOp::Lt => Ok(ConstValue::Bool(l < r)),
+                        BinOp::Gt => Ok(ConstValue::Bool(l > r)),
+                        BinOp::Le => Ok(ConstValue::Bool(l <= r)),
+                        BinOp::Ge => Ok(ConstValue::Bool(l >= r)),
+                        BinOp::And => Ok(ConstValue::Bool(l != 0 && r != 0)),
+                        BinOp::Or => Ok(ConstValue::Bool(l != 0 || r != 0)),
+                    },
+                    (ConstValue::Float(l), ConstValue::Float(r)) => match op {
+                        BinOp::Add => Ok(ConstValue::Float(l + r)),
+                        BinOp::Sub => Ok(ConstValue::Float(l - r)),
+                        BinOp::Mul => Ok(ConstValue::Float(l * r)),
+                        BinOp::Div => Ok(ConstValue::Float(l / r)),
+                        BinOp::Eq => Ok(ConstValue::Bool(l == r)),
+                        BinOp::Neq => Ok(ConstValue::Bool(l != r)),
+                        BinOp::Lt => Ok(ConstValue::Bool(l < r)),
+                        BinOp::Gt => Ok(ConstValue::Bool(l > r)),
+                        BinOp::Le => Ok(ConstValue::Bool(l <= r)),
+                        BinOp::Ge => Ok(ConstValue::Bool(l >= r)),
+                        _ => Err(CodegenError::new(
+                            "invalid operators on float constants".to_string(),
+                        )),
+                    },
+                    (ConstValue::Bool(l), ConstValue::Bool(r)) => match op {
+                        BinOp::Eq => Ok(ConstValue::Bool(l == r)),
+                        BinOp::Neq => Ok(ConstValue::Bool(l != r)),
+                        BinOp::And => Ok(ConstValue::Bool(l && r)),
+                        BinOp::Or => Ok(ConstValue::Bool(l || r)),
+                        _ => Err(CodegenError::new(
+                            "invalid operators on bool constants".to_string(),
+                        )),
+                    },
+                    _ => Err(CodegenError::new(
+                        "type mismatch in const expression".to_string(),
+                    )),
                 }
             }
-            Expr::Ref { .. } => Err(
-                "reference expressions are not supported in const initializers"
-                    .to_string()
-                    .into(),
-            ),
-            Expr::UnaryMinus(expr, ..) => {
-                let val = self.const_eval(expr)?;
-                Ok(-val)
+            Expr::UnaryMinus(inner, ..) => match self.const_eval(inner)? {
+                ConstValue::Int(v) => Ok(ConstValue::Int(v.wrapping_neg())),
+                ConstValue::Float(v) => Ok(ConstValue::Float(-v)),
+                _ => Err(CodegenError::new(
+                    "invalid operand for unary minus".to_string(),
+                )),
+            },
+            Expr::UnaryNot(inner, ..) => match self.const_eval(inner)? {
+                ConstValue::Bool(v) => Ok(ConstValue::Bool(!v)),
+                ConstValue::Int(v) => Ok(ConstValue::Int(!v)),
+                _ => Err(CodegenError::new(
+                    "invalid operand for unary not".to_string(),
+                )),
+            },
+            Expr::Cast {
+                expr: inner,
+                to_type,
+                ..
+            } => {
+                let val = self.const_eval(inner)?;
+                match val {
+                    ConstValue::Int(v) => match to_type {
+                        Type::F32 | Type::F64 => Ok(ConstValue::Float(v as f64)),
+                        Type::Bool => Ok(ConstValue::Bool(v != 0)),
+                        _ => Ok(ConstValue::Int(v)),
+                    },
+                    ConstValue::Float(v) => match to_type {
+                        Type::I8
+                        | Type::I16
+                        | Type::I32
+                        | Type::I64
+                        | Type::U8
+                        | Type::U16
+                        | Type::U32
+                        | Type::U64
+                        | Type::Usize
+                        | Type::Isize => Ok(ConstValue::Int(v as i64)),
+                        Type::Bool => Ok(ConstValue::Bool(v != 0.0)),
+                        _ => Ok(ConstValue::Float(v)),
+                    },
+                    ConstValue::Bool(v) => match to_type {
+                        Type::I8
+                        | Type::I16
+                        | Type::I32
+                        | Type::I64
+                        | Type::U8
+                        | Type::U16
+                        | Type::U32
+                        | Type::U64
+                        | Type::Usize
+                        | Type::Isize => Ok(ConstValue::Int(if v { 1 } else { 0 })),
+                        Type::F32 | Type::F64 => Ok(ConstValue::Float(if v { 1.0 } else { 0.0 })),
+                        _ => Ok(ConstValue::Bool(v)),
+                    },
+                }
             }
-            Expr::Deref(..) => Err(
-                "dereference expressions are not supported in const initializers"
-                    .to_string()
-                    .into(),
-            ),
-            Expr::Assign { .. } => Err("assignment is not supported in const initializers"
-                .to_string()
-                .into()),
             Expr::MethodCall {
-                expr, method, args, ..
+                expr: inner,
+                method,
+                args,
+                ..
             } => {
                 if method == "len" && args.is_empty() {
-                    if let Expr::StrLit(s, ..) = expr.as_ref() {
-                        Ok(s.len() as i64)
+                    if let Expr::StrLit(s, ..) = inner.as_ref() {
+                        Ok(ConstValue::Int(s.len() as i64))
                     } else {
                         Err("non-constant receiver for method call in const initializer"
                             .to_string()
@@ -9126,10 +9482,10 @@ impl<'ctx> CodeGen<'ctx> {
                         .into())
                 }
             }
-            Expr::Cast { expr, .. } => self.const_eval(expr),
-            _ => Err("non-constant expression in const initializer"
-                .to_string()
-                .into()),
+            _ => Err(CodegenError::with_span(
+                format!("expression not supported in const initializers: {:?}", expr),
+                expr.span(),
+            )),
         }
     }
 

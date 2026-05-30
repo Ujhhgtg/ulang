@@ -1066,18 +1066,18 @@ impl<'ctx> CodeGen<'ctx> {
             Type::Str => self
                 .trait_impls
                 .get("str")
-                .map(|traits| traits.contains(trait_name))
+                .map(|traits| traits.iter().any(|t| t == trait_name || t.ends_with(&format!("::{}", trait_name))))
                 .unwrap_or(false),
             Type::Struct(name) => self
                 .trait_impls
                 .get(name)
-                .map(|traits| traits.contains(trait_name))
+                .map(|traits| traits.iter().any(|t| t == trait_name || t.ends_with(&format!("::{}", trait_name))))
                 .unwrap_or(false),
             Type::GenericInstance(name, args) => {
                 let mangled = Self::mangle_generic_instance(name, args);
                 self.trait_impls
                     .get(&mangled)
-                    .map(|traits| traits.contains(trait_name))
+                    .map(|traits| traits.iter().any(|t| t == trait_name || t.ends_with(&format!("::{}", trait_name))))
                     .unwrap_or(false)
             }
             Type::Ref { inner, .. } => self.check_type_implements_trait(inner, trait_name),
@@ -1092,10 +1092,10 @@ impl<'ctx> CodeGen<'ctx> {
                     || self
                         .trait_impls
                         .get(&key)
-                        .map(|traits| traits.contains(trait_name))
+                        .map(|traits| traits.iter().any(|t| t == trait_name || t.ends_with(&format!("::{}", trait_name))))
                         .unwrap_or(false)
             }
-            Type::ImplTrait(bounds) => bounds.iter().any(|b| b.trait_name == trait_name),
+            Type::ImplTrait(bounds) => bounds.iter().any(|b| b.trait_name == trait_name || b.trait_name.ends_with(&format!("::{}", trait_name))),
             // Tuple/unit types are not derivable (no plan for these)
             _ => false,
         }
@@ -3330,7 +3330,7 @@ impl<'ctx> CodeGen<'ctx> {
                     .into());
                 }
                 // Track direct impl Drop
-                if tname == "Drop" {
+                if tname == "Drop" || tname.ends_with("::Drop") {
                     self.drop_types.insert(type_name.clone());
                 }
                 self.trait_impls
@@ -6992,7 +6992,7 @@ impl<'ctx> CodeGen<'ctx> {
                         && self
                             .trait_impls
                             .get(tn)
-                            .is_some_and(|traits| traits.contains("Drop"))
+                            .is_some_and(|traits| traits.iter().any(|t| t == "Drop" || t.ends_with("::Drop")))
                     {
                         return Err("cannot call Drop::drop directly, use std::mem::drop()"
                             .to_string()

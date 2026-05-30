@@ -1245,8 +1245,6 @@ fn test_vec_iter() {
                 Option::Some(x) => {}
                 Option::None => { print(999); }
             };
-            
-            v.drop();
         }
         "#
     ));
@@ -1285,8 +1283,6 @@ fn test_vec_iter_mut() {
                 Option::Some(val) => { print(val); }
                 Option::None => {}
             };
-
-            v.drop();
         }
         "#
     ));
@@ -1326,7 +1322,6 @@ fn test_for_loop_vec() {
             for x in v {
                 print(*x);
             };
-            v.drop();
         }
         "#
     ));
@@ -1734,6 +1729,7 @@ fn test_no_direct_drop_call() {
         "no_direct_drop",
         r#"
         use std::mem::drop;
+        use std::drop::Drop;
 
         struct MyType { x: i32 }
 
@@ -1919,7 +1915,6 @@ fn test_vec_as_slice() {
             if s[1] != 20 { return 1; };
             if s[2] != 30 { return 1; };
 
-            v.drop();
             0
         }
         "#
@@ -1955,7 +1950,6 @@ fn test_vec_as_mut_slice() {
             if s[1] != 88 { return 1; };
             if s[2] != 30 { return 1; };
 
-            v.drop();
             0
         }
         "#

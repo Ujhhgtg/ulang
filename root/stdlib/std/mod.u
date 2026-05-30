@@ -19,3 +19,4 @@ pub use core::option;
 pub use core::result;
 pub use core::slice;
 pub use core::intrinsics;
+pub use core::drop;

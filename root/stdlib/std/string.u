@@ -63,10 +63,6 @@ impl String {
     pub fn as_str(&self) -> &str {
         transmute::<&[u8], &str>(self.vec.as_slice())
     }
-
-    pub fn drop(&mut self) {
-        self.vec.drop()
-    }
 }
 
 impl str {

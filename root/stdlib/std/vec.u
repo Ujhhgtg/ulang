@@ -7,8 +7,8 @@ use std::iter::IntoIterator;
 use std::iter::IntoIteratorMut;
 use std::iter::Iter;
 use std::intrinsics::{size_of, slice_from_raw_parts, slice_from_raw_parts_mut};
-
 use std::iter::IterMut;
+use std::drop::Drop;
 
 pub struct Vec<T> {
     pub ptr: *mut u8,
@@ -72,8 +72,10 @@ impl<T> Vec<T> {
     pub fn as_mut_slice(&mut self) -> &mut [T] {
         slice_from_raw_parts_mut(self.ptr as *mut T, self.len)
     }
+}
 
-    pub fn drop(&mut self) {
+impl<T> Drop for Vec<T> {
+    fn drop(&mut self) {
         if self.cap > 0 {
             free(self.ptr);
             self.ptr = 0 as *mut u8;

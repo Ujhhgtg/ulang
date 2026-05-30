@@ -65,7 +65,7 @@ impl From<OptLevel> for inkwell::OptimizationLevel {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum Cc {
+enum Linker {
     Gcc,
     #[default]
     Clang,
@@ -74,27 +74,27 @@ enum Cc {
     Tcc,
 }
 
-fn parse_cc(s: &str) -> Result<Cc, String> {
+fn parse_linker(s: &str) -> Result<Linker, String> {
     match s {
-        "gcc" => Ok(Cc::Gcc),
-        "clang" => Ok(Cc::Clang),
-        "cosmocc" => Ok(Cc::Cosmocc),
-        "zig" => Ok(Cc::Zig),
-        "tcc" => Ok(Cc::Tcc),
+        "gcc" => Ok(Linker::Gcc),
+        "clang" => Ok(Linker::Clang),
+        "cosmocc" => Ok(Linker::Cosmocc),
+        "zig" => Ok(Linker::Zig),
+        "tcc" => Ok(Linker::Tcc),
         _ => Err(format!(
-            "invalid C compiler '{s}': use gcc, clang, cosmocc, zig, or tcc"
+            "invalid linker '{s}': use gcc, clang, cosmocc, zig, or tcc"
         )),
     }
 }
 
-impl std::fmt::Display for Cc {
+impl std::fmt::Display for Linker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Cc::Gcc => write!(f, "gcc"),
-            Cc::Clang => write!(f, "clang"),
-            Cc::Cosmocc => write!(f, "cosmocc"),
-            Cc::Zig => write!(f, "zig"),
-            Cc::Tcc => write!(f, "tcc"),
+            Linker::Gcc => write!(f, "gcc"),
+            Linker::Clang => write!(f, "clang"),
+            Linker::Cosmocc => write!(f, "cosmocc"),
+            Linker::Zig => write!(f, "zig"),
+            Linker::Tcc => write!(f, "tcc"),
         }
     }
 }
@@ -117,25 +117,27 @@ struct PackageConfig {
 
 #[derive(Debug, Deserialize, Default)]
 struct BuildConfig {
-    #[serde(default, deserialize_with = "deserialize_cc_opt")]
-    cc: Option<Cc>,
+    #[serde(default, deserialize_with = "deserialize_linker_opt")]
+    linker: Option<Linker>,
+    #[serde(rename = "linker-flags", default)]
+    linker_flags: Option<Vec<String>>,
 }
 
-fn deserialize_cc_opt<'de, D>(deserializer: D) -> Result<Option<Cc>, D::Error>
+fn deserialize_linker_opt<'de, D>(deserializer: D) -> Result<Option<Linker>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    struct CcOptVisitor;
-    impl<'de> serde::de::Visitor<'de> for CcOptVisitor {
-        type Value = Option<Cc>;
+    struct LinkerOptVisitor;
+    impl<'de> serde::de::Visitor<'de> for LinkerOptVisitor {
+        type Value = Option<Linker>;
         fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-            formatter.write_str("a string representation of Cc or null")
+            formatter.write_str("a string representation of Linker or null")
         }
         fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
         where
             E: serde::de::Error,
         {
-            parse_cc(v).map(Some).map_err(serde::de::Error::custom)
+            parse_linker(v).map(Some).map_err(serde::de::Error::custom)
         }
         fn visit_none<E>(self) -> Result<Self::Value, E>
         where
@@ -150,7 +152,7 @@ where
             deserializer.deserialize_str(self)
         }
     }
-    deserializer.deserialize_option(CcOptVisitor)
+    deserializer.deserialize_option(LinkerOptVisitor)
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -325,7 +327,7 @@ opt-level = "0"
 opt-level = "3"
 
 [build]
-cc = "clang"
+linker = "clang"
 "#,
         name
     );
@@ -376,9 +378,12 @@ enum Command {
         /// Optimization level (0|none, 1|less, 2|default, 3|aggressive)
         #[arg(short = 'o', long = "opt", value_parser = parse_opt_level)]
         opt: Option<OptLevel>,
-        /// C compiler to use for linking (in project mode)
-        #[arg(long = "cc", value_parser = parse_cc)]
-        cc: Option<Cc>,
+        /// Linker to use for linking (in project mode)
+        #[arg(long = "linker", value_parser = parse_linker)]
+        linker: Option<Linker>,
+        /// Additional flags to pass to the linker
+        #[arg(long = "linker-flags", num_args = 1..)]
+        linker_flags: Option<Vec<String>>,
         /// Run as a single file script, even if inside a project
         #[arg(long = "script")]
         script: bool,
@@ -396,9 +401,12 @@ enum Command {
         /// Optimization level (0|none, 1|less, 2|default, 3|aggressive)
         #[arg(short = 'o', long = "opt", value_parser = parse_opt_level)]
         opt: Option<OptLevel>,
-        /// C compiler to use for linking (gcc, clang, cosmocc, zig, tcc)
-        #[arg(long = "cc", value_parser = parse_cc)]
-        cc: Option<Cc>,
+        /// Linker to use for linking (gcc, clang, cosmocc, zig, tcc)
+        #[arg(long = "linker", value_parser = parse_linker)]
+        linker: Option<Linker>,
+        /// Additional flags to pass to the linker
+        #[arg(long = "linker-flags", num_args = 1..)]
+        linker_flags: Option<Vec<String>>,
         /// Run as a single file script, even if inside a project
         #[arg(long = "script")]
         script: bool,
@@ -417,9 +425,12 @@ enum Command {
         /// Optimization level (0|none, 1|less, 2|default, 3|aggressive)
         #[arg(short = 'o', long = "opt", default_value_t = OptLevel::Default, value_parser = parse_opt_level)]
         opt: OptLevel,
-        /// C compiler to use for linking (gcc, clang, cosmocc, zig, tcc)
-        #[arg(long = "cc", default_value_t = Default::default(), value_parser = parse_cc)]
-        cc: Cc,
+        /// Linker to use for linking (gcc, clang, cosmocc, zig, tcc)
+        #[arg(long = "linker", default_value_t = Default::default(), value_parser = parse_linker)]
+        linker: Linker,
+        /// Additional flags to pass to the linker
+        #[arg(long = "linker-flags", num_args = 1..)]
+        linker_flags: Option<Vec<String>>,
         /// Run as a single file script, even if inside a project
         #[arg(long = "script")]
         script: bool,
@@ -449,12 +460,14 @@ enum Mode {
     Build {
         output: Option<String>,
         opt: OptLevel,
-        cc: Cc,
+        linker: Linker,
+        linker_flags: Vec<String>,
     },
     BuildRun {
         output: Option<String>,
         opt: OptLevel,
-        cc: Cc,
+        linker: Linker,
+        linker_flags: Vec<String>,
     },
     EmitIr {
         opt: OptLevel,
@@ -463,12 +476,17 @@ enum Mode {
 
 /// Compile the module to an object file, link it, and return the executable path.
 /// Exits the process on failure.
-fn do_build(codegen: &mut codegen::CodeGen<'_>, output: Option<String>, cc: Cc) -> String {
+fn do_build(
+    codegen: &mut codegen::CodeGen<'_>,
+    output: Option<String>,
+    linker: Linker,
+    linker_flags: &[String],
+) -> String {
     let exe_path = output.unwrap_or_else(|| "a.out".to_string());
     let obj_path = format!("{}.o", exe_path);
 
-    match cc {
-        Cc::Cosmocc => {
+    match linker {
+        Linker::Cosmocc => {
             if let Err(msg) = codegen.compile_to_object_for_triple(
                 &TargetTriple::create("x86_64-pc-linux-gnu"),
                 Path::new(&obj_path),
@@ -514,6 +532,7 @@ fn do_build(codegen: &mut codegen::CodeGen<'_>, output: Option<String>, cc: Cc) 
                 cc_args,
                 Path::new(&obj_path),
                 Path::new(&exe_path),
+                linker_flags,
             ) {
                 error::emit_error_opt(
                     &codegen.source,
@@ -542,15 +561,16 @@ fn do_build(codegen: &mut codegen::CodeGen<'_>, output: Option<String>, cc: Cc) 
                 process::exit(1);
             }
 
-            let cc_str = cc.to_string();
-            let cc_args: &[&str] = match cc {
-                Cc::Zig => &["zig", "cc"],
+            let cc_str = linker.to_string();
+            let cc_args: &[&str] = match linker {
+                Linker::Zig => &["zig", "cc"],
                 _ => &[&cc_str],
             };
             if let Err(msg) = codegen::CodeGen::link_executable(
                 cc_args,
                 Path::new(&obj_path),
                 Path::new(&exe_path),
+                linker_flags,
             ) {
                 error::emit_error_opt(
                     &codegen.source,
@@ -1601,18 +1621,28 @@ fn main() {
                     opt: opt.unwrap_or(OptLevel::Default),
                 },
                 Command::Build {
-                    output, opt, cc, ..
+                    output,
+                    opt,
+                    linker,
+                    linker_flags,
+                    ..
                 } => Mode::Build {
                     output: output.clone(),
                     opt: opt.unwrap_or(OptLevel::Default),
-                    cc: cc.unwrap_or(Default::default()),
+                    linker: linker.unwrap_or(Default::default()),
+                    linker_flags: linker_flags.clone().unwrap_or_default(),
                 },
                 Command::BuildRun {
-                    output, opt, cc, ..
+                    output,
+                    opt,
+                    linker,
+                    linker_flags,
+                    ..
                 } => Mode::BuildRun {
                     output: output.clone(),
                     opt: *opt,
-                    cc: *cc,
+                    linker: *linker,
+                    linker_flags: linker_flags.clone().unwrap_or_default(),
                 },
                 Command::EmitIr { opt, .. } => Mode::EmitIr {
                     opt: opt.unwrap_or(OptLevel::Default),
@@ -1645,7 +1675,7 @@ fn main() {
             };
             if file_opt.is_some() {
                 eprintln!(
-                    "error: found a project but a source file was specified. Use '--script' to run in script mode, or run without a file argument for project mode."
+                    "error: found a project but a source file was specified. Use '--script' to run in script mode, or run without a file argument for project mode"
                 );
                 process::exit(1);
             }
@@ -1667,9 +1697,26 @@ fn main() {
                 }
             };
 
-            let cc = match &cli.command {
-                Command::Run { cc: Some(c), .. } | Command::Build { cc: Some(c), .. } => *c,
-                _ => config.build.cc.unwrap_or(Cc::Gcc),
+            let linker = match &cli.command {
+                Command::Run {
+                    linker: Some(l), ..
+                }
+                | Command::Build {
+                    linker: Some(l), ..
+                } => *l,
+                _ => config.build.linker.unwrap_or(Linker::Gcc),
+            };
+
+            let linker_flags = match &cli.command {
+                Command::Run {
+                    linker_flags: Some(f),
+                    ..
+                }
+                | Command::Build {
+                    linker_flags: Some(f),
+                    ..
+                } => f.clone(),
+                _ => config.build.linker_flags.clone().unwrap_or_default(),
             };
 
             let exe_name = match &cli.command {
@@ -1710,12 +1757,14 @@ fn main() {
                 Command::Build { .. } => Mode::Build {
                     output: Some(exe_name),
                     opt,
-                    cc,
+                    linker,
+                    linker_flags,
                 },
                 Command::Run { .. } => Mode::BuildRun {
                     output: Some(exe_name),
                     opt,
-                    cc,
+                    linker,
+                    linker_flags,
                 },
                 _ => unreachable!(),
             };
@@ -1746,18 +1795,28 @@ fn main() {
                 opt: opt.unwrap_or(OptLevel::Default),
             },
             Command::Build {
-                output, opt, cc, ..
+                output,
+                opt,
+                linker,
+                linker_flags,
+                ..
             } => Mode::Build {
                 output: output.clone(),
                 opt: opt.unwrap_or(OptLevel::Default),
-                cc: cc.unwrap_or(Default::default()),
+                linker: linker.unwrap_or(Default::default()),
+                linker_flags: linker_flags.clone().unwrap_or_default(),
             },
             Command::BuildRun {
-                output, opt, cc, ..
+                output,
+                opt,
+                linker,
+                linker_flags,
+                ..
             } => Mode::BuildRun {
                 output: output.clone(),
                 opt: *opt,
-                cc: *cc,
+                linker: *linker,
+                linker_flags: linker_flags.clone().unwrap_or_default(),
             },
             Command::EmitIr { opt, .. } => Mode::EmitIr {
                 opt: opt.unwrap_or(OptLevel::Default),
@@ -1806,7 +1865,12 @@ fn main() {
             }
             println!("program executed successfully");
         }
-        Mode::Build { output, opt, cc } => {
+        Mode::Build {
+            output,
+            opt,
+            linker,
+            linker_flags,
+        } => {
             let opt_level: inkwell::OptimizationLevel = opt.into();
             let mut codegen =
                 codegen::CodeGen::new_native(&context, opt_level, source.clone(), path.clone());
@@ -1817,10 +1881,15 @@ fn main() {
                 process::exit(1);
             }
 
-            let exe_path = do_build(&mut codegen, output, cc);
+            let exe_path = do_build(&mut codegen, output, linker, &linker_flags);
             println!("compiled successfully: {exe_path}");
         }
-        Mode::BuildRun { output, opt, cc } => {
+        Mode::BuildRun {
+            output,
+            opt,
+            linker,
+            linker_flags,
+        } => {
             let opt_level: inkwell::OptimizationLevel = opt.into();
             let mut codegen =
                 codegen::CodeGen::new_native(&context, opt_level, source.clone(), path.clone());
@@ -1831,7 +1900,7 @@ fn main() {
                 process::exit(1);
             }
 
-            let exe_path = do_build(&mut codegen, output, cc);
+            let exe_path = do_build(&mut codegen, output, linker, &linker_flags);
 
             let run_path = if exe_path.contains('/') {
                 exe_path.clone()
@@ -2776,7 +2845,8 @@ mod project_tests {
             opt-level = 3
 
             [build]
-            cc = "clang"
+            linker = "clang"
+            linker-flags = ["-lm", "-lpthread"]
         "#;
         let config: UlangToml = toml::from_str(toml_content).unwrap();
         assert_eq!(config.package.name, "my_project");
@@ -2785,7 +2855,11 @@ mod project_tests {
             config.profile.release.opt_level,
             OptLevel::Aggressive
         ));
-        assert_eq!(config.build.cc, Some(Cc::Clang));
+        assert_eq!(config.build.linker, Some(Linker::Clang));
+        assert_eq!(
+            config.build.linker_flags,
+            Some(vec!["-lm".to_string(), "-lpthread".to_string()])
+        );
     }
 
     #[test]
@@ -2796,7 +2870,8 @@ mod project_tests {
         "#;
         let config: UlangToml = toml::from_str(toml_content).unwrap();
         assert_eq!(config.package.name, "test_defaults");
-        assert_eq!(config.build.cc, None);
+        assert_eq!(config.build.linker, None);
+        assert_eq!(config.build.linker_flags, None);
         assert!(matches!(config.profile.dev.opt_level, OptLevel::None));
         assert!(matches!(
             config.profile.release.opt_level,

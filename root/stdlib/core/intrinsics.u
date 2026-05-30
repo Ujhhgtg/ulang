@@ -26,3 +26,8 @@ pub fn slice_from_raw_parts<T>(ptr: *const T, len: usize) -> &[T];
 /// Creates a mutable fat pointer (reference to slice) from a raw pointer and length.
 #[ulang_intrinsic]
 pub fn slice_from_raw_parts_mut<T>(ptr: *mut T, len: usize) -> &mut [T];
+
+/// Converts a byte slice to a string slice without checking UTF-8 validity.
+/// This is a no-op at runtime since &[u8] and &str have the same layout.
+#[ulang_intrinsic]
+pub fn str_from_utf8_unchecked(v: &[u8]) -> &str;

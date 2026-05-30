@@ -8559,6 +8559,19 @@ impl<'ctx> CodeGen<'ctx> {
                 }
                 None
             }
+            "str_from_utf8_unchecked" if args.len() == 1 => {
+                let arg_ty = self.expr_type(&args[0]);
+                if let Type::Ref { inner, is_mut: _ } = &arg_ty
+                    && let Type::Slice { inner: elem_ty } = inner.as_ref()
+                    && **elem_ty == Type::U8
+                {
+                    return Some(Type::Ref {
+                        inner: Box::new(Type::Str),
+                        is_mut: false,
+                    });
+                }
+                None
+            }
             _ => None,
         }
     }
@@ -8699,6 +8712,10 @@ impl<'ctx> CodeGen<'ctx> {
                     .build_insert_value(fat_ptr, len_int, 1, "fat_len")
                     .map_err(|e| CodegenError::new(format!("failed to build fat len: {}", e)))?;
                 Ok(Some(fat_ptr.into_struct_value().into()))
+            }
+            "str_from_utf8_unchecked" if args.len() == 1 => {
+                let v = self.compile_expr(&args[0])?;
+                Ok(Some(v))
             }
             _ => Ok(None),
         }

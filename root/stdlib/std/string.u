@@ -1,4 +1,5 @@
 use std::vec::Vec;
+use std::intrinsics::str_from_utf8_unchecked;
 use std::alloc::malloc;
 use std::alloc::realloc;
 use std::alloc::free;
@@ -62,6 +63,11 @@ impl String {
     pub fn as_ptr(&self) -> *const u8 {
         let v = self.vec;
         v.as_ptr()
+    }
+
+    pub fn as_str(&self) -> &str {
+        let v = self.vec;
+        str_from_utf8_unchecked(v.as_slice())
     }
 
     pub fn drop(&mut self) {

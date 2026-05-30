@@ -63,8 +63,3 @@ impl f64 {
     pub const INFINITY: f64 = 1.0f64 / 0.0f64;
     pub const NEG_INFINITY: f64 = -1.0f64 / 0.0f64;
 }
-
-impl bool {
-    pub const FALSE: bool = false;
-    pub const TRUE: bool = true;
-}

@@ -2812,7 +2812,12 @@ fn qualify_block(
 ) {
     for stmt in &mut block.stmts {
         match stmt {
-            crate::ast::Stmt::Let { type_ann, init, .. } => {
+            crate::ast::Stmt::Let {
+                type_ann,
+                init,
+                else_block,
+                ..
+            } => {
                 if let Some(ty) = type_ann {
                     qualify_type(ty, local_types, prefix);
                 }
@@ -2825,6 +2830,17 @@ fn qualify_block(
                     submodules,
                     top_level_modules,
                 );
+                if let Some(block) = else_block {
+                    qualify_block(
+                        block,
+                        local_funcs,
+                        local_types,
+                        prefix,
+                        current_path,
+                        submodules,
+                        top_level_modules,
+                    );
+                }
             }
             crate::ast::Stmt::Const { type_ann, init, .. } => {
                 if let Some(ty) = type_ann {

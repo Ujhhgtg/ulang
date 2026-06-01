@@ -62,6 +62,7 @@ use lsp_types::{
 };
 use std::collections::HashMap;
 use url::Url;
+
 // ---------------------------------------------------------------------------
 // Semantic Tokens
 // ---------------------------------------------------------------------------
@@ -132,17 +133,22 @@ fn walk_block_stmts(block: &Block, map: &mut SemanticMap) {
             pattern,
             is_mut,
             span,
+            else_block,
             ..
         } = stmt
         {
             let mods = if *is_mut { M_MUTABLE } else { 0 };
             collect_pattern_bindings(pattern, mods, *span, map);
+            if let Some(el_block) = else_block {
+                walk_block_stmts(el_block, map);
+            }
         }
     }
     if let Some(tail) = &block.tail_expr {
         walk_expr_for_lets(tail, map);
     }
 }
+
 fn collect_pattern_bindings(pattern: &Pattern, mods: u32, span: Span, map: &mut SemanticMap) {
     match pattern {
         Pattern::Binding(name) => {

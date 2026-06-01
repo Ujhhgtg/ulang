@@ -136,6 +136,8 @@ pub enum Stmt {
         type_ann: Option<Type>,
         /// The initializer expression.
         init: Expr,
+        /// The optional else block for let-else statement.
+        else_block: Option<Block>,
         #[allow(dead_code)]
         /// Source span of the let statement.
         span: Span,

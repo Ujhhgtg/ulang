@@ -1655,13 +1655,6 @@ impl<'a> Parser<'a> {
                 let pattern_lo = self.current_span_lo();
                 let pattern = self.parse_pattern()?;
                 let pattern_hi = self.last_span_end();
-                // Check for refutable (non-exhaustive) pattern in let binding
-                if Self::is_refutable_pattern(&pattern) {
-                    return Err(ParseError {
-                        span: Span::new(pattern_lo, pattern_hi),
-                        msg: "non-exhaustive pattern".to_string(),
-                    });
-                }
                 // Optional type annotation
                 let type_ann = if *self.peek_token() == Token::Colon {
                     self.advance();
@@ -1671,6 +1664,19 @@ impl<'a> Parser<'a> {
                 };
                 self.expect(&Token::Eq)?;
                 let init = self.parse_expr()?;
+                let else_block = if *self.peek_token() == Token::Else {
+                    self.advance();
+                    Some(self.parse_block()?)
+                } else {
+                    None
+                };
+                // Check for refutable (non-exhaustive) pattern in let binding
+                if else_block.is_none() && Self::is_refutable_pattern(&pattern) {
+                    return Err(ParseError {
+                        span: Span::new(pattern_lo, pattern_hi),
+                        msg: "non-exhaustive pattern".to_string(),
+                    });
+                }
                 self.expect(&Token::Semicolon)?;
                 let hi = self.last_span_end();
                 Ok(Stmt::Let {
@@ -1678,6 +1684,7 @@ impl<'a> Parser<'a> {
                     is_mut,
                     type_ann,
                     init,
+                    else_block,
                     span: Span::new(lo, hi),
                 })
             }
@@ -3561,9 +3568,16 @@ impl<'a> Parser<'a> {
         for stmt in &mut body.stmts {
             match stmt {
                 Stmt::Let {
-                    type_ann: Some(ty), ..
+                    type_ann,
+                    else_block,
+                    ..
                 } => {
-                    self.resolve_type_in_place_owned(ty, aliases, &mut HashSet::new())?;
+                    if let Some(ty) = type_ann {
+                        self.resolve_type_in_place_owned(ty, aliases, &mut HashSet::new())?;
+                    }
+                    if let Some(el_block) = else_block {
+                        self.resolve_types_in_block(el_block, aliases)?;
+                    }
                 }
                 Stmt::Const {
                     type_ann: Some(ty), ..

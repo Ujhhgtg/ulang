@@ -2381,13 +2381,21 @@ impl<'ctx> CodeGen<'ctx> {
     fn m_substitute_block(block: &mut Block, params: &[String], args: &[Type]) {
         for stmt in &mut block.stmts {
             match stmt {
-                Stmt::Let { type_ann, init, .. } => {
+                Stmt::Let {
+                    type_ann,
+                    init,
+                    else_block,
+                    ..
+                } => {
                     if let Some(ty) = type_ann {
                         Self::substitute_type_params(ty, params, args);
                     }
                     let mut expr_box = Box::new(init.clone());
                     Self::m_substitute_types_in_expr(&mut expr_box, params, args);
                     *init = *expr_box;
+                    if let Some(block) = else_block {
+                        Self::m_substitute_block(block, params, args);
+                    }
                 }
                 Stmt::Const { type_ann, init, .. } => {
                     if let Some(ty) = type_ann {
@@ -5034,7 +5042,14 @@ impl<'ctx> CodeGen<'ctx> {
             Stmt::Break { .. } => {
                 breaks.push(stmt.clone());
             }
-            Stmt::Let { init, .. } => Self::find_expr_breaks(init, breaks),
+            Stmt::Let {
+                init, else_block, ..
+            } => {
+                Self::find_expr_breaks(init, breaks);
+                if let Some(block) = else_block {
+                    Self::find_loop_breaks(block, breaks);
+                }
+            }
             Stmt::Const { init, .. } => Self::find_expr_breaks(init, breaks),
             Stmt::Expr(expr) => Self::find_expr_breaks(expr, breaks),
             Stmt::Return { value, .. } => {
@@ -5392,89 +5407,169 @@ impl<'ctx> CodeGen<'ctx> {
     /// Compile a single statement, producing no value (statements are compiled for effects).
     fn compile_stmt(&mut self, stmt: &Stmt) -> Result<(), CodegenError> {
         match stmt {
-            // let pattern: type = init; — allocates stack slot, stores initial value
             Stmt::Let {
                 pattern,
                 is_mut,
                 type_ann,
                 init,
+                else_block,
                 ..
             } => {
                 if let Some(ann_ty) = type_ann {
                     self.check_visibility_of_type(&self.current_module_path, ann_ty)?;
                 }
-                // Only create a binding for irrefutable patterns that bind a name
-                match pattern {
-                    Pattern::Binding(name) => {
-                        // Shadowing: if the variable already exists, drop the previous binding
+
+                if let Some(el_block) = else_block {
+                    // let-else statement
+                    let el_ty = self.block_type(el_block);
+                    if el_ty != Type::Never {
+                        return Err(CodegenError {
+                            msg: "else block of let-else statement must diverge (return never)"
+                                .to_string(),
+                            span: Some(el_block.span),
+                        });
+                    }
+
+                    let init_val = if let Some(ann_ty) = type_ann {
+                        self.with_expected_type(ann_ty, |this| this.compile_expr(init))?
+                    } else {
+                        self.compile_expr(init)?
+                    };
+                    let init_ty = self.expr_type(init);
+                    let ty = type_ann.clone().unwrap_or_else(|| init_ty.clone());
+                    let llvm_ty = self.type_to_llvm(&ty);
+                    let mut coerced_val = init_val;
+                    if coerced_val.get_type() != llvm_ty
+                        && let Some(ann_ty) = type_ann
+                        && &init_ty != ann_ty {
+                            coerced_val = self.emit_cast(coerced_val, &init_ty, ann_ty)?;
+                        }
+
+                    let (matches_val, bindings) =
+                        self.gen_pattern_check(pattern, coerced_val, &ty)?;
+
+                    let parent_fn = self
+                        .builder
+                        .get_insert_block()
+                        .unwrap()
+                        .get_parent()
+                        .unwrap();
+
+                    let then_bb = self.context.append_basic_block(parent_fn, "let_else_then");
+                    let else_bb = self.context.append_basic_block(parent_fn, "let_else_else");
+
+                    self.builder
+                        .build_conditional_branch(matches_val, then_bb, else_bb)
+                        .map_err(|e| {
+                            CodegenError::new(format!("failed to build let_else branch: {}", e))
+                        })?;
+
+                    // Compile else block
+                    self.builder.position_at_end(else_bb);
+                    let saved_syms = self.symbols.clone();
+                    let saved_moved = self.moved_vars.clone();
+                    self.compile_block_get_value(el_block)?;
+                    self.symbols = saved_syms;
+                    self.moved_vars = saved_moved;
+
+                    if self
+                        .builder
+                        .get_insert_block()
+                        .unwrap()
+                        .get_terminator()
+                        .is_none()
+                    {
+                        self.builder.build_unreachable().map_err(|e| {
+                            CodegenError::new(format!(
+                                "failed to build unreachable in let_else else: {}",
+                                e
+                            ))
+                        })?;
+                    }
+
+                    // Compile then path
+                    self.builder.position_at_end(then_bb);
+
+                    for (name, ptr, b_ty) in &bindings {
                         if let Some((old_ptr, _, old_ty)) = self.symbols.get(name).cloned() {
                             if self.has_drop_glue(&old_ty) {
                                 self.drop_variable(name, &old_ty, old_ptr)?;
                             }
-                            // Remove from scope_stack if present
                             if let Some(scope) = self.scope_stack.last_mut() {
                                 scope.retain(|(n, _, _)| n != name);
                             }
                         }
-
-                        let ty = type_ann.clone().unwrap_or_else(|| self.expr_type(init));
-                        let llvm_ty = self.type_to_llvm(&ty);
-                        // Alloca at use-site (rather than at function entry) because ulang
-                        // compiles one function at a time and LLVM's mem2reg pass can promote
-                        // allocas regardless of position. This also simplifies handling of
-                        // shadowed variables (drop-and-rebind within the same scope).
-                        let alloca = self.builder.build_alloca(llvm_ty, name).map_err(|e| {
-                            CodegenError::new(format!("failed to build alloca: {}", e))
-                        })?;
-                        let mut value = if let Some(ann_ty) = type_ann {
-                            self.with_expected_type(ann_ty, |this| this.compile_expr(init))?
-                        } else {
-                            self.compile_expr(init)?
-                        };
-                        // Only attempt type coercion when the LLVM types differ,
-                        // to handle cases like StructLit vs GenericInstance types
-                        if value.get_type() != llvm_ty
-                            && let Some(ann_ty) = type_ann
-                        {
-                            let inferred = self.expr_type(init);
-                            if ann_ty != &inferred {
-                                value = self.emit_cast(value, &inferred, ann_ty)?;
-                            }
-                        }
-                        self.builder.build_store(alloca, value).map_err(|e| {
-                            CodegenError::new(format!("failed to build store: {}", e))
-                        })?;
-                        self.symbols.insert(name.clone(), (alloca, *is_mut, ty));
-
-                        // Track in scope_stack for drop order
-                        let ty_for_scope = type_ann.clone().unwrap_or_else(|| self.expr_type(init));
+                        self.symbols
+                            .insert(name.clone(), (*ptr, *is_mut, b_ty.clone()));
                         if let Some(scope) = self.scope_stack.last_mut() {
-                            scope.push((name.clone(), ty_for_scope, alloca));
+                            scope.push((name.clone(), b_ty.clone(), *ptr));
                         }
+                    }
 
-                        // Move detection: if init is a simple ident and source is not Copy
-                        // Move semantics are enforced at the IR level rather than the type level:
-                        // when a non-Copy variable is used by-value (assigned to another variable,
-                        // or passed as a non-ref argument), the source is marked as moved in
-                        // `moved_vars`. Any subsequent use triggers a compile error. This mirrors
-                        // Rust's borrow checker but implemented as a runtime check at codegen time.
-                        if let Expr::Ident(src_name, _) = init {
-                            let src_ty = self.expr_type(init);
-                            if !self.is_copy_type(&src_ty) {
-                                self.moved_vars.insert(src_name.clone());
+                    if let Expr::Ident(src_name, _) = init {
+                        let src_ty = self.expr_type(init);
+                        if !self.is_copy_type(&src_ty) {
+                            self.moved_vars.insert(src_name.clone());
+                        }
+                    }
+                } else {
+                    // Existing standard let statement
+                    // Only create a binding for irrefutable patterns that bind a name
+                    match pattern {
+                        Pattern::Binding(name) => {
+                            if let Some((old_ptr, _, old_ty)) = self.symbols.get(name).cloned() {
+                                if self.has_drop_glue(&old_ty) {
+                                    self.drop_variable(name, &old_ty, old_ptr)?;
+                                }
+                                if let Some(scope) = self.scope_stack.last_mut() {
+                                    scope.retain(|(n, _, _)| n != name);
+                                }
+                            }
+
+                            let ty = type_ann.clone().unwrap_or_else(|| self.expr_type(init));
+                            let llvm_ty = self.type_to_llvm(&ty);
+                            let alloca = self.builder.build_alloca(llvm_ty, name).map_err(|e| {
+                                CodegenError::new(format!("failed to build alloca: {}", e))
+                            })?;
+                            let mut value = if let Some(ann_ty) = type_ann {
+                                self.with_expected_type(ann_ty, |this| this.compile_expr(init))?
+                            } else {
+                                self.compile_expr(init)?
+                            };
+                            if value.get_type() != llvm_ty
+                                && let Some(ann_ty) = type_ann
+                            {
+                                let inferred = self.expr_type(init);
+                                if ann_ty != &inferred {
+                                    value = self.emit_cast(value, &inferred, ann_ty)?;
+                                }
+                            }
+                            self.builder.build_store(alloca, value).map_err(|e| {
+                                CodegenError::new(format!("failed to build store: {}", e))
+                            })?;
+                            self.symbols.insert(name.clone(), (alloca, *is_mut, ty));
+
+                            let ty_for_scope =
+                                type_ann.clone().unwrap_or_else(|| self.expr_type(init));
+                            if let Some(scope) = self.scope_stack.last_mut() {
+                                scope.push((name.clone(), ty_for_scope, alloca));
+                            }
+
+                            if let Expr::Ident(src_name, _) = init {
+                                let src_ty = self.expr_type(init);
+                                if !self.is_copy_type(&src_ty) {
+                                    self.moved_vars.insert(src_name.clone());
+                                }
                             }
                         }
-                    }
-                    Pattern::Wildcard => {
-                        // Evaluate the init expression for side effects, discard result
-                        self.compile_expr(init)?;
-                    }
-                    _ => {
-                        // Refutable patterns (EnumVariant, IntLit, BoolLit) are rejected
-                        // by the parser's exhaustiveness check and should never reach codegen
-                        return Err("internal error: refutable pattern reached codegen"
-                            .to_string()
-                            .into());
+                        Pattern::Wildcard => {
+                            self.compile_expr(init)?;
+                        }
+                        _ => {
+                            return Err("internal error: refutable pattern reached codegen"
+                                .to_string()
+                                .into());
+                        }
                     }
                 }
                 Ok(())

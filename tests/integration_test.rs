@@ -2027,6 +2027,59 @@ fn test_match_single_expression_custom_enum() {
     ));
 }
 
+#[test]
+fn test_let_else_basic() {
+    assert!(run_test(
+        "let_else_basic",
+        r#"
+        use std::option::Option;
+        fn main() -> i32 {
+            let opt = Option::Some(42);
+            let Option::Some(x) = opt else {
+                return 1;
+            };
+            if x == 42 {
+                return 0;
+            };
+            return 1;
+        }
+        "#
+    ));
+}
+
+#[test]
+fn test_let_else_non_diverging_error() {
+    assert!(run_test_expect_error(
+        "let_else_non_diverge",
+        r#"
+        use std::option::Option;
+        fn main() {
+            let opt = Option::Some(42);
+            let Option::Some(x) = opt else {
+                // does not return never
+            };
+        }
+        "#
+    ));
+}
+
+#[test]
+fn test_let_else_scope_error() {
+    assert!(run_test_expect_error(
+        "let_else_scope_err",
+        r#"
+        use std::option::Option;
+        fn main() {
+            let opt = Option::Some(42);
+            let Option::Some(x) = opt else {
+                let y = x;
+                return;
+            };
+        }
+        "#
+    ));
+}
+
 // === Use paths and imports ===
 
 #[test]

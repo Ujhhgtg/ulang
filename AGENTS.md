@@ -61,7 +61,7 @@ User-defined types: structs (`struct Point { x: i32, y: i32 }`), enums (`enum Op
 
 ## Statements
 
-- **Let bindings**: `let x = expr;`, `let mut x = expr;`, `let x: Type = expr;`, `let (a, b) = pair;` (destructuring), `let _ = expr;` (wildcard)
+- **Let bindings**: `let x = expr;`, `let mut x = expr;`, `let x: Type = expr;`, `let (a, b) = pair;` (destructuring), `let _ = expr;` (wildcard), `let Some(x) = opt else { return; };` (let-else, else block must diverge)
 - **Const**: `const NAME: Type = expr;` (compile-time evaluated)
 - **Return**: `return expr;`, `return;`
 - **Continue/Break**: `continue;`, `break;`, `break value;` (loop control)

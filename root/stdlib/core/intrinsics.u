@@ -3,9 +3,9 @@
 // and do not have actual implementations. They must be called with the
 // #[ulang_intrinsic] attribute, which allows them to have no body.
 
-/// Returns the size in bytes of the given value's type.
+/// Returns the size in bytes of the given type.
 #[ulang_intrinsic]
-pub fn size_of<T>(x: T) -> usize;
+pub fn size_of<T>() -> usize;
 
 /// Returns a shared reference to the element at `idx` in the array `s`.
 #[ulang_intrinsic]

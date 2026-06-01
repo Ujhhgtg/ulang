@@ -33,7 +33,7 @@ impl<T> Vec<T> {
     pub fn is_empty(&self) -> bool { self.len == 0 }
 
     pub fn push(&mut self, elem: T) {
-        let elem_size = size_of(elem);
+        let elem_size = size_of::<T>();
         if self.len == self.cap {
             let new_cap = if self.cap == 0 { 1 } else { self.cap * 2 };
             let new_size = new_cap * elem_size;
@@ -55,7 +55,7 @@ impl<T> Vec<T> {
             Option::None
         } else {
             self.len = self.len - 1;
-            let elem_size = size_of(*(0 as *const T));
+            let elem_size = size_of::<T>();
             let src = (self.ptr as usize + self.len * elem_size) as *const T;
             Option::Some(*src)
         }
@@ -87,7 +87,7 @@ impl<T> Drop for Vec<T> {
 
 impl<T> IntoIterator<T> for Vec<T> {
     fn iter(&self) -> Iter<T> {
-        let elem_size = size_of(*(0 as *const T));
+        let elem_size = size_of::<T>();
         let start = self.ptr;
         let end = (start as usize + self.len * elem_size) as *mut u8;
         Iter { ptr: start, end: end }
@@ -96,7 +96,7 @@ impl<T> IntoIterator<T> for Vec<T> {
 
 impl<T> IntoIteratorMut<T> for Vec<T> {
     fn iter_mut(&mut self) -> IterMut<T> {
-        let elem_size = size_of(*(0 as *const T));
+        let elem_size = size_of::<T>();
         let start = self.ptr;
         let end = (start as usize + self.len * elem_size) as *mut u8;
         IterMut { ptr: start, end: end }

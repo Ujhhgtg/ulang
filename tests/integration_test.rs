@@ -2566,3 +2566,23 @@ fn test_trait_associated_const_mixed() {
         "#
     ));
 }
+
+#[test]
+fn test_size_of_intrinsic() {
+    assert!(run_test(
+        "size_of_test",
+        r#"
+        use std::intrinsics::size_of;
+        use std::panic::panic;
+        fn get_size<T>() -> usize {
+            size_of::<T>()
+        }
+        fn main() {
+            if size_of::<i32>() != 4 { panic("i32 should be 4"); };
+            if size_of::<u8>() != 1 { panic("u8 should be 1"); };
+            if size_of::<[i32; 10]>() != 40 { panic("array should be 40"); };
+            if get_size::<i32>() != 4 { panic("generic size should be 4"); };
+        }
+        "#
+    ));
+}

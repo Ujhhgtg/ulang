@@ -59,16 +59,16 @@ impl Command {
 
     pub fn spawn(&mut self) {
         let argc = self.args.len();
-        let argv_size = (argc + 1) * size_of(0 as *mut u8);
+        let argv_size = (argc + 1) * size_of::<*mut u8>();
         let argv = malloc(argv_size) as *mut *mut u8;
         let mut i = 0;
         while i < argc {
-            let elem_ptr = (self.args.as_ptr() as usize + i * size_of(0 as *mut u8)) as *const *mut u8;
-            let dest = (argv as usize + i * size_of(0 as *mut u8)) as *mut *mut u8;
+            let elem_ptr = (self.args.as_ptr() as usize + i * size_of::<*mut u8>()) as *const *mut u8;
+            let dest = (argv as usize + i * size_of::<*mut u8>()) as *mut *mut u8;
             *dest = *elem_ptr;
             i = i + 1;
         };
-        let dest_null = (argv as usize + argc * size_of(0 as *mut u8)) as *mut *mut u8;
+        let dest_null = (argv as usize + argc * size_of::<*mut u8>()) as *mut *mut u8;
         *dest_null = 0 as *mut u8;
 
         let env_ptr = dlsym(0 as *mut u8, "environ".0);
@@ -85,16 +85,16 @@ impl Command {
 
     pub fn status(&mut self) -> i32 {
         let argc = self.args.len();
-        let argv_size = (argc + 1) * size_of(0 as *mut u8);
+        let argv_size = (argc + 1) * size_of::<*mut u8>();
         let argv = malloc(argv_size) as *mut *mut u8;
         let mut i = 0;
         while i < argc {
-            let elem_ptr = (self.args.as_ptr() as usize + i * size_of(0 as *mut u8)) as *const *mut u8;
-            let dest = (argv as usize + i * size_of(0 as *mut u8)) as *mut *mut u8;
+            let elem_ptr = (self.args.as_ptr() as usize + i * size_of::<*mut u8>()) as *const *mut u8;
+            let dest = (argv as usize + i * size_of::<*mut u8>()) as *mut *mut u8;
             *dest = *elem_ptr;
             i = i + 1;
         };
-        let dest_null = (argv as usize + argc * size_of(0 as *mut u8)) as *mut *mut u8;
+        let dest_null = (argv as usize + argc * size_of::<*mut u8>()) as *mut *mut u8;
         *dest_null = 0 as *mut u8;
 
         let env_ptr = dlsym(0 as *mut u8, "environ".0);

@@ -30,7 +30,7 @@ impl<T, const L: usize> IndexMut<usize, T> for [T; L] {
 
 impl<T, const L: usize> IntoIterator<T> for [T; L] {
     fn iter(&self) -> Iter<T> {
-        let elem_size = size_of(*(0 as *const T));
+        let elem_size = size_of::<T>();
         let start = self.as_ptr() as *mut u8;
         let end = (start as usize + L * elem_size) as *mut u8;
         Iter { ptr: start, end: end }
@@ -39,7 +39,7 @@ impl<T, const L: usize> IntoIterator<T> for [T; L] {
 
 impl<T, const L: usize> IntoIteratorMut<T> for [T; L] {
     fn iter_mut(&mut self) -> IterMut<T> {
-        let elem_size = size_of(*(0 as *const T));
+        let elem_size = size_of::<T>();
         let start = self.as_ptr() as *mut u8;
         let end = (start as usize + L * elem_size) as *mut u8;
         IterMut { ptr: start, end: end }

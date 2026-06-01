@@ -2170,17 +2170,23 @@ impl<'ctx> CodeGen<'ctx> {
                 Self::substitute_type_params(to_type, params, args);
             }
             Expr::Call {
-                args: call_args, ..
+                args: call_args,
+                type_args: call_type_args,
+                ..
             } => {
                 for arg in call_args.iter_mut() {
                     let mut inner = Box::new(arg.clone());
                     Self::m_substitute_types_in_expr(&mut inner, params, args);
                     *arg = *inner;
                 }
+                for ty in call_type_args.iter_mut() {
+                    Self::substitute_type_params(ty, params, args);
+                }
             }
             Expr::QualifiedCall {
                 module,
                 args: call_args,
+                type_args: call_type_args,
                 ..
             } => {
                 if let Some(pos) = params.iter().position(|p| p == module) {
@@ -2203,6 +2209,9 @@ impl<'ctx> CodeGen<'ctx> {
                     let mut inner = Box::new(arg.clone());
                     Self::m_substitute_types_in_expr(&mut inner, params, args);
                     *arg = *inner;
+                }
+                for ty in call_type_args.iter_mut() {
+                    Self::substitute_type_params(ty, params, args);
                 }
             }
             Expr::EnumLit {
@@ -2323,6 +2332,7 @@ impl<'ctx> CodeGen<'ctx> {
             Expr::MethodCall {
                 expr: receiver,
                 args: call_args,
+                type_args: call_type_args,
                 ..
             } => {
                 Self::m_substitute_types_in_expr(receiver, params, args);
@@ -2330,6 +2340,9 @@ impl<'ctx> CodeGen<'ctx> {
                     let mut inner = Box::new(arg.clone());
                     Self::m_substitute_types_in_expr(&mut inner, params, args);
                     *arg = *inner;
+                }
+                for ty in call_type_args.iter_mut() {
+                    Self::substitute_type_params(ty, params, args);
                 }
             }
             Expr::Tuple(elems, ..) => {
@@ -4038,6 +4051,11 @@ impl<'ctx> CodeGen<'ctx> {
         Ok(())
     }
 
+    fn compile_size_of(&self, ty: &Type) -> BasicValueEnum<'ctx> {
+        let llvm_ty = self.type_to_llvm(ty);
+        llvm_ty.size_of().unwrap().into()
+    }
+
     /// Convert a ulang type to its LLVM representation.
     ///
     /// Maps each `Type` variant to the corresponding LLVM type:
@@ -4608,7 +4626,7 @@ impl<'ctx> CodeGen<'ctx> {
                     return ret_ty;
                 }
                 // Handle size_of intrinsic
-                if callee == "size_of" && args.len() == 1 {
+                if (callee == "size_of" || callee.ends_with("::size_of")) && type_args.len() == 1 {
                     return Type::Usize;
                 }
                 // Handle transmute intrinsic
@@ -4681,6 +4699,9 @@ impl<'ctx> CodeGen<'ctx> {
                 type_args,
                 ..
             } => {
+                if (callee == "size_of" || callee.ends_with("::size_of")) && type_args.len() == 1 {
+                    return Type::Usize;
+                }
                 if args.is_empty()
                     && type_args.is_empty()
                     && self
@@ -6800,43 +6821,8 @@ impl<'ctx> CodeGen<'ctx> {
             } => {
                 self.check_visibility_of_path(&self.current_module_path, callee)?;
                 // Handle size_of intrinsic
-                if callee == "size_of" && args.len() == 1 {
-                    let arg_ty = self.expr_type(&args[0]);
-                    let llvm_ty = self.type_to_llvm(&arg_ty);
-                    let size = match llvm_ty {
-                        inkwell::types::BasicTypeEnum::IntType(i) => i.get_bit_width() as u64 / 8,
-                        inkwell::types::BasicTypeEnum::FloatType(f) => {
-                            if f == self.f32_type {
-                                4
-                            } else {
-                                8
-                            }
-                        }
-                        inkwell::types::BasicTypeEnum::PointerType(_) => 8,
-                        inkwell::types::BasicTypeEnum::StructType(s) => {
-                            let mut total = 0u64;
-                            for i in 0..s.count_fields() {
-                                if let Some(ft) = s.get_field_type_at_index(i) {
-                                    match ft {
-                                        inkwell::types::BasicTypeEnum::IntType(i) => {
-                                            total += i.get_bit_width() as u64 / 8
-                                        }
-                                        inkwell::types::BasicTypeEnum::FloatType(f) => {
-                                            total += if f == self.f32_type { 4 } else { 8 }
-                                        }
-                                        inkwell::types::BasicTypeEnum::PointerType(_) => total += 8,
-                                        _ => total += 4,
-                                    }
-                                }
-                            }
-                            if total == 0 {
-                                total = 4;
-                            }
-                            total
-                        }
-                        _ => 4,
-                    };
-                    return Ok(self.ptr_int_type.const_int(size, false).into());
+                if (callee == "size_of" || callee.ends_with("::size_of")) && type_args.len() == 1 {
+                    return Ok(self.compile_size_of(&type_args[0]));
                 }
                 // Handle transmute intrinsic
                 if callee == "transmute" && args.len() == 1 {
@@ -6953,6 +6939,9 @@ impl<'ctx> CodeGen<'ctx> {
                 type_args,
                 ..
             } => {
+                if (callee == "size_of" || callee.ends_with("::size_of")) && type_args.len() == 1 {
+                    return Ok(self.compile_size_of(&type_args[0]));
+                }
                 if args.is_empty()
                     && type_args.is_empty()
                     && self

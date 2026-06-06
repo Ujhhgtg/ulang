@@ -4,6 +4,7 @@ use std::alloc::malloc;
 use std::alloc::realloc;
 use std::alloc::free;
 use std::alloc::memcpy;
+use std::ops::Deref;
 
 pub struct String {
     pub vec: Vec<u8>,
@@ -76,3 +77,10 @@ impl str {
         s
     }
 }
+
+impl Deref<str> for String {
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+

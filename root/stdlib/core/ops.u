@@ -23,3 +23,8 @@ pub trait Index<Idx, T> {
 pub trait IndexMut<Idx, T> {
     fn index_mut(&mut self, idx: Idx) -> &mut T;
 }
+
+/// Deref<Target> — dereference wrapper or smart pointer to Target type.
+pub trait Deref<Target> {
+    fn deref(&self) -> &Target;
+}

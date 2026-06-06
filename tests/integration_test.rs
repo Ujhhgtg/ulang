@@ -2473,7 +2473,7 @@ fn test_trait_associated_const_required() {
         trait HasConst {
             const VALUE: i32;
         }
-        struct MyStruct {}
+        struct MyStruct;
         impl HasConst for MyStruct {
             const VALUE: i32 = 42;
         }
@@ -2494,7 +2494,7 @@ fn test_trait_associated_const_default() {
         trait HasDefaultConst {
             const ANSWER: i32 = 42;
         }
-        struct MyStruct {}
+        struct MyStruct;
         impl HasDefaultConst for MyStruct {}
         fn main() -> i32 {
             if MyStruct::ANSWER != 42 { panic("expected 42"); };
@@ -2514,7 +2514,7 @@ fn test_trait_associated_const_override_default() {
         trait HasDefaultConst {
             const ANSWER: i32 = 42;
         }
-        struct MyStruct {}
+        struct MyStruct;
         impl HasDefaultConst for MyStruct {
             const ANSWER: i32 = 99;
         }
@@ -2535,7 +2535,7 @@ fn test_trait_associated_const_missing_required() {
         trait HasConst {
             const VALUE: i32;
         }
-        struct MyStruct {}
+        struct MyStruct;
         impl HasConst for MyStruct {}
         fn main() -> i32 { 0 }
         "#
@@ -2586,3 +2586,316 @@ fn test_size_of_intrinsic() {
         "#
     ));
 }
+
+#[test]
+fn test_array_bounds_check_panic() {
+    assert!(run_test_expect_error(
+        "array_bounds_panic",
+        r#"
+        fn main() {
+            let arr = [1, 2, 3];
+            let x = arr[3];
+        }
+        "#
+    ));
+}
+
+#[test]
+fn test_array_bounds_check_mut_panic() {
+    assert!(run_test_expect_error(
+        "array_bounds_mut_panic",
+        r#"
+        fn main() {
+            let mut arr = [1, 2, 3];
+            arr[3] = 42;
+        }
+        "#
+    ));
+}
+
+#[test]
+fn test_vec_bounds_check_panic() {
+    assert!(run_test_expect_error(
+        "vec_bounds_panic",
+        r#"
+        use std::vec::Vec;
+        fn main() {
+            let mut v: Vec<i32> = Vec::new();
+            v.push(10);
+            v.push(20);
+            let x = v[2];
+        }
+        "#
+    ));
+}
+
+#[test]
+fn test_vec_bounds_check_mut_panic() {
+    assert!(run_test_expect_error(
+        "vec_bounds_mut_panic",
+        r#"
+        use std::vec::Vec;
+        fn main() {
+            let mut v: Vec<i32> = Vec::new();
+            v.push(10);
+            v.push(20);
+            v[2] = 42;
+        }
+        "#
+    ));
+}
+
+#[test]
+fn test_array_at_option() {
+    assert!(run_test(
+        "array_at_option",
+        r#"
+        use std::option::Option;
+        use std::panic::panic;
+        fn main() {
+            let arr = [10, 20, 30];
+            let o1 = arr.at(0);
+            let o2 = arr.at(2);
+            let o3 = arr.at(3);
+
+            match o1 {
+                Option::Some(x) => {
+                    if *x != 10 { panic("expected Some(&10)"); };
+                },
+                Option::None => panic("expected Some"),
+            };
+
+            match o2 {
+                Option::Some(x) => {
+                    if *x != 30 { panic("expected Some(&30)"); };
+                },
+                Option::None => panic("expected Some"),
+            };
+
+            match o3 {
+                Option::Some(_) => panic("expected None"),
+                Option::None => {},
+            };
+        }
+        "#
+    ));
+}
+
+#[test]
+fn test_vec_at_option() {
+    assert!(run_test(
+        "vec_at_option",
+        r#"
+        use std::vec::Vec;
+        use std::option::Option;
+        use std::panic::panic;
+        fn main() {
+            let mut v: Vec<i32> = Vec::new();
+            v.push(10);
+            v.push(20);
+            v.push(30);
+
+            let o1 = v.at(0);
+            let o2 = v.at(2);
+            let o3 = v.at(3);
+
+            match o1 {
+                Option::Some(x) => {
+                    if *x != 10 { panic("expected Some(&10)"); };
+                },
+                Option::None => panic("expected Some"),
+            };
+
+            match o2 {
+                Option::Some(x) => {
+                    if *x != 30 { panic("expected Some(&30)"); };
+                },
+                Option::None => panic("expected Some"),
+            };
+
+            match o3 {
+                Option::Some(_) => panic("expected None"),
+                Option::None => {},
+            };
+        }
+        "#
+    ));
+}
+
+#[test]
+fn test_vec_indexing_success() {
+    assert!(run_test(
+        "vec_indexing_success",
+        r#"
+        use std::vec::Vec;
+        use std::panic::panic;
+        fn main() {
+            let mut v: Vec<i32> = Vec::new();
+            v.push(100);
+            v.push(200);
+
+            let x = v[0];
+            let y = v[1];
+            if x != 100 { panic("expected 100"); };
+            if y != 200 { panic("expected 200"); };
+
+            v[0] = 300;
+            v[1] = 400;
+            if v[0] != 300 { panic("expected 300"); };
+            if v[1] != 400 { panic("expected 400"); };
+        }
+        "#
+    ));
+}
+
+#[test]
+fn test_custom_deref_smart_pointer() {
+    assert!(run_test(
+        "custom_deref_smart_pointer",
+        r#"
+        use std::ops::Deref;
+        use std::panic::panic;
+
+        struct MyBox<T> {
+            val: T,
+        }
+
+        impl<T> Deref<T> for MyBox<T> {
+            fn deref(&self) -> &T {
+                &self.val
+            }
+        }
+
+        struct Point {
+            x: i32,
+            y: i32,
+        }
+
+        impl Point {
+            fn get_x(&self) -> i32 {
+                self.x
+            }
+        }
+
+        fn take_point_ref(p: &Point) -> i32 {
+            p.x + p.y
+        }
+
+        fn main() {
+            // Test 1: Explicit dereference read
+            let b1: MyBox<i32> = MyBox { val: 42 };
+            let val1 = *b1;
+            if val1 != 42 { panic("explicit deref read failed"); };
+
+            // Test 2: Explicit dereference write
+            let mut b2: MyBox<i32> = MyBox { val: 100 };
+            *b2 = 200;
+            if b2.val != 200 { panic("explicit deref write failed"); };
+
+            // Test 3: Auto-deref on method call
+            let b3: MyBox<Point> = MyBox { val: Point { x: 10, y: 20 } };
+            let x_val = b3.get_x();
+            if x_val != 10 { panic("auto-deref method call failed"); };
+
+            // Test 4: Auto-deref on field access
+            let b4: MyBox<Point> = MyBox { val: Point { x: 30, y: 40 } };
+            if b4.x != 30 || b4.y != 40 { panic("auto-deref field access failed"); };
+
+            // Test 5: Deref coercion in function arguments
+            let b5: MyBox<Point> = MyBox { val: Point { x: 5, y: 6 } };
+            let sum = take_point_ref(&b5);
+            if sum != 11 { panic("deref coercion failed"); };
+
+            // Test 6: taking reference to deref: &*b
+            let b6: MyBox<i32> = MyBox { val: 77 };
+            let r = &*b6;
+            if *r != 77 { panic("ref to deref failed"); };
+        }
+        "#
+    ));
+}
+
+#[test]
+fn test_stdlib_deref_coercion() {
+    assert!(run_test(
+        "stdlib_deref_coercion",
+        r#"
+        use std::string::String;
+        use std::vec::Vec;
+        use std::panic::panic;
+
+        fn greet(s: &str) -> usize {
+            s.len()
+        }
+
+        fn sum_slice(slice: &[i32]) -> i32 {
+            let mut sum = 0;
+            let mut i = 0;
+            while i < slice.len() {
+                sum = sum + slice[i];
+                i = i + 1;
+            };
+            sum
+        }
+
+        fn main() {
+            // Test 1: String to &str coercion
+            let mut s = String::new();
+            s.push_str("hello");
+            let len = greet(&s);
+            if len != 5 { panic("string coercion failed"); };
+
+            // Test 2: Vec to &[T] coercion
+            let mut v: Vec<i32> = Vec::new();
+            v.push(10);
+            v.push(20);
+            let sum = sum_slice(&v);
+            if sum != 30 { panic("vec coercion failed"); };
+
+            // Test 3: Auto-deref on String method call
+            let s_len = s.len();
+            if s_len != 5 { panic("string len call failed"); };
+
+            // Test 4: Auto-deref on Vec to slice indexing.
+            let s_slice = v.as_slice();
+            if s_slice[0] != 10 { panic("slice index read failed"); };
+        }
+        "#
+    ));
+}
+
+#[test]
+fn test_autoderef_indexing() {
+    assert!(run_test(
+        "autoderef_indexing",
+        r#"
+        use std::ops::Deref;
+        use std::panic::panic;
+
+        struct MyBox<T> {
+            val: T,
+        }
+
+        impl<T> Deref<T> for MyBox<T> {
+            fn deref(&self) -> &T {
+                &self.val
+            }
+        }
+
+        fn main() {
+            let b1: MyBox<[i32; 3]> = MyBox { val: [10, 20, 30] };
+            
+            // Test 1: Auto-deref indexing read
+            let x = b1[1];
+            if x != 20 { panic("autoderef index read failed"); };
+
+            // Test 2: Auto-deref indexing write
+            let mut b2: MyBox<[i32; 3]> = MyBox { val: [100, 200, 300] };
+            b2[1] = 999;
+            if b2.val[1] != 999 { panic("autoderef index write failed"); };
+        }
+        "#
+    ));
+}
+
+

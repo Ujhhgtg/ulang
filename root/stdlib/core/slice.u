@@ -5,6 +5,8 @@ use std::iter::IntoIteratorMut;
 use std::iter::Iter;
 use std::iter::IterMut;
 use std::intrinsics::{slice_index, slice_index_mut, slice_as_ptr, size_of};
+use std::panic::panic;
+use std::option::Option;
 
 impl<T, const L: usize> [T; L] {
     fn len(&self) -> usize {
@@ -14,16 +16,30 @@ impl<T, const L: usize> [T; L] {
     fn as_ptr(&self) -> *const T {
         slice_as_ptr(self)
     }
+
+    fn at(&self, idx: usize) -> Option<&T> {
+        if idx >= L {
+            Option::None
+        } else {
+            Option::Some(slice_index(self, idx))
+        }
+    }
 }
 
 impl<T, const L: usize> Index<usize, T> for [T; L] {
     fn index(&self, idx: usize) -> &T {
+        if idx >= L {
+            panic("index out of bounds");
+        };
         slice_index(self, idx)
     }
 }
 
 impl<T, const L: usize> IndexMut<usize, T> for [T; L] {
     fn index_mut(&mut self, idx: usize) -> &mut T {
+        if idx >= L {
+            panic("index out of bounds");
+        };
         slice_index_mut(self, idx)
     }
 }

@@ -1,7 +1,8 @@
+/.antigravitycli
+
 /target
 /a.out*
 
-# VS Code Extension Artifacts
 /vscode-ext/node_modules/
 /vscode-ext/out/
 /vscode-ext/.vscode-test/

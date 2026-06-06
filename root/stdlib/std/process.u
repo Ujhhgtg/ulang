@@ -30,11 +30,7 @@ impl Command {
 
     pub fn new(program: &str) -> Command {
         let prog_c = Command::to_c_str(program);
-        let mut args_vec: Vec<*mut u8> = Vec {
-            ptr: 0 as *mut u8,
-            len: 0,
-            cap: 0,
-        };
+        let mut args_vec: Vec<*mut u8> = Vec::new();
         args_vec.push(prog_c);
         Command {
             program: prog_c,
@@ -123,13 +119,5 @@ impl Command {
             return div - (div / 256) * 256;
         };
         -1
-    }
-
-    pub fn drop(&mut self) {
-        while !self.args.is_empty() {
-            let opt: Option<*mut u8> = self.args.pop();
-            let arg_ptr = opt.unwrap();
-            free(arg_ptr);
-        }
     }
 }

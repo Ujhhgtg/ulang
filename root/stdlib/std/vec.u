@@ -5,10 +5,13 @@ use std::alloc::free;
 use std::alloc::memcpy;
 use std::iter::IntoIterator;
 use std::iter::IntoIteratorMut;
-use std::iter::Iter;
+use std::iter::{Iter, IterMut};
 use std::intrinsics::{size_of, slice_from_raw_parts, slice_from_raw_parts_mut};
-use std::iter::IterMut;
 use std::drop::Drop;
+use std::ops::Index;
+use std::ops::IndexMut;
+use std::ops::Deref;
+use std::panic::panic;
 
 pub struct Vec<T> {
     pub ptr: *mut u8,
@@ -72,6 +75,16 @@ impl<T> Vec<T> {
     pub fn as_mut_slice(&mut self) -> &mut [T] {
         slice_from_raw_parts_mut(self.ptr as *mut T, self.len)
     }
+
+    pub fn at(&self, idx: usize) -> Option<&T> {
+        if idx >= self.len {
+            Option::None
+        } else {
+            let elem_size = size_of::<T>();
+            let ptr = (self.ptr as usize + idx * elem_size) as *const T;
+            Option::Some(&*ptr)
+        }
+    }
 }
 
 impl<T> Drop for Vec<T> {
@@ -102,3 +115,32 @@ impl<T> IntoIteratorMut<T> for Vec<T> {
         IterMut { ptr: start, end: end }
     }
 }
+
+impl<T> Index<usize, T> for Vec<T> {
+    fn index(&self, idx: usize) -> &T {
+        if idx >= self.len {
+            panic("index out of bounds");
+        };
+        let elem_size = size_of::<T>();
+        let ptr = (self.ptr as usize + idx * elem_size) as *const T;
+        &*ptr
+    }
+}
+
+impl<T> IndexMut<usize, T> for Vec<T> {
+    fn index_mut(&mut self, idx: usize) -> &mut T {
+        if idx >= self.len {
+            panic("index out of bounds");
+        };
+        let elem_size = size_of::<T>();
+        let ptr = (self.ptr as usize + idx * elem_size) as *mut T;
+        &mut *ptr
+    }
+}
+
+impl<T> Deref<[T]> for Vec<T> {
+    fn deref(&self) -> &[T] {
+        self.as_slice()
+    }
+}
+

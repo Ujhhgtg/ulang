@@ -3814,6 +3814,7 @@ impl<'ctx> CodeGen<'ctx> {
             }
             self.declare_function(func)?;
         }
+
         // Phase 0.6: Discover and monomorphize all needed generic instances
         let generic_instances = Self::collect_generic_instances(program);
         for (base_name, args) in &generic_instances {
@@ -3823,6 +3824,7 @@ impl<'ctx> CodeGen<'ctx> {
                 self.ensure_monomorphized(base_name, args)?;
             }
         }
+
         // Phase 0.65: Set struct bodies for non-generic structs/enums
         for decl in &program.structs {
             if !decl.type_params.is_empty() {
@@ -3872,6 +3874,7 @@ impl<'ctx> CodeGen<'ctx> {
                 self.process_struct_derives(&sd, program)?;
             }
         }
+
         // Phase 0.8: Compute transitive drop closure
         // Iterate struct fields and propagate drop_types to structs containing Drop fields
         let mut changed = true;
@@ -4386,122 +4389,135 @@ impl<'ctx> CodeGen<'ctx> {
                 type_args,
                 ..
             } => {
-                // Try to determine return type from method definition
-                let receiver_type = self.expr_type(receiver);
-                if let Type::Ref { inner, .. } = &receiver_type
-                    && **inner == Type::Str
-                    && method == "len"
-                {
-                    return Type::Usize;
-                }
-                // .len() on &[T] or [T] returns Usize
-                if method == "len" {
-                    let is_slice = matches!(&receiver_type, Type::Slice { .. })
-                        || matches!(&receiver_type, Type::Ref { inner, .. } if matches!(inner.as_ref(), Type::Slice { .. }));
-                    if is_slice {
-                        return Type::Usize;
+                // Try to determine return type from method definition using auto-deref
+                let mut curr_receiver_type = self.expr_type(receiver);
+                loop {
+                    // 1. Check special cases (len, as_ptr)
+                    if method == "len" && args.is_empty() {
+                        let is_str = matches!(&curr_receiver_type, Type::Ref { inner, .. } if **inner == Type::Str) || curr_receiver_type == Type::Str;
+                        let is_slice = matches!(&curr_receiver_type, Type::Slice { .. })
+                            || matches!(&curr_receiver_type, Type::Ref { inner, .. } if matches!(inner.as_ref(), Type::Slice { .. }));
+                        if is_str || is_slice {
+                            return Type::Usize;
+                        }
                     }
-                }
-                // .as_ptr() on &[T] returns *const T
-                if method == "as_ptr" {
-                    if let Type::Ref { inner, .. } = &receiver_type
-                        && let Type::Slice { inner: elem_ty } = inner.as_ref()
-                    {
-                        return Type::Ptr {
-                            inner: elem_ty.clone(),
-                            is_mut: false,
-                        };
+                    if method == "as_ptr" && args.is_empty() {
+                        if let Type::Ref { inner, .. } = &curr_receiver_type
+                            && let Type::Slice { inner: elem_ty } = inner.as_ref()
+                        {
+                            return Type::Ptr {
+                                inner: elem_ty.clone(),
+                                is_mut: false,
+                            };
+                        }
+                        if let Type::Slice { inner: elem_ty } = &curr_receiver_type {
+                            return Type::Ptr {
+                                inner: elem_ty.clone(),
+                                is_mut: false,
+                            };
+                        }
                     }
-                    if let Type::Slice { inner: elem_ty } = &receiver_type {
-                        return Type::Ptr {
-                            inner: elem_ty.clone(),
-                            is_mut: false,
-                        };
-                    }
-                }
-                // For struct/primitive methods, look up return type from impl methods
-                let type_name = match &receiver_type {
-                    Type::Array { inner, len } => Some(Self::array_type_key(inner, *len)),
-                    Type::Struct(name) => Some(name.clone()),
-                    Type::GenericInstance(name, args) => {
-                        Some(Self::mangle_generic_instance(name, args))
-                    }
-                    Type::Ref { inner, .. } => match inner.as_ref() {
-                        Type::Array {
-                            inner: arr_inner,
-                            len,
-                        } => Some(Self::array_type_key(arr_inner, *len)),
+
+                    // 2. Check general methods
+                    let type_name = match &curr_receiver_type {
+                        Type::Array { inner, len } => Some(Self::array_type_key(inner, *len)),
                         Type::Struct(name) => Some(name.clone()),
                         Type::GenericInstance(name, args) => {
                             Some(Self::mangle_generic_instance(name, args))
                         }
-                        _ => Self::primitive_type_name(inner).map(|s| s.to_string()),
-                    },
-                    _ => Self::primitive_type_name(&receiver_type).map(|s| s.to_string()),
-                };
-                if let Some(type_name) = type_name {
-                    if let Some(generic_methods) = self.generic_methods.get(&type_name)
-                        && let Some(gen_method) = generic_methods.iter().find(|m| m.name == *method)
-                    {
-                        let param_names: Vec<String> = gen_method
-                            .type_params
-                            .iter()
-                            .map(|p| p.name.clone())
-                            .collect();
-                        let mut mappings = HashMap::new();
-                        if !type_args.is_empty() {
-                            for (name, ty) in param_names.iter().zip(type_args.iter()) {
-                                if !matches!(ty, Type::Infer) {
-                                    mappings.insert(name.clone(), ty.clone());
+                        Type::Ref { inner, .. } => match inner.as_ref() {
+                            Type::Array {
+                                inner: arr_inner,
+                                len,
+                            } => Some(Self::array_type_key(arr_inner, *len)),
+                            Type::Struct(name) => Some(name.clone()),
+                            Type::GenericInstance(name, args) => {
+                                Some(Self::mangle_generic_instance(name, args))
+                            }
+                            _ => Self::primitive_type_name(inner).map(|s| s.to_string()),
+                        },
+                        _ => Self::primitive_type_name(&curr_receiver_type).map(|s| s.to_string()),
+                    };
+
+                    if let Some(ref tn) = type_name {
+                        // Check generic methods
+                        if let Some(generic_methods) = self.generic_methods.get(tn)
+                            && let Some(gen_method) = generic_methods.iter().find(|m| m.name == *method)
+                        {
+                            let param_names: Vec<String> = gen_method
+                                .type_params
+                                .iter()
+                                .map(|p| p.name.clone())
+                                .collect();
+                            let mut mappings = HashMap::new();
+                            if !type_args.is_empty() {
+                                for (name, ty) in param_names.iter().zip(type_args.iter()) {
+                                    if !matches!(ty, Type::Infer) {
+                                        mappings.insert(name.clone(), ty.clone());
+                                    }
                                 }
                             }
-                        }
-                        // Infer any remaining (unmapped) type parameters from arguments
-                        let mut all_arg_types = vec![receiver_type.clone()];
-                        all_arg_types.extend(args.iter().map(|a| self.expr_type(a)));
-                        for (param, arg_ty) in gen_method.params.iter().zip(&all_arg_types) {
-                            for name in &param_names {
-                                if !mappings.contains_key(name) {
-                                    self.infer_type_mappings(
-                                        &param.ty,
-                                        arg_ty,
-                                        &param_names,
-                                        &mut mappings,
-                                    );
+                            let mut all_arg_types = vec![curr_receiver_type.clone()];
+                            all_arg_types.extend(args.iter().map(|a| self.expr_type(a)));
+                            for (param, arg_ty) in gen_method.params.iter().zip(&all_arg_types) {
+                                for name in &param_names {
+                                    if !mappings.contains_key(name) {
+                                        self.infer_type_mappings(
+                                            &param.ty,
+                                            arg_ty,
+                                            &param_names,
+                                            &mut mappings,
+                                        );
+                                    }
                                 }
                             }
+                            if let Some(mut ret_ty) = gen_method.return_type.clone() {
+                                Self::substitute_type_params(
+                                    &mut ret_ty,
+                                    &param_names,
+                                    &param_names
+                                        .iter()
+                                        .map(|n| mappings.get(n).cloned().unwrap_or(Type::I32))
+                                        .collect::<Vec<_>>(),
+                                );
+                                return ret_ty;
+                            } else {
+                                return Type::Unit;
+                            }
                         }
-                        if let Some(mut ret_ty) = gen_method.return_type.clone() {
-                            Self::substitute_type_params(
-                                &mut ret_ty,
-                                &param_names,
-                                &param_names
-                                    .iter()
-                                    .map(|n| mappings.get(n).cloned().unwrap_or(Type::I32))
-                                    .collect::<Vec<_>>(),
-                            );
-                            return ret_ty;
-                        } else {
-                            return Type::Unit;
+
+                        // Check impl methods
+                        if let Some(methods) = self.impl_methods.get(tn)
+                            && let Some((_, mangled)) = methods.iter().find(|(name, _)| name == method)
+                            && let Some(ret_ty) = self.fn_return_types.get(mangled)
+                        {
+                            return ret_ty.clone();
+                        }
+
+                        // clone / default
+                        if method == "clone" || method == "default" {
+                            return curr_receiver_type;
+                        }
+                        if method == "eq" || method == "ne" {
+                            return Type::Bool;
+                        }
+                        if let Some(methods) = self.impl_methods.get(tn)
+                            && methods.iter().any(|(name, _)| name == method)
+                        {
+                            return Type::I32;
                         }
                     }
-                    if let Some(methods) = self.impl_methods.get(&type_name)
-                        && let Some((_, mangled)) = methods.iter().find(|(name, _)| name == method)
-                        && let Some(ret_ty) = self.fn_return_types.get(mangled)
-                    {
-                        return ret_ty.clone();
-                    }
-                    // clone/default return Self, eq/ne return bool, cmp returns i32
-                    if method == "clone" || method == "default" {
-                        return receiver_type;
-                    }
-                    if method == "eq" || method == "ne" {
-                        return Type::Bool;
-                    }
-                    if let Some(methods) = self.impl_methods.get(&type_name)
-                        && methods.iter().any(|(name, _)| name == method)
-                    {
-                        return Type::I32;
+
+                    // 3. Try to auto-deref
+                    if let Some((next_ty, _)) = self.get_custom_deref_target(&curr_receiver_type) {
+                        curr_receiver_type = Type::Ref {
+                            inner: Box::new(next_ty),
+                            is_mut: false,
+                        };
+                    } else if let Type::Ref { inner, .. } | Type::Ptr { inner, .. } = &curr_receiver_type {
+                        curr_receiver_type = inner.as_ref().clone();
+                    } else {
+                        break;
                     }
                 }
                 Self::literal_type(expr)
@@ -4522,12 +4538,13 @@ impl<'ctx> CodeGen<'ctx> {
                 ..
             } => {
                 let parent_ty = self.expr_type(inner);
+                let deref_ty = self.resolve_member_type(&parent_ty, field.as_ref(), *index);
                 // Resolve struct types to their inner type for field access
-                let resolved_ty = match &parent_ty {
+                let resolved_ty = match &deref_ty {
                     Type::Ref { inner, .. } => inner.as_ref(),
-                    Type::Struct(_) => &parent_ty,
-                    Type::GenericInstance(_, _) => &parent_ty,
-                    _ => &parent_ty,
+                    Type::Struct(_) => &deref_ty,
+                    Type::GenericInstance(_, _) => &deref_ty,
+                    _ => &deref_ty,
                 };
                 match resolved_ty {
                     Type::Tuple(elems) => {
@@ -4862,15 +4879,48 @@ impl<'ctx> CodeGen<'ctx> {
             }
             Expr::Index { array, .. } => {
                 let array_ty = self.expr_type(array);
-                match &array_ty {
+                let resolved_ty = self.resolve_index_type(&array_ty);
+                match &resolved_ty {
                     Type::Array { inner, .. } => *inner.clone(),
                     Type::Slice { inner, .. } => *inner.clone(),
                     Type::Ref { inner, .. } => match inner.as_ref() {
                         Type::Array { inner: ai, .. } => *ai.clone(),
                         Type::Slice { inner: si, .. } => *si.clone(),
-                        _ => Type::I32,
+                        _ => {
+                            let type_name = match inner.as_ref() {
+                                Type::GenericInstance(name, args) => Self::mangle_generic_instance(name, args),
+                                Type::Struct(name) => name.clone(),
+                                _ => Self::type_to_mangled_name(inner),
+                            };
+                            if let Some(methods) = self.impl_methods.get(&type_name)
+                                && let Some((_, mangled)) = methods.iter().find(|(name, _)| name == "index" || name == "index_mut")
+                                && let Some(ret_ty) = self.fn_return_types.get(mangled)
+                            {
+                                if let Type::Ref { inner: elem_ref_ty, .. } = ret_ty {
+                                    return elem_ref_ty.as_ref().clone();
+                                }
+                                return ret_ty.clone();
+                            }
+                            Type::I32
+                        }
                     },
-                    _ => Type::I32,
+                    _ => {
+                        let type_name = match &resolved_ty {
+                            Type::GenericInstance(name, args) => Self::mangle_generic_instance(name, args),
+                            Type::Struct(name) => name.clone(),
+                            _ => Self::type_to_mangled_name(&resolved_ty),
+                        };
+                        if let Some(methods) = self.impl_methods.get(&type_name)
+                            && let Some((_, mangled)) = methods.iter().find(|(name, _)| name == "index" || name == "index_mut")
+                            && let Some(ret_ty) = self.fn_return_types.get(mangled)
+                        {
+                            if let Type::Ref { inner: elem_ref_ty, .. } = ret_ty {
+                                return elem_ref_ty.as_ref().clone();
+                            }
+                            return ret_ty.clone();
+                        }
+                        Type::I32
+                    }
                 }
             }
             Expr::Array(elems, ..) => {
@@ -6503,8 +6553,20 @@ impl<'ctx> CodeGen<'ctx> {
                     Ok(val)
                 }
                 Expr::Deref(inner, ..) => {
-                    let ptr = self.compile_expr(inner)?;
-                    let ptr = ptr.into_pointer_value();
+                    let inner_ty = self.expr_type(inner);
+                    let ptr = if let Some((_, mangled_deref)) = self.get_custom_deref_target(&inner_ty) {
+                        let ptr = self.compile_expr_to_pointer_val(inner)?;
+                        let fn_val = self.module.get_function(&mangled_deref).ok_or_else(|| {
+                            CodegenError::new(format!("internal: deref function {} not found", mangled_deref))
+                        })?;
+                        let res = self.builder.build_call(fn_val, &[ptr.into()], "deref_call").map_err(|e| {
+                            CodegenError::new(format!("failed to call deref: {}", e))
+                        })?;
+                        self.try_extract_result(res).into_pointer_value()
+                    } else {
+                        let ptr_val = self.compile_expr(inner)?;
+                        ptr_val.into_pointer_value()
+                    };
                     let val = self.compile_expr(value)?;
                     self.builder.build_store(ptr, val).map_err(|e| {
                         CodegenError::new(format!("failed to build store through deref: {}", e))
@@ -6517,11 +6579,13 @@ impl<'ctx> CodeGen<'ctx> {
                     field,
                     ..
                 } => {
-                    let parent_ptr_val = self.compile_expr(member_expr)?;
+                    let (parent_ptr_val, parent_type) = self.compile_member_expr_with_autoderef(member_expr, field.as_ref(), *index)?;
                     let parent_ptr = match parent_ptr_val {
                         BasicValueEnum::PointerValue(p) => p,
                         _ => {
-                            if let Expr::Ident(name, ..) = member_expr.as_ref() {
+                            if let Expr::Ident(name, ..) = member_expr.as_ref()
+                                && self.expr_type(member_expr) == parent_type
+                            {
                                 if let Some((ptr, _, _)) = self.symbols.get(name) {
                                     *ptr
                                 } else {
@@ -6537,7 +6601,6 @@ impl<'ctx> CodeGen<'ctx> {
                             }
                         }
                     };
-                    let parent_type = self.expr_type(member_expr);
 
                     let (struct_ty, struct_name) = match &parent_type {
                         Type::Ref { inner, is_mut } => {
@@ -6634,131 +6697,283 @@ impl<'ctx> CodeGen<'ctx> {
                 }
                 Expr::Index { array, index, .. } => {
                     let array_ty = self.expr_type(array);
-                    // Handle slice/slice-ref indexing write (fat pointer → GEP → store)
-                    let is_slice = matches!(&array_ty, Type::Slice { .. })
-                        || matches!(&array_ty, Type::Ref { inner, .. } if matches!(inner.as_ref(), Type::Slice { .. }));
-                    if is_slice {
-                        let fat_ptr_val = self.compile_expr(array)?;
-                        let ptr_field = match fat_ptr_val {
-                            BasicValueEnum::StructValue(sv) => self
-                                .builder
-                                .build_extract_value(sv, 0, "slice_ptr")
-                                .map_err(|e| {
-                                    CodegenError::new(format!("failed to extract slice ptr: {}", e))
-                                })?,
-                            _ => {
-                                return Err(CodegenError::with_span(
-                                    "expected slice fat pointer",
-                                    expr.span(),
-                                ));
-                            }
-                        };
-                        let ptr = ptr_field.into_pointer_value();
-                        let elem_ty = match &array_ty {
-                            Type::Slice { inner } => inner.as_ref().clone(),
-                            Type::Ref { inner, .. } => match inner.as_ref() {
+                    let resolved_ty = self.resolve_index_type(&array_ty);
+                    if resolved_ty == array_ty {
+                        // Handle slice/slice-ref indexing write (fat pointer → GEP → store)
+                        let is_slice = matches!(&array_ty, Type::Slice { .. })
+                            || matches!(&array_ty, Type::Ref { inner, .. } if matches!(inner.as_ref(), Type::Slice { .. }));
+                        if is_slice {
+                            let fat_ptr_val = self.compile_expr(array)?;
+                            let ptr_field = match fat_ptr_val {
+                                BasicValueEnum::StructValue(sv) => self
+                                    .builder
+                                    .build_extract_value(sv, 0, "slice_ptr")
+                                    .map_err(|e| {
+                                        CodegenError::new(format!("failed to extract slice ptr: {}", e))
+                                    })?,
+                                _ => {
+                                    return Err(CodegenError::with_span(
+                                        "expected slice fat pointer",
+                                        expr.span(),
+                                    ));
+                                }
+                            };
+                            let ptr = ptr_field.into_pointer_value();
+                            let elem_ty = match &array_ty {
                                 Type::Slice { inner } => inner.as_ref().clone(),
+                                Type::Ref { inner, .. } => match inner.as_ref() {
+                                    Type::Slice { inner } => inner.as_ref().clone(),
+                                    _ => unreachable!(),
+                                },
                                 _ => unreachable!(),
+                            };
+                            let elem_llvm = self.type_to_llvm(&elem_ty);
+                            let idx_val = self.compile_expr(index)?;
+                            let idx = idx_val.into_int_value();
+                            let elem_ptr = unsafe {
+                                self.builder
+                                    .build_in_bounds_gep(elem_llvm, ptr, &[idx], "slice_index_mut")
+                                    .map_err(|e| {
+                                        CodegenError::new(format!("failed to GEP into slice: {}", e))
+                                    })?
+                            };
+                            let val = self.compile_expr(value)?;
+                            self.builder.build_store(elem_ptr, val).map_err(|e| {
+                                CodegenError::new(format!("failed to store slice element: {}", e))
+                            })?;
+                            return Ok(val);
+                        }
+                        let fn_name = if let Some((ai_inner, len)) = match &array_ty {
+                            Type::Array { inner, len } => Some((*inner.clone(), *len)),
+                            Type::Ref { inner, .. } => match inner.as_ref() {
+                                Type::Array { inner: ai, len } => Some((*ai.clone(), *len)),
+                                _ => None,
                             },
-                            _ => unreachable!(),
-                        };
-                        let elem_llvm = self.type_to_llvm(&elem_ty);
-                        let idx_val = self.compile_expr(index)?;
-                        let idx = idx_val.into_int_value();
-                        let elem_ptr = unsafe {
-                            self.builder
-                                .build_in_bounds_gep(elem_llvm, ptr, &[idx], "slice_index_mut")
-                                .map_err(|e| {
-                                    CodegenError::new(format!("failed to GEP into slice: {}", e))
+                            _ => None,
+                        } {
+                            self.ensure_slice_methods(&ai_inner, len)?;
+                            let key = Self::array_type_key(&ai_inner, len);
+                            let methods = self.impl_methods.get(&key).ok_or_else(|| {
+                                CodegenError::new(format!("no methods registered for array type '{}'", key))
+                            })?;
+                            methods
+                                .iter()
+                                .find(|(name, _)| name == "index_mut")
+                                .map(|(_, mangled)| mangled.clone())
+                                .ok_or_else(|| {
+                                    CodegenError::new(format!(
+                                        "no 'index_mut' method for array type '{}'",
+                                        key
+                                    ))
+                                })?
+                        } else {
+                            let type_name = match &array_ty {
+                                Type::GenericInstance(name, args) => Self::mangle_generic_instance(name, args),
+                                Type::Ref { inner, .. } => match inner.as_ref() {
+                                    Type::GenericInstance(name, args) => Self::mangle_generic_instance(name, args),
+                                    Type::Struct(name) => name.clone(),
+                                    _ => Self::type_to_mangled_name(inner),
+                                },
+                                Type::Struct(name) => name.clone(),
+                                _ => Self::type_to_mangled_name(&array_ty),
+                            };
+                            let methods = self.impl_methods.get(&type_name).ok_or_else(|| {
+                                CodegenError::with_span(
+                                    format!("cannot index into type {:?}", array_ty),
+                                    expr.span(),
+                                )
+                            })?;
+                            methods
+                                .iter()
+                                .find(|(name, _)| name == "index_mut")
+                                .map(|(_, mangled)| mangled.clone())
+                                .ok_or_else(|| {
+                                    CodegenError::with_span(
+                                        format!("type {:?} does not implement IndexMut", array_ty),
+                                        expr.span(),
+                                    )
                                 })?
                         };
-                        let val = self.compile_expr(value)?;
-                        self.builder.build_store(elem_ptr, val).map_err(|e| {
-                            CodegenError::new(format!("failed to store slice element: {}", e))
+                        let fn_val = self.module.get_function(&fn_name).ok_or_else(|| {
+                            format!("internal: index_mut function '{}' not found", fn_name)
                         })?;
-                        return Ok(val);
-                    }
-                    let (elem_ty, len) = match &array_ty {
-                        Type::Array { inner, len } => (*inner.clone(), *len),
-                        Type::Ref { inner, .. } => match inner.as_ref() {
-                            Type::Array { inner: ai, len } => (*ai.clone(), *len),
-                            _ => {
+                        // Compile array to a pointer — use original alloca if it's a variable
+                        let array_ptr = if let Expr::Ident(name, ..) = array.as_ref() {
+                            if let Some((ptr, _, _)) = self.symbols.get(name) {
+                                *ptr
+                            } else {
                                 return Err(CodegenError::with_span(
-                                    format!("cannot index into non-array type {:?}", array_ty),
+                                    format!("undefined variable '{}'", name),
                                     expr.span(),
                                 ));
                             }
-                        },
-                        _ => {
-                            return Err(CodegenError::with_span(
-                                format!("cannot index into non-array type {:?}", array_ty),
-                                expr.span(),
-                            ));
-                        }
-                    };
-                    self.ensure_slice_methods(&elem_ty, len)?;
-                    let key = Self::array_type_key(&elem_ty, len);
-                    let methods = self.impl_methods.get(&key).ok_or_else(|| {
-                        CodegenError::new(format!("no methods registered for array type '{}'", key))
-                    })?;
-                    let fn_name = methods
-                        .iter()
-                        .find(|(name, _)| name == "index_mut")
-                        .map(|(_, mangled)| mangled.clone())
-                        .ok_or_else(|| {
-                            CodegenError::new(format!(
-                                "no 'index_mut' method for array type '{}'",
-                                key
-                            ))
-                        })?;
-                    let fn_val = self.module.get_function(&fn_name).ok_or_else(|| {
-                        format!("internal: index_mut function '{}' not found", fn_name)
-                    })?;
-                    // Compile array to a pointer — use original alloca if it's a variable
-                    let array_ptr = if let Expr::Ident(name, ..) = array.as_ref() {
-                        if let Some((ptr, _, _)) = self.symbols.get(name) {
-                            *ptr
                         } else {
-                            return Err(CodegenError::with_span(
-                                format!("undefined variable '{}'", name),
-                                expr.span(),
-                            ));
-                        }
+                            let array_val = self.compile_expr(array)?;
+                            match array_val {
+                                BasicValueEnum::PointerValue(p) => p,
+                                _ => {
+                                    let alloca = self
+                                        .builder
+                                        .build_alloca(array_val.get_type(), "array_mut_ref")
+                                        .map_err(|e| {
+                                            format!("failed to build alloca for array mut ref: {}", e)
+                                        })?;
+                                    self.builder.build_store(alloca, array_val).map_err(|e| {
+                                        CodegenError::new(format!("failed to store array: {}", e))
+                                    })?;
+                                    alloca
+                                }
+                            }
+                        };
+                        let idx_val = self.compile_expr(index)?;
+                        let result = self
+                            .builder
+                            .build_call(
+                                fn_val,
+                                &[array_ptr.into(), idx_val.into()],
+                                "index_mut_call",
+                            )
+                            .map_err(|e| {
+                                CodegenError::new(format!("failed to call index_mut: {}", e))
+                            })?;
+                        let result_ptr = self.try_extract_result(result).into_pointer_value();
+                        let val = self.compile_expr(value)?;
+                        self.builder.build_store(result_ptr, val).map_err(|e| {
+                            CodegenError::new(format!("failed to store through index_mut: {}", e))
+                        })?;
+                        Ok(val)
                     } else {
-                        let array_val = self.compile_expr(array)?;
-                        match array_val {
+                        let (val, coerced_ty) = self.compile_index_expr_with_autoderef(array)?;
+                        let is_slice = matches!(&coerced_ty, Type::Slice { .. })
+                            || matches!(&coerced_ty, Type::Ref { inner, .. } if matches!(inner.as_ref(), Type::Slice { .. }));
+                        if is_slice {
+                            let fat_ptr_val = val;
+                            let ptr_field = match fat_ptr_val {
+                                BasicValueEnum::StructValue(sv) => self
+                                    .builder
+                                    .build_extract_value(sv, 0, "slice_ptr")
+                                    .map_err(|e| {
+                                        CodegenError::new(format!("failed to extract slice ptr: {}", e))
+                                    })?,
+                                _ => {
+                                    return Err(CodegenError::with_span(
+                                        "expected slice fat pointer",
+                                        expr.span(),
+                                    ));
+                                }
+                            };
+                            let ptr = ptr_field.into_pointer_value();
+                            let elem_ty = match &coerced_ty {
+                                Type::Slice { inner } => inner.as_ref().clone(),
+                                Type::Ref { inner, .. } => match inner.as_ref() {
+                                    Type::Slice { inner } => inner.as_ref().clone(),
+                                    _ => unreachable!(),
+                                },
+                                _ => unreachable!(),
+                            };
+                            let elem_llvm = self.type_to_llvm(&elem_ty);
+                            let idx_val = self.compile_expr(index)?;
+                            let idx = idx_val.into_int_value();
+                            let elem_ptr = unsafe {
+                                self.builder
+                                    .build_in_bounds_gep(elem_llvm, ptr, &[idx], "slice_index_mut")
+                                    .map_err(|e| {
+                                        CodegenError::new(format!("failed to GEP into slice: {}", e))
+                                    })?
+                            };
+                            let val = self.compile_expr(value)?;
+                            self.builder.build_store(elem_ptr, val).map_err(|e| {
+                                CodegenError::new(format!("failed to store slice element: {}", e))
+                            })?;
+                            return Ok(val);
+                        }
+                        let fn_name = if let Some((ai_inner, len)) = match &coerced_ty {
+                            Type::Array { inner, len } => Some((*inner.clone(), *len)),
+                            Type::Ref { inner, .. } => match inner.as_ref() {
+                                Type::Array { inner: ai, len } => Some((*ai.clone(), *len)),
+                                _ => None,
+                            },
+                            _ => None,
+                        } {
+                            self.ensure_slice_methods(&ai_inner, len)?;
+                            let key = Self::array_type_key(&ai_inner, len);
+                            let methods = self.impl_methods.get(&key).ok_or_else(|| {
+                                CodegenError::new(format!("no methods registered for array type '{}'", key))
+                            })?;
+                            methods
+                                .iter()
+                                .find(|(name, _)| name == "index_mut")
+                                .map(|(_, mangled)| mangled.clone())
+                                .ok_or_else(|| {
+                                    CodegenError::new(format!(
+                                        "no 'index_mut' method for array type '{}'",
+                                        key
+                                    ))
+                                })?
+                        } else {
+                            let type_name = match &coerced_ty {
+                                Type::GenericInstance(name, args) => Self::mangle_generic_instance(name, args),
+                                Type::Ref { inner, .. } => match inner.as_ref() {
+                                    Type::GenericInstance(name, args) => Self::mangle_generic_instance(name, args),
+                                    Type::Struct(name) => name.clone(),
+                                    _ => Self::type_to_mangled_name(inner),
+                                },
+                                Type::Struct(name) => name.clone(),
+                                _ => Self::type_to_mangled_name(&coerced_ty),
+                            };
+                            let methods = self.impl_methods.get(&type_name).ok_or_else(|| {
+                                CodegenError::with_span(
+                                    format!("cannot index into type {:?}", coerced_ty),
+                                    expr.span(),
+                                )
+                            })?;
+                            methods
+                                .iter()
+                                .find(|(name, _)| name == "index_mut")
+                                .map(|(_, mangled)| mangled.clone())
+                                .ok_or_else(|| {
+                                    CodegenError::with_span(
+                                        format!("type {:?} does not implement IndexMut", coerced_ty),
+                                        expr.span(),
+                                    )
+                                })?
+                        };
+                        let fn_val = self.module.get_function(&fn_name).ok_or_else(|| {
+                            CodegenError::new(format!("internal: index_mut function '{}' not found", fn_name))
+                        })?;
+                        let array_ptr = match val {
                             BasicValueEnum::PointerValue(p) => p,
                             _ => {
                                 let alloca = self
                                     .builder
-                                    .build_alloca(array_val.get_type(), "array_mut_ref")
+                                    .build_alloca(val.get_type(), "array_mut_ref")
                                     .map_err(|e| {
                                         format!("failed to build alloca for array mut ref: {}", e)
                                     })?;
-                                self.builder.build_store(alloca, array_val).map_err(|e| {
+                                self.builder.build_store(alloca, val).map_err(|e| {
                                     CodegenError::new(format!("failed to store array: {}", e))
                                 })?;
                                 alloca
                             }
-                        }
-                    };
-                    let idx_val = self.compile_expr(index)?;
-                    let result = self
-                        .builder
-                        .build_call(
-                            fn_val,
-                            &[array_ptr.into(), idx_val.into()],
-                            "index_mut_call",
-                        )
-                        .map_err(|e| {
-                            CodegenError::new(format!("failed to call index_mut: {}", e))
+                        };
+                        let idx_val = self.compile_expr(index)?;
+                        let result = self
+                            .builder
+                            .build_call(
+                                fn_val,
+                                &[array_ptr.into(), idx_val.into()],
+                                "index_mut_call",
+                            )
+                            .map_err(|e| {
+                                CodegenError::new(format!("failed to call index_mut: {}", e))
+                            })?;
+                        let result_ptr = self.try_extract_result(result).into_pointer_value();
+                        let val = self.compile_expr(value)?;
+                        self.builder.build_store(result_ptr, val).map_err(|e| {
+                            CodegenError::new(format!("failed to store through index_mut: {}", e))
                         })?;
-                    let result_ptr = self.try_extract_result(result).into_pointer_value();
-                    let val = self.compile_expr(value)?;
-                    self.builder.build_store(result_ptr, val).map_err(|e| {
-                        CodegenError::new(format!("failed to store through index_mut: {}", e))
-                    })?;
-                    Ok(val)
+                        Ok(val)
+                    }
                 }
                 _ => Err(CodegenError::with_span(
                     "invalid assignment target",
@@ -6777,9 +6992,28 @@ impl<'ctx> CodeGen<'ctx> {
                         ))
                     }
                 } else if let Expr::Deref(inner, ..) = expr.as_ref() {
-                    self.compile_expr(inner)
+                    let inner_ty = self.expr_type(inner);
+                    if let Some((_, mangled_deref)) = self.get_custom_deref_target(&inner_ty) {
+                        let ptr = self.compile_expr_to_pointer_val(inner)?;
+                        let fn_val = self.module.get_function(&mangled_deref).ok_or_else(|| {
+                            CodegenError::new(format!("internal: deref function {} not found", mangled_deref))
+                        })?;
+                        let res = self.builder.build_call(fn_val, &[ptr.into()], "deref_call").map_err(|e| {
+                            CodegenError::new(format!("failed to call deref: {}", e))
+                        })?;
+                        Ok(self.try_extract_result(res))
+                    } else {
+                        self.compile_expr(inner)
+                    }
+                } else if matches!(expr.as_ref(), Expr::Member { .. } | Expr::Index { .. }) {
+                    // For &struct.field or &arr[i], compute a direct pointer (GEP)
+                    // into the parent's memory instead of creating a copy in a
+                    // stack-local alloca. The alloca approach returns a dangling
+                    // pointer when the function returns (e.g. deref() returning &self.val).
+                    let ptr = self.compile_expr_to_pointer_val(expr)?;
+                    Ok(ptr.into())
                 } else {
-                    let ty = Self::literal_type(expr);
+                    let ty = self.expr_type(expr);
                     let llvm_ty = self.type_to_llvm(&ty);
                     let alloca = self
                         .builder
@@ -6796,20 +7030,35 @@ impl<'ctx> CodeGen<'ctx> {
             }
             // Deref — load through a pointer operand
             Expr::Deref(expr, ..) => {
-                let ptr_val = self.compile_expr(expr)?;
-                let ptr = ptr_val.into_pointer_value();
-                // Determine pointee type
                 let pointee_ty = self.expr_type(expr);
-                let pointee_llvm_ty = self.type_to_llvm(match &pointee_ty {
-                    Type::Ref { inner, .. } => inner,
-                    Type::Ptr { inner, .. } => inner,
-                    _ => &pointee_ty,
-                });
-                let val = self
-                    .builder
-                    .build_load(pointee_llvm_ty, ptr, "deref")
-                    .map_err(|e| CodegenError::new(format!("failed to build deref load: {}", e)))?;
-                Ok(val)
+                if let Some((target_ty, mangled_deref)) = self.get_custom_deref_target(&pointee_ty) {
+                    let ptr = self.compile_expr_to_pointer_val(expr)?;
+                    let fn_val = self.module.get_function(&mangled_deref).ok_or_else(|| {
+                        CodegenError::new(format!("internal: deref function {} not found", mangled_deref))
+                    })?;
+                    let res = self.builder.build_call(fn_val, &[ptr.into()], "deref_call").map_err(|e| {
+                        CodegenError::new(format!("failed to call deref: {}", e))
+                    })?;
+                    let target_ref = self.try_extract_result(res).into_pointer_value();
+                    let target_llvm_ty = self.type_to_llvm(&target_ty);
+                    let loaded = self.builder.build_load(target_llvm_ty, target_ref, "deref_val").map_err(|e| {
+                        CodegenError::new(format!("failed to load deref target: {}", e))
+                    })?;
+                    Ok(loaded)
+                } else {
+                    let ptr_val = self.compile_expr(expr)?;
+                    let ptr = ptr_val.into_pointer_value();
+                    let pointee_llvm_ty = self.type_to_llvm(match &pointee_ty {
+                        Type::Ref { inner, .. } => inner,
+                        Type::Ptr { inner, .. } => inner,
+                        _ => &pointee_ty,
+                    });
+                    let val = self
+                        .builder
+                        .build_load(pointee_llvm_ty, ptr, "deref")
+                        .map_err(|e| CodegenError::new(format!("failed to build deref load: {}", e)))?;
+                    Ok(val)
+                }
             }
             // Call — function call: size_of/transmute intrinsics, slice intrinsics,
             // direct lookup, overload resolution, then generic monomorphization
@@ -7354,12 +7603,10 @@ impl<'ctx> CodeGen<'ctx> {
             Expr::Member {
                 expr, index, field, ..
             } => {
-                let mut val = self.compile_expr(expr)?;
+                let (mut val, ty) = self.compile_member_expr_with_autoderef(expr, field.as_ref(), *index)?;
                 // If the result is a pointer, load the struct first
                 if val.is_pointer_value() {
                     let ptr = val.into_pointer_value();
-                    // Determine struct type from the expression type
-                    let ty = self.expr_type(expr);
                     match &ty {
                         Type::Ref { inner, .. } => {
                             let llvm_ty = self.type_to_llvm(inner);
@@ -7388,7 +7635,7 @@ impl<'ctx> CodeGen<'ctx> {
                         let effective_index = if let Some(field_name) = field {
                             // Look up field index from struct type definition
                             // Infer the struct name from the expression type
-                            let parent_ty = self.expr_type(expr);
+                            let parent_ty = ty;
                             let struct_name = match &parent_ty {
                                 Type::Struct(name) => name.clone(),
                                 Type::GenericInstance(name, args) => {
@@ -7561,106 +7808,178 @@ impl<'ctx> CodeGen<'ctx> {
                     }
                 }
 
-                // Determine receiver type
-                let receiver_type = self.expr_type(receiver);
-                let (type_name, _is_ref) = match &receiver_type {
-                    Type::Array { inner, len } => {
-                        self.ensure_slice_methods(inner, *len)?;
-                        (Self::array_type_key(inner, *len), false)
+                // Determine receiver type and resolve method using auto-deref
+                let mut curr_val = self.compile_expr(receiver)?;
+                let mut curr_ty = self.expr_type(receiver);
+                
+                let mut resolved_info = None;
+                loop {
+                    // Check special case: .len() on &str and &[T]
+                    if method == "len" && args.is_empty() {
+                        let is_str = matches!(&curr_ty, Type::Ref { inner, .. } if **inner == Type::Str) || curr_ty == Type::Str;
+                        let is_slice = matches!(&curr_ty, Type::Slice { .. })
+                            || matches!(&curr_ty, Type::Ref { inner, .. } if matches!(inner.as_ref(), Type::Slice { .. }));
+                        if is_str || is_slice {
+                            match curr_val {
+                                BasicValueEnum::StructValue(sv) => {
+                                    let len = self.builder.build_extract_value(sv, 1, "len").map_err(|e| {
+                                        CodegenError::new(format!("failed to extract length: {}", e))
+                                    })?;
+                                    return Ok(len);
+                                }
+                                _ => {
+                                    return Err("cannot call .len() on a non-fat-pointer value".to_string().into());
+                                }
+                            }
+                        }
                     }
-                    Type::Struct(name) => (name.clone(), false),
-                    Type::GenericInstance(name, args) => {
-                        (Self::mangle_generic_instance(name, args), false)
+                    // Check special case: .as_ptr() on &[T]
+                    if method == "as_ptr" && args.is_empty() {
+                        let is_slice_ref = matches!(&curr_ty, Type::Ref { inner, .. } if matches!(inner.as_ref(), Type::Slice { .. }));
+                        let is_slice_val = matches!(&curr_ty, Type::Slice { .. });
+                        if is_slice_ref || is_slice_val {
+                            match curr_val {
+                                BasicValueEnum::StructValue(sv) => {
+                                    let ptr = self.builder.build_extract_value(sv, 0, "as_ptr").map_err(|e| {
+                                        CodegenError::new(format!("failed to extract slice ptr: {}", e))
+                                    })?;
+                                    return Ok(ptr);
+                                }
+                                _ => {
+                                    return Err("cannot call .as_ptr() on a non-fat-pointer value".to_string().into());
+                                }
+                            }
+                        }
                     }
-                    Type::Ref { inner, .. } => match inner.as_ref() {
+
+                    // Check if it has the method
+                    let type_name_and_ref = match &curr_ty {
                         Type::Array { inner, len } => {
                             self.ensure_slice_methods(inner, *len)?;
-                            (Self::array_type_key(inner, *len), true)
+                            Some((Self::array_type_key(inner, *len), false))
                         }
-                        Type::Struct(name) => (name.clone(), true),
+                        Type::Struct(name) => Some((name.clone(), false)),
                         Type::GenericInstance(name, args) => {
-                            (Self::mangle_generic_instance(name, args), true)
+                            Some((Self::mangle_generic_instance(name, args), false))
                         }
-                        Type::Bool => ("bool".to_string(), true),
-                        Type::I8 => ("i8".to_string(), true),
-                        Type::I16 => ("i16".to_string(), true),
-                        Type::I32 => ("i32".to_string(), true),
-                        Type::I64 => ("i64".to_string(), true),
-                        Type::U8 => ("u8".to_string(), true),
-                        Type::U16 => ("u16".to_string(), true),
-                        Type::U32 => ("u32".to_string(), true),
-                        Type::U64 => ("u64".to_string(), true),
-                        Type::Usize => ("usize".to_string(), true),
-                        Type::Isize => ("isize".to_string(), true),
-                        Type::F32 => ("f32".to_string(), true),
-                        Type::F64 => ("f64".to_string(), true),
-                        Type::Str => ("str".to_string(), true),
-                        _ => {
-                            return Err(CodegenError::with_span(
-                                format!(
-                                    "cannot call method '{}' on type {:?}",
-                                    method, receiver_type
-                                ),
-                                expr.span(),
-                            ));
-                        }
-                    },
-                    Type::Bool => ("bool".to_string(), false),
-                    Type::I8 => ("i8".to_string(), false),
-                    Type::I16 => ("i16".to_string(), false),
-                    Type::I32 => ("i32".to_string(), false),
-                    Type::I64 => ("i64".to_string(), false),
-                    Type::U8 => ("u8".to_string(), false),
-                    Type::U16 => ("u16".to_string(), false),
-                    Type::U32 => ("u32".to_string(), false),
-                    Type::U64 => ("u64".to_string(), false),
-                    Type::Usize => ("usize".to_string(), false),
-                    Type::Isize => ("isize".to_string(), false),
-                    Type::F32 => ("f32".to_string(), false),
-                    Type::F64 => ("f64".to_string(), false),
-                    Type::Str => ("str".to_string(), false),
-                    _ => {
-                        return Err(CodegenError::with_span(
-                            format!(
-                                "cannot call method '{}' on type {:?}",
-                                method, receiver_type
-                            ),
-                            expr.span(),
-                        ));
-                    }
-                };
+                        Type::Ref { inner, .. } => match inner.as_ref() {
+                            Type::Array { inner: elem_inner, len } => {
+                                self.ensure_slice_methods(elem_inner, *len)?;
+                                Some((Self::array_type_key(elem_inner, *len), true))
+                            }
+                            Type::Struct(name) => Some((name.clone(), true)),
+                            Type::GenericInstance(name, args) => {
+                                Some((Self::mangle_generic_instance(name, args), true))
+                            }
+                            Type::Bool => Some(("bool".to_string(), true)),
+                            Type::I8 => Some(("i8".to_string(), true)),
+                            Type::I16 => Some(("i16".to_string(), true)),
+                            Type::I32 => Some(("i32".to_string(), true)),
+                            Type::I64 => Some(("i64".to_string(), true)),
+                            Type::U8 => Some(("u8".to_string(), true)),
+                            Type::U16 => Some(("u16".to_string(), true)),
+                            Type::U32 => Some(("u32".to_string(), true)),
+                            Type::U64 => Some(("u64".to_string(), true)),
+                            Type::Usize => Some(("usize".to_string(), true)),
+                            Type::Isize => Some(("isize".to_string(), true)),
+                            Type::F32 => Some(("f32".to_string(), true)),
+                            Type::F64 => Some(("f64".to_string(), true)),
+                            Type::Str => Some(("str".to_string(), true)),
+                            _ => None,
+                        },
+                        Type::Bool => Some(("bool".to_string(), false)),
+                        Type::I8 => Some(("i8".to_string(), false)),
+                        Type::I16 => Some(("i16".to_string(), false)),
+                        Type::I32 => Some(("i32".to_string(), false)),
+                        Type::I64 => Some(("i64".to_string(), false)),
+                        Type::U8 => Some(("u8".to_string(), false)),
+                        Type::U16 => Some(("u16".to_string(), false)),
+                        Type::U32 => Some(("u32".to_string(), false)),
+                        Type::U64 => Some(("u64".to_string(), false)),
+                        Type::Usize => Some(("usize".to_string(), false)),
+                        Type::Isize => Some(("isize".to_string(), false)),
+                        Type::F32 => Some(("f32".to_string(), false)),
+                        Type::F64 => Some(("f64".to_string(), false)),
+                        Type::Str => Some(("str".to_string(), false)),
+                        _ => None,
+                    };
 
-                // Look up method
-                let gen_method_opt =
-                    if let Some(generic_methods) = self.generic_methods.get(&type_name) {
-                        generic_methods.iter().find(|m| m.name == *method).cloned()
+                    if let Some((type_name, is_ref)) = type_name_and_ref {
+                        let gen_method_opt = if let Some(generic_methods) = self.generic_methods.get(&type_name) {
+                            generic_methods.iter().find(|m| m.name == *method).cloned()
+                        } else {
+                            None
+                        };
+                        let mangled_opt = if let Some(gen_method) = gen_method_opt {
+                            let mut all_exprs = vec![receiver.as_ref().clone()];
+                            all_exprs.extend(args.clone());
+                            let explicit_type_args = if type_args.is_empty() {
+                                None
+                            } else {
+                                Some(type_args.as_slice())
+                            };
+                            Some(self.monomorphize_generic_method(
+                                &type_name,
+                                &gen_method,
+                                &all_exprs,
+                                explicit_type_args,
+                            )?)
+                        } else if let Some(methods) = self.impl_methods.get(&type_name)
+                            && let Some((_, mangled_name)) = methods.iter().find(|(name, _)| name == method)
+                        {
+                            Some(mangled_name.clone())
+                        } else {
+                            None
+                        };
+
+                        if let Some(mangled) = mangled_opt {
+                            resolved_info = Some((curr_ty, curr_val, type_name, is_ref, mangled));
+                            break;
+                        }
+                    }
+
+                    // Try auto-deref
+                    if let Some((next_ty, mangled_deref)) = self.get_custom_deref_target(&curr_ty) {
+                        let ptr = if let BasicValueEnum::PointerValue(p) = curr_val {
+                            p
+                        } else {
+                            let alloca = self.builder.build_alloca(curr_val.get_type(), "deref_self").map_err(|e| {
+                                format!("failed to build alloca for deref: {}", e)
+                            })?;
+                            self.builder.build_store(alloca, curr_val).map_err(|e| {
+                                format!("failed to store for deref: {}", e)
+                            })?;
+                            alloca
+                        };
+                        let fn_val = self.module.get_function(&mangled_deref).ok_or_else(|| {
+                            CodegenError::new(format!("internal: deref function {} not found", mangled_deref))
+                        })?;
+                        let res = self.builder.build_call(fn_val, &[ptr.into()], "deref_call").map_err(|e| {
+                            CodegenError::new(format!("failed to call deref: {}", e))
+                        })?;
+                        curr_val = self.try_extract_result(res);
+                        curr_ty = Type::Ref {
+                            inner: Box::new(next_ty),
+                            is_mut: false,
+                        };
+                    } else if let Type::Ref { inner, .. } | Type::Ptr { inner, .. } = &curr_ty {
+                        let pointee_llvm_ty = self.type_to_llvm(inner.as_ref());
+                        let ptr = curr_val.into_pointer_value();
+                        curr_val = self.builder.build_load(pointee_llvm_ty, ptr, "deref_load").map_err(|e| {
+                            format!("failed to build load for deref: {}", e)
+                        })?;
+                        curr_ty = inner.as_ref().clone();
                     } else {
-                        None
-                    };
-                let mangled = if let Some(gen_method) = gen_method_opt {
-                    let mut all_exprs = vec![receiver.as_ref().clone()];
-                    all_exprs.extend(args.clone());
-                    let explicit_type_args = if type_args.is_empty() {
-                        None
-                    } else {
-                        Some(type_args.as_slice())
-                    };
-                    self.monomorphize_generic_method(
-                        &type_name,
-                        &gen_method,
-                        &all_exprs,
-                        explicit_type_args,
-                    )?
-                } else if let Some(methods) = self.impl_methods.get(&type_name)
-                    && let Some((_, mangled_name)) = methods.iter().find(|(name, _)| name == method)
-                {
-                    mangled_name.clone()
-                } else {
-                    return Err(CodegenError::with_span(
-                        format!("type '{}' has no method '{}'", type_name, method),
+                        break;
+                    }
+                }
+
+                let (receiver_type, receiver_val, _type_name, _is_ref, mangled) = resolved_info.ok_or_else(|| {
+                    CodegenError::with_span(
+                        format!("cannot call method '{}' on type {:?}", method, self.expr_type(receiver)),
                         expr.span(),
-                    ));
-                };
+                    )
+                })?;
 
                 self.check_visibility_of_path(&self.current_module_path, &mangled)?;
 
@@ -7671,8 +7990,6 @@ impl<'ctx> CodeGen<'ctx> {
                     ))
                 })?;
 
-                // Compile receiver as first arg (pass pointer for &self, or value for fat pointers)
-                let receiver_val = self.compile_expr(receiver)?;
                 let is_fat_ptr_receiver = self.fn_param_types.get(&mangled).is_some_and(|param_tys| {
                     param_tys.first().is_some_and(|ty| matches!(ty, Type::Ref { inner, .. } if matches!(inner.as_ref(), Type::Str | Type::Slice { .. })))
                 });
@@ -7694,7 +8011,9 @@ impl<'ctx> CodeGen<'ctx> {
                     match receiver_val {
                         BasicValueEnum::PointerValue(p) => p,
                         _ => {
-                            if let Expr::Ident(name, ..) = receiver.as_ref() {
+                            if let Expr::Ident(name, ..) = receiver.as_ref()
+                                && self.expr_type(receiver) == receiver_type
+                            {
                                 if let Some((ptr, _, _)) = self.symbols.get(name) {
                                     *ptr
                                 } else {
@@ -8021,128 +8340,294 @@ impl<'ctx> CodeGen<'ctx> {
             // Index — array/slice element access: GEP for slices, index() method for arrays
             Expr::Index { array, index, .. } => {
                 let array_ty = self.expr_type(array);
-                // Handle slice/slice-ref indexing (fat pointer -> GEP -> load)
-                let is_slice = matches!(&array_ty, Type::Slice { .. })
-                    || matches!(&array_ty, Type::Ref { inner, .. } if matches!(inner.as_ref(), Type::Slice { .. }));
-                if is_slice {
-                    let fat_ptr_val = self.compile_expr(array)?;
-                    let ptr_field = match fat_ptr_val {
-                        BasicValueEnum::StructValue(sv) => self
+                let resolved_ty = self.resolve_index_type(&array_ty);
+                if resolved_ty == array_ty {
+                    // Handle slice/slice-ref indexing (fat pointer -> GEP -> load)
+                    let is_slice = matches!(&array_ty, Type::Slice { .. })
+                        || matches!(&array_ty, Type::Ref { inner, .. } if matches!(inner.as_ref(), Type::Slice { .. }));
+                    if is_slice {
+                        let fat_ptr_val = self.compile_expr(array)?;
+                        let ptr_field = match fat_ptr_val {
+                            BasicValueEnum::StructValue(sv) => self
+                                .builder
+                                .build_extract_value(sv, 0, "slice_ptr")
+                                .map_err(|e| {
+                                    CodegenError::new(format!("failed to extract slice ptr: {}", e))
+                                })?,
+                            _ => {
+                                return Err(CodegenError::with_span(
+                                    "expected slice fat pointer",
+                                    expr.span(),
+                                ));
+                            }
+                        };
+                        let ptr = ptr_field.into_pointer_value();
+                        let elem_ty = match &array_ty {
+                            Type::Slice { inner } => inner.as_ref().clone(),
+                            Type::Ref { inner, .. } => match inner.as_ref() {
+                                Type::Slice { inner } => inner.as_ref().clone(),
+                                _ => unreachable!(),
+                            },
+                            _ => unreachable!(),
+                        };
+                        let elem_llvm = self.type_to_llvm(&elem_ty);
+                        let idx_val = self.compile_expr(index)?;
+                        let idx = idx_val.into_int_value();
+                        let elem_ptr = unsafe {
+                            self.builder
+                                .build_in_bounds_gep(elem_llvm, ptr, &[idx], "slice_index")
+                                .map_err(|e| {
+                                    CodegenError::new(format!("failed to GEP into slice: {}", e))
+                                })?
+                        };
+                        let loaded = self
                             .builder
-                            .build_extract_value(sv, 0, "slice_ptr")
+                            .build_load(elem_llvm, elem_ptr, "slice_load")
                             .map_err(|e| {
-                                CodegenError::new(format!("failed to extract slice ptr: {}", e))
-                            })?,
-                        _ => {
+                                CodegenError::new(format!("failed to load slice element: {}", e))
+                            })?;
+                        return Ok(loaded);
+                    }
+                    let (elem_ty, fn_name) = if let Some((ai_inner, len)) = match &array_ty {
+                        Type::Array { inner, len } => Some((*inner.clone(), *len)),
+                        Type::Ref { inner, .. } => match inner.as_ref() {
+                            Type::Array { inner: ai, len } => Some((*ai.clone(), *len)),
+                            _ => None,
+                        },
+                        _ => None,
+                    } {
+                        self.ensure_slice_methods(&ai_inner, len)?;
+                        let key = Self::array_type_key(&ai_inner, len);
+                        let methods = self.impl_methods.get(&key).ok_or_else(|| {
+                            CodegenError::new(format!("no methods registered for array type '{}'", key))
+                        })?;
+                        let fn_name = methods
+                            .iter()
+                            .find(|(name, _)| name == "index")
+                            .map(|(_, mangled)| mangled.clone())
+                            .ok_or_else(|| {
+                                CodegenError::new(format!("no 'index' method for array type '{}'", key))
+                            })?;
+                        (ai_inner, fn_name)
+                    } else {
+                        let type_name = match &array_ty {
+                            Type::GenericInstance(name, args) => Self::mangle_generic_instance(name, args),
+                            Type::Ref { inner, .. } => match inner.as_ref() {
+                                Type::GenericInstance(name, args) => Self::mangle_generic_instance(name, args),
+                                Type::Struct(name) => name.clone(),
+                                _ => Self::type_to_mangled_name(inner),
+                            },
+                            Type::Struct(name) => name.clone(),
+                            _ => Self::type_to_mangled_name(&array_ty),
+                        };
+                        let methods = self.impl_methods.get(&type_name).ok_or_else(|| {
+                            CodegenError::with_span(
+                                format!("cannot index into type {:?}", array_ty),
+                                expr.span(),
+                            )
+                        })?;
+                        let fn_name = methods
+                            .iter()
+                            .find(|(name, _)| name == "index")
+                            .map(|(_, mangled)| mangled.clone())
+                            .ok_or_else(|| {
+                                CodegenError::with_span(
+                                    format!("type {:?} does not implement Index", array_ty),
+                                    expr.span(),
+                                )
+                            })?;
+                        let ret_ty = self.fn_return_types.get(&fn_name).ok_or_else(|| {
+                            CodegenError::new(format!("internal: return type of index method '{}' not found", fn_name))
+                        })?;
+                        let elem_ty = match ret_ty {
+                            Type::Ref { inner, .. } => inner.as_ref().clone(),
+                            _ => ret_ty.clone(),
+                        };
+                        (elem_ty, fn_name)
+                    };
+                    let fn_val = self.module.get_function(&fn_name).ok_or_else(|| {
+                        CodegenError::new(format!("internal: index function '{}' not found", fn_name))
+                    })?;
+                    // Compile array to a pointer — use original alloca if it's a variable
+                    let array_ptr = if let Expr::Ident(name, ..) = array.as_ref() {
+                        if let Some((ptr, _, _)) = self.symbols.get(name) {
+                            *ptr
+                        } else {
                             return Err(CodegenError::with_span(
-                                "expected slice fat pointer",
+                                format!("undefined variable '{}'", name),
                                 expr.span(),
                             ));
                         }
+                    } else {
+                        let array_val = self.compile_expr(array)?;
+                        match array_val {
+                            BasicValueEnum::PointerValue(p) => p,
+                            _ => {
+                                let alloca = self
+                                    .builder
+                                    .build_alloca(array_val.get_type(), "array_ref")
+                                    .map_err(|e| {
+                                        format!("failed to build alloca for array ref: {}", e)
+                                    })?;
+                                self.builder.build_store(alloca, array_val).map_err(|e| {
+                                    CodegenError::new(format!("failed to store array: {}", e))
+                                })?;
+                                alloca
+                            }
+                        }
                     };
-                    let ptr = ptr_field.into_pointer_value();
-                    let elem_ty = match &array_ty {
-                        Type::Slice { inner } => inner.as_ref().clone(),
-                        Type::Ref { inner, .. } => match inner.as_ref() {
-                            Type::Slice { inner } => inner.as_ref().clone(),
-                            _ => unreachable!(),
-                        },
-                        _ => unreachable!(),
-                    };
-                    let elem_llvm = self.type_to_llvm(&elem_ty);
                     let idx_val = self.compile_expr(index)?;
-                    let idx = idx_val.into_int_value();
-                    let elem_ptr = unsafe {
-                        self.builder
-                            .build_in_bounds_gep(elem_llvm, ptr, &[idx], "slice_index")
-                            .map_err(|e| {
-                                CodegenError::new(format!("failed to GEP into slice: {}", e))
-                            })?
-                    };
+                    let result = self
+                        .builder
+                        .build_call(fn_val, &[array_ptr.into(), idx_val.into()], "index_call")
+                        .map_err(|e| CodegenError::new(format!("failed to call index: {}", e)))?;
+                    // The result is a pointer to the element; dereference it
+                    let result_ptr = self.try_extract_result(result).into_pointer_value();
+                    let elem_llvm = self.type_to_llvm(&elem_ty);
                     let loaded = self
                         .builder
-                        .build_load(elem_llvm, elem_ptr, "slice_load")
+                        .build_load(elem_llvm, result_ptr, "index_load")
                         .map_err(|e| {
-                            CodegenError::new(format!("failed to load slice element: {}", e))
+                            CodegenError::new(format!("failed to load index result: {}", e))
                         })?;
-                    return Ok(loaded);
-                }
-                let (elem_ty, len) = match &array_ty {
-                    Type::Array { inner, len } => (*inner.clone(), *len),
-                    Type::Ref { inner, .. } => match inner.as_ref() {
-                        Type::Array { inner: ai, len } => (*ai.clone(), *len),
-                        _ => {
-                            return Err(CodegenError::with_span(
-                                format!("cannot index into non-array type {:?}", array_ty),
-                                expr.span(),
-                            ));
-                        }
-                    },
-                    _ => {
-                        return Err(CodegenError::with_span(
-                            format!("cannot index into non-array type {:?}", array_ty),
-                            expr.span(),
-                        ));
-                    }
-                };
-                self.ensure_slice_methods(&elem_ty, len)?;
-                let key = Self::array_type_key(&elem_ty, len);
-                let methods = self.impl_methods.get(&key).ok_or_else(|| {
-                    CodegenError::new(format!("no methods registered for array type '{}'", key))
-                })?;
-                let fn_name = methods
-                    .iter()
-                    .find(|(name, _)| name == "index")
-                    .map(|(_, mangled)| mangled.clone())
-                    .ok_or_else(|| {
-                        CodegenError::new(format!("no 'index' method for array type '{}'", key))
-                    })?;
-                let fn_val = self.module.get_function(&fn_name).ok_or_else(|| {
-                    CodegenError::new(format!("internal: index function '{}' not found", fn_name))
-                })?;
-                // Compile array to a pointer — use original alloca if it's a variable
-                let array_ptr = if let Expr::Ident(name, ..) = array.as_ref() {
-                    if let Some((ptr, _, _)) = self.symbols.get(name) {
-                        *ptr
-                    } else {
-                        return Err(CodegenError::with_span(
-                            format!("undefined variable '{}'", name),
-                            expr.span(),
-                        ));
-                    }
+                    Ok(loaded)
                 } else {
-                    let array_val = self.compile_expr(array)?;
-                    match array_val {
+                    let (val, coerced_ty) = self.compile_index_expr_with_autoderef(array)?;
+                    let is_slice = matches!(&coerced_ty, Type::Slice { .. })
+                        || matches!(&coerced_ty, Type::Ref { inner, .. } if matches!(inner.as_ref(), Type::Slice { .. }));
+                    if is_slice {
+                        let fat_ptr_val = val;
+                        let ptr_field = match fat_ptr_val {
+                            BasicValueEnum::StructValue(sv) => self
+                                .builder
+                                .build_extract_value(sv, 0, "slice_ptr")
+                                .map_err(|e| {
+                                    CodegenError::new(format!("failed to extract slice ptr: {}", e))
+                                })?,
+                            _ => {
+                                return Err(CodegenError::with_span(
+                                    "expected slice fat pointer",
+                                    expr.span(),
+                                ));
+                            }
+                        };
+                        let ptr = ptr_field.into_pointer_value();
+                        let elem_ty = match &coerced_ty {
+                            Type::Slice { inner } => inner.as_ref().clone(),
+                            Type::Ref { inner, .. } => match inner.as_ref() {
+                                Type::Slice { inner } => inner.as_ref().clone(),
+                                _ => unreachable!(),
+                            },
+                            _ => unreachable!(),
+                        };
+                        let elem_llvm = self.type_to_llvm(&elem_ty);
+                        let idx_val = self.compile_expr(index)?;
+                        let idx = idx_val.into_int_value();
+                        let elem_ptr = unsafe {
+                            self.builder
+                                .build_in_bounds_gep(elem_llvm, ptr, &[idx], "slice_index")
+                                .map_err(|e| {
+                                    CodegenError::new(format!("failed to GEP into slice: {}", e))
+                                })?
+                        };
+                        let loaded = self
+                            .builder
+                            .build_load(elem_llvm, elem_ptr, "slice_load")
+                            .map_err(|e| {
+                                CodegenError::new(format!("failed to load slice element: {}", e))
+                            })?;
+                        return Ok(loaded);
+                    }
+                    let (elem_ty, fn_name) = if let Some((ai_inner, len)) = match &coerced_ty {
+                        Type::Array { inner, len } => Some((*inner.clone(), *len)),
+                        Type::Ref { inner, .. } => match inner.as_ref() {
+                            Type::Array { inner: ai, len } => Some((*ai.clone(), *len)),
+                            _ => None,
+                        },
+                        _ => None,
+                    } {
+                        self.ensure_slice_methods(&ai_inner, len)?;
+                        let key = Self::array_type_key(&ai_inner, len);
+                        let methods = self.impl_methods.get(&key).ok_or_else(|| {
+                            CodegenError::new(format!("no methods registered for array type '{}'", key))
+                        })?;
+                        let fn_name = methods
+                            .iter()
+                            .find(|(name, _)| name == "index")
+                            .map(|(_, mangled)| mangled.clone())
+                            .ok_or_else(|| {
+                                CodegenError::new(format!("no 'index' method for array type '{}'", key))
+                            })?;
+                        (ai_inner, fn_name)
+                    } else {
+                        let type_name = match &coerced_ty {
+                            Type::GenericInstance(name, args) => Self::mangle_generic_instance(name, args),
+                            Type::Ref { inner, .. } => match inner.as_ref() {
+                                Type::GenericInstance(name, args) => Self::mangle_generic_instance(name, args),
+                                Type::Struct(name) => name.clone(),
+                                _ => Self::type_to_mangled_name(inner),
+                            },
+                            Type::Struct(name) => name.clone(),
+                            _ => Self::type_to_mangled_name(&coerced_ty),
+                        };
+                        let methods = self.impl_methods.get(&type_name).ok_or_else(|| {
+                            CodegenError::with_span(
+                                format!("cannot index into type {:?}", coerced_ty),
+                                expr.span(),
+                            )
+                        })?;
+                        let fn_name = methods
+                            .iter()
+                            .find(|(name, _)| name == "index")
+                            .map(|(_, mangled)| mangled.clone())
+                            .ok_or_else(|| {
+                                CodegenError::with_span(
+                                    format!("type {:?} does not implement Index", coerced_ty),
+                                    expr.span(),
+                                )
+                            })?;
+                        let ret_ty = self.fn_return_types.get(&fn_name).ok_or_else(|| {
+                            CodegenError::new(format!("internal: return type of index method '{}' not found", fn_name))
+                        })?;
+                        let elem_ty = match ret_ty {
+                            Type::Ref { inner, .. } => inner.as_ref().clone(),
+                            _ => ret_ty.clone(),
+                        };
+                        (elem_ty, fn_name)
+                    };
+                    let fn_val = self.module.get_function(&fn_name).ok_or_else(|| {
+                        CodegenError::new(format!("internal: index function '{}' not found", fn_name))
+                    })?;
+                    let array_ptr = match val {
                         BasicValueEnum::PointerValue(p) => p,
                         _ => {
                             let alloca = self
                                 .builder
-                                .build_alloca(array_val.get_type(), "array_ref")
+                                .build_alloca(val.get_type(), "array_ref")
                                 .map_err(|e| {
                                     format!("failed to build alloca for array ref: {}", e)
                                 })?;
-                            self.builder.build_store(alloca, array_val).map_err(|e| {
+                            self.builder.build_store(alloca, val).map_err(|e| {
                                 CodegenError::new(format!("failed to store array: {}", e))
                             })?;
                             alloca
                         }
-                    }
-                };
-                let idx_val = self.compile_expr(index)?;
-                let result = self
-                    .builder
-                    .build_call(fn_val, &[array_ptr.into(), idx_val.into()], "index_call")
-                    .map_err(|e| CodegenError::new(format!("failed to call index: {}", e)))?;
-                // The result is a pointer to the element; dereference it
-                let result_ptr = self.try_extract_result(result).into_pointer_value();
-                let elem_llvm = self.type_to_llvm(&elem_ty);
-                let loaded = self
-                    .builder
-                    .build_load(elem_llvm, result_ptr, "index_load")
-                    .map_err(|e| {
-                        CodegenError::new(format!("failed to load index result: {}", e))
-                    })?;
-                Ok(loaded)
+                    };
+                    let idx_val = self.compile_expr(index)?;
+                    let result = self
+                        .builder
+                        .build_call(fn_val, &[array_ptr.into(), idx_val.into()], "index_call")
+                        .map_err(|e| CodegenError::new(format!("failed to call index: {}", e)))?;
+                    let result_ptr = self.try_extract_result(result).into_pointer_value();
+                    let elem_llvm = self.type_to_llvm(&elem_ty);
+                    let loaded = self
+                        .builder
+                        .build_load(elem_llvm, result_ptr, "index_load")
+                        .map_err(|e| {
+                            CodegenError::new(format!("failed to load index result: {}", e))
+                        })?;
+                    Ok(loaded)
+                }
             }
             // Cast — type conversion via emit_cast (int-to-float, float-to-int, etc.)
             Expr::Cast { expr, to_type, .. } => {
@@ -9318,7 +9803,7 @@ impl<'ctx> CodeGen<'ctx> {
                 if param_types
                     .iter()
                     .zip(arg_types.iter())
-                    .all(|(p, a)| p == a)
+                    .all(|(p, a)| self.is_type_coercible(a, p))
                 {
                     return self.module.get_function(mangled);
                 }
@@ -9807,6 +10292,624 @@ impl<'ctx> CodeGen<'ctx> {
         }
     }
 
+    fn get_custom_deref_target(&self, ty: &Type) -> Option<(Type, String)> {
+        let type_name = match ty {
+            Type::GenericInstance(name, args) => Self::mangle_generic_instance(name, args),
+            Type::Struct(name) => name.clone(),
+            _ => return None,
+        };
+        let methods = self.impl_methods.get(&type_name)?;
+        let (_, mangled_deref) = methods.iter().find(|(name, _)| name == "deref")?;
+        let ret_ty = self.fn_return_types.get(mangled_deref)?;
+        if let Type::Ref { inner, .. } = ret_ty {
+            Some((inner.as_ref().clone(), mangled_deref.clone()))
+        } else {
+            None
+        }
+    }
+
+    fn is_type_coercible(&self, from: &Type, to: &Type) -> bool {
+        if from == to {
+            return true;
+        }
+        let mut curr_from = from.clone();
+        loop {
+            if &curr_from == to {
+                return true;
+            }
+            if let Type::Ref { inner, .. } = &curr_from {
+                let inner_is_ref = matches!(inner.as_ref(), Type::Ref { .. });
+                if inner.as_ref() == to || inner_is_ref {
+                    curr_from = inner.as_ref().clone();
+                    continue;
+                }
+            }
+            if let Type::Ref { inner: arg_inner, .. } = &curr_from
+                && let Type::Ref { inner: param_inner, .. } = to
+                    && let Some((target, _)) = self.get_custom_deref_target(arg_inner)
+                        && &target == param_inner.as_ref() {
+                            curr_from = Type::Ref {
+                                inner: Box::new(target),
+                                is_mut: false,
+                            };
+                            continue;
+                        }
+            break;
+        }
+        if &curr_from == to {
+            return true;
+        }
+        let from_is_array = matches!(&curr_from, Type::Array { .. })
+            || matches!(&curr_from, Type::Ref { inner, .. } if matches!(inner.as_ref(), Type::Array { .. }));
+        let to_is_slice = matches!(to, Type::Slice { .. })
+            || matches!(to, Type::Ref { inner, .. } if matches!(inner.as_ref(), Type::Slice { .. }));
+        if from_is_array && to_is_slice {
+            let from_elem = match &curr_from {
+                Type::Array { inner, .. } => inner,
+                Type::Ref { inner, .. } => match inner.as_ref() {
+                    Type::Array { inner: elem, .. } => elem,
+                    _ => unreachable!(),
+                },
+                _ => unreachable!(),
+            };
+            let to_elem = match to {
+                Type::Slice { inner } => inner,
+                Type::Ref { inner, .. } => match inner.as_ref() {
+                    Type::Slice { inner: elem } => elem,
+                    _ => unreachable!(),
+                },
+                _ => unreachable!(),
+            };
+            if from_elem == to_elem {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn resolve_member_type(&self, ty: &Type, field: Option<&String>, index: usize) -> Type {
+        let mut ty = ty.clone();
+        loop {
+            let has_field = match &ty {
+                Type::Tuple(elems) => index < elems.len(),
+                Type::Str => index == 0 || index == 1,
+                Type::Struct(name) | Type::GenericInstance(name, _) => {
+                    if let Some(field_name) = field {
+                        if let Some(fields) = self.struct_fields.get(name) {
+                            fields.iter().any(|f| f.name == *field_name)
+                        } else {
+                            false
+                        }
+                    } else {
+                        if let Some(fields) = self.struct_fields.get(name) {
+                            index < fields.len()
+                        } else {
+                            false
+                        }
+                    }
+                }
+                Type::Ref { inner, .. } => match inner.as_ref() {
+                    Type::Tuple(elems) => index < elems.len(),
+                    Type::Str => index == 0 || index == 1,
+                    Type::Struct(name) | Type::GenericInstance(name, _) => {
+                        if let Some(field_name) = field {
+                            if let Some(fields) = self.struct_fields.get(name) {
+                                fields.iter().any(|f| f.name == *field_name)
+                            } else {
+                                false
+                            }
+                        } else {
+                            if let Some(fields) = self.struct_fields.get(name) {
+                                index < fields.len()
+                            } else {
+                                false
+                            }
+                        }
+                    }
+                    _ => false,
+                }
+                _ => false,
+            };
+            if has_field {
+                break;
+            }
+            if let Some((next_ty, _)) = self.get_custom_deref_target(&ty) {
+                ty = Type::Ref {
+                    inner: Box::new(next_ty),
+                    is_mut: false,
+                };
+            } else if let Type::Ref { inner, .. } | Type::Ptr { inner, .. } = &ty {
+                ty = inner.as_ref().clone();
+            } else {
+                break;
+            }
+        }
+        ty
+    }
+
+    fn compile_expr_to_pointer_val(&mut self, expr: &Expr) -> Result<PointerValue<'ctx>, CodegenError> {
+        match expr {
+            Expr::Ident(name, ..) => {
+                if self.moved_vars.contains(name) {
+                    return Err(CodegenError::with_span(
+                        format!("cannot use moved variable '{}'", name),
+                        expr.span(),
+                    ));
+                }
+                if let Some((ptr, _, ty)) = self.symbols.get(name) {
+                    let is_fat_ref = if let Type::Ref { inner, .. } = ty {
+                        matches!(inner.as_ref(), Type::Str | Type::Slice { .. })
+                    } else {
+                        false
+                    };
+                    if (matches!(ty, Type::Ref { .. }) && !is_fat_ref) || matches!(ty, Type::Ptr { .. }) {
+                        let val = self.compile_expr(expr)?;
+                        Ok(val.into_pointer_value())
+                    } else {
+                        Ok(*ptr)
+                    }
+                } else {
+                    Err(CodegenError::with_span(
+                        format!("undefined variable '{}'", name),
+                        expr.span(),
+                    ))
+                }
+            }
+            Expr::Deref(inner, ..) => {
+                let val = self.compile_expr(inner)?;
+                Ok(val.into_pointer_value())
+            }
+            Expr::Member { expr: member_expr, index, field, .. } => {
+                let (parent_ptr_val, parent_type) = self.compile_member_expr_with_autoderef(member_expr, field.as_ref(), *index)?;
+                let parent_ptr = match parent_ptr_val {
+                    BasicValueEnum::PointerValue(p) => p,
+                    _ => {
+                        if let Expr::Ident(name, ..) = member_expr.as_ref()
+                            && self.expr_type(member_expr) == parent_type
+                        {
+                            if let Some((ptr, _, _)) = self.symbols.get(name) {
+                                *ptr
+                            } else {
+                                return Err(CodegenError::with_span(
+                                    format!("undefined variable '{}'", name),
+                                    expr.span(),
+                                ));
+                            }
+                        } else {
+                            return Err(CodegenError::with_span("expected pointer for member", expr.span()));
+                        }
+                    }
+                };
+                let struct_name = match &parent_type {
+                    Type::Ref { inner, .. } => match inner.as_ref() {
+                        Type::Struct(name) => name.clone(),
+                        Type::GenericInstance(name, args) => Self::mangle_generic_instance(name, args),
+                        _ => return Err(CodegenError::with_span("cannot access field of non-struct", expr.span())),
+                    }
+                    Type::Struct(name) => name.clone(),
+                    Type::GenericInstance(name, args) => Self::mangle_generic_instance(name, args),
+                    _ => return Err(CodegenError::with_span("cannot access field of non-struct", expr.span())),
+                };
+                let struct_ty = self.struct_types.get(&struct_name).copied().ok_or_else(|| {
+                    CodegenError::new(format!("unknown struct '{}'", struct_name))
+                })?;
+                let field_ptr = self.builder.build_struct_gep(struct_ty, parent_ptr, *index as u32, "field_ptr").map_err(|e| {
+                    CodegenError::new(format!("failed to GEP field: {}", e))
+                })?;
+                Ok(field_ptr)
+            }
+            Expr::Index { array, index, .. } => {
+                let array_ty = self.expr_type(array);
+                let resolved_ty = self.resolve_index_type(&array_ty);
+                if resolved_ty == array_ty {
+                    let is_slice = matches!(&array_ty, Type::Slice { .. })
+                        || matches!(&array_ty, Type::Ref { inner, .. } if matches!(inner.as_ref(), Type::Slice { .. }));
+                    if is_slice {
+                        let fat_ptr_val = self.compile_expr(array)?;
+                        let ptr_field = match fat_ptr_val {
+                            BasicValueEnum::StructValue(sv) => self.builder.build_extract_value(sv, 0, "slice_ptr").map_err(|e| {
+                                CodegenError::new(format!("failed to extract slice ptr: {}", e))
+                            })?,
+                            _ => return Err(CodegenError::with_span("expected slice fat pointer", expr.span())),
+                        };
+                        let ptr = ptr_field.into_pointer_value();
+                        let elem_ty = match &array_ty {
+                            Type::Slice { inner } => inner.as_ref().clone(),
+                            Type::Ref { inner, .. } => match inner.as_ref() {
+                                Type::Slice { inner } => inner.as_ref().clone(),
+                                _ => unreachable!(),
+                            },
+                            _ => unreachable!(),
+                        };
+                        let elem_llvm = self.type_to_llvm(&elem_ty);
+                        let idx_val = self.compile_expr(index)?;
+                        let idx = idx_val.into_int_value();
+                        let elem_ptr = unsafe {
+                            self.builder.build_in_bounds_gep(elem_llvm, ptr, &[idx], "slice_index").map_err(|e| {
+                                CodegenError::new(format!("failed to GEP into slice: {}", e))
+                            })?
+                        };
+                        Ok(elem_ptr)
+                    } else {
+                        let (_elem_ty, fn_name) = if let Some((ai_inner, len)) = match &array_ty {
+                            Type::Array { inner, len } => Some((*inner.clone(), *len)),
+                            Type::Ref { inner, .. } => match inner.as_ref() {
+                                Type::Array { inner: ai, len } => Some((*ai.clone(), *len)),
+                                _ => None,
+                            },
+                            _ => None,
+                        } {
+                            self.ensure_slice_methods(&ai_inner, len)?;
+                            let key = Self::array_type_key(&ai_inner, len);
+                            let methods = self.impl_methods.get(&key).ok_or_else(|| {
+                                CodegenError::new(format!("no methods registered for array type '{}'", key))
+                            })?;
+                            let fn_name = methods.iter().find(|(name, _)| name == "index_mut" || name == "index").map(|(_, mangled)| mangled.clone()).ok_or_else(|| {
+                                CodegenError::new(format!("no 'index'/'index_mut' method for array type '{}'", key))
+                            })?;
+                            (ai_inner, fn_name)
+                        } else {
+                            let type_name = match &array_ty {
+                                Type::GenericInstance(name, args) => Self::mangle_generic_instance(name, args),
+                                Type::Ref { inner, .. } => match inner.as_ref() {
+                                    Type::GenericInstance(name, args) => Self::mangle_generic_instance(name, args),
+                                    Type::Struct(name) => name.clone(),
+                                    _ => Self::type_to_mangled_name(inner),
+                                },
+                                Type::Struct(name) => name.clone(),
+                                _ => Self::type_to_mangled_name(&array_ty),
+                            };
+                            let methods = self.impl_methods.get(&type_name).ok_or_else(|| {
+                                CodegenError::with_span(format!("cannot index into type {:?}", array_ty), expr.span())
+                            })?;
+                            let fn_name = methods.iter().find(|(name, _)| name == "index_mut" || name == "index").map(|(_, mangled)| mangled.clone()).ok_or_else(|| {
+                                CodegenError::with_span(format!("type {:?} does not implement Index/IndexMut", array_ty), expr.span())
+                            })?;
+                            let ret_ty = self.fn_return_types.get(&fn_name).ok_or_else(|| {
+                                CodegenError::new(format!("internal: return type of index method '{}' not found", fn_name))
+                            })?;
+                            let elem_ty = match ret_ty {
+                                Type::Ref { inner, .. } => inner.as_ref().clone(),
+                                _ => ret_ty.clone(),
+                            };
+                            (elem_ty, fn_name)
+                        };
+                        let fn_val = self.module.get_function(&fn_name).ok_or_else(|| {
+                            CodegenError::new(format!("internal: index function '{}' not found", fn_name))
+                        })?;
+                        let array_ptr = if let Expr::Ident(name, ..) = array.as_ref() {
+                            if let Some((ptr, _, _)) = self.symbols.get(name) {
+                                *ptr
+                            } else {
+                                return Err(CodegenError::with_span(format!("undefined variable '{}'", name), expr.span()));
+                            }
+                        } else {
+                            let array_val = self.compile_expr(array)?;
+                            match array_val {
+                                BasicValueEnum::PointerValue(p) => p,
+                                _ => {
+                                    let alloca = self.builder.build_alloca(array_val.get_type(), "array_ref").map_err(|e| {
+                                        format!("failed to build alloca: {}", e)
+                                    })?;
+                                    self.builder.build_store(alloca, array_val).map_err(|e| {
+                                        CodegenError::new(format!("failed to store: {}", e))
+                                    })?;
+                                    alloca
+                                }
+                            }
+                        };
+                        let idx_val = self.compile_expr(index)?;
+                        let result = self.builder.build_call(fn_val, &[array_ptr.into(), idx_val.into()], "index_call").map_err(|e| {
+                            CodegenError::new(format!("failed to call index: {}", e))
+                        })?;
+                        let result_ptr = self.try_extract_result(result).into_pointer_value();
+                        Ok(result_ptr)
+                    }
+                } else {
+                    let (val, coerced_ty) = self.compile_index_expr_with_autoderef(array)?;
+                    let is_slice = matches!(&coerced_ty, Type::Slice { .. })
+                        || matches!(&coerced_ty, Type::Ref { inner, .. } if matches!(inner.as_ref(), Type::Slice { .. }));
+                    if is_slice {
+                        let fat_ptr_val = val;
+                        let ptr_field = match fat_ptr_val {
+                            BasicValueEnum::StructValue(sv) => self.builder.build_extract_value(sv, 0, "slice_ptr").map_err(|e| {
+                                CodegenError::new(format!("failed to extract slice ptr: {}", e))
+                            })?,
+                            _ => return Err(CodegenError::with_span("expected slice fat pointer", expr.span())),
+                        };
+                        let ptr = ptr_field.into_pointer_value();
+                        let elem_ty = match &coerced_ty {
+                            Type::Slice { inner } => inner.as_ref().clone(),
+                            Type::Ref { inner, .. } => match inner.as_ref() {
+                                Type::Slice { inner } => inner.as_ref().clone(),
+                                _ => unreachable!(),
+                            },
+                            _ => unreachable!(),
+                        };
+                        let elem_llvm = self.type_to_llvm(&elem_ty);
+                        let idx_val = self.compile_expr(index)?;
+                        let idx = idx_val.into_int_value();
+                        let elem_ptr = unsafe {
+                            self.builder.build_in_bounds_gep(elem_llvm, ptr, &[idx], "slice_index").map_err(|e| {
+                                CodegenError::new(format!("failed to GEP into slice: {}", e))
+                            })?
+                        };
+                        Ok(elem_ptr)
+                    } else {
+                        let (_elem_ty, fn_name) = if let Some((ai_inner, len)) = match &coerced_ty {
+                            Type::Array { inner, len } => Some((*inner.clone(), *len)),
+                            Type::Ref { inner, .. } => match inner.as_ref() {
+                                Type::Array { inner: ai, len } => Some((*ai.clone(), *len)),
+                                _ => None,
+                            },
+                            _ => None,
+                        } {
+                            self.ensure_slice_methods(&ai_inner, len)?;
+                            let key = Self::array_type_key(&ai_inner, len);
+                            let methods = self.impl_methods.get(&key).ok_or_else(|| {
+                                CodegenError::new(format!("no methods registered for array type '{}'", key))
+                            })?;
+                            let fn_name = methods.iter().find(|(name, _)| name == "index" || name == "index_mut").map(|(_, mangled)| mangled.clone()).ok_or_else(|| {
+                                CodegenError::new(format!("no 'index' method for array type '{}'", key))
+                            })?;
+                            (ai_inner, fn_name)
+                        } else {
+                            let type_name = match &coerced_ty {
+                                Type::GenericInstance(name, args) => Self::mangle_generic_instance(name, args),
+                                Type::Ref { inner, .. } => match inner.as_ref() {
+                                    Type::GenericInstance(name, args) => Self::mangle_generic_instance(name, args),
+                                    Type::Struct(name) => name.clone(),
+                                    _ => Self::type_to_mangled_name(inner),
+                                },
+                                Type::Struct(name) => name.clone(),
+                                _ => Self::type_to_mangled_name(&coerced_ty),
+                            };
+                            let methods = self.impl_methods.get(&type_name).ok_or_else(|| {
+                                CodegenError::with_span(format!("cannot index into type {:?}", coerced_ty), expr.span())
+                            })?;
+                            let fn_name = methods.iter().find(|(name, _)| name == "index" || name == "index_mut").map(|(_, mangled)| mangled.clone()).ok_or_else(|| {
+                                CodegenError::with_span(format!("type {:?} does not implement Index", coerced_ty), expr.span())
+                            })?;
+                            let ret_ty = self.fn_return_types.get(&fn_name).ok_or_else(|| {
+                                CodegenError::new(format!("internal: return type of index method '{}' not found", fn_name))
+                            })?;
+                            let elem_ty = match ret_ty {
+                                Type::Ref { inner, .. } => inner.as_ref().clone(),
+                                _ => ret_ty.clone(),
+                            };
+                            (elem_ty, fn_name)
+                        };
+                        let fn_val = self.module.get_function(&fn_name).ok_or_else(|| {
+                            CodegenError::new(format!("internal: index function '{}' not found", fn_name))
+                        })?;
+                        let array_ptr = match val {
+                            BasicValueEnum::PointerValue(p) => p,
+                            _ => {
+                                let alloca = self.builder.build_alloca(val.get_type(), "array_ref").map_err(|e| {
+                                    format!("failed to build alloca: {}", e)
+                                })?;
+                                self.builder.build_store(alloca, val).map_err(|e| {
+                                    CodegenError::new(format!("failed to store: {}", e))
+                                })?;
+                                alloca
+                            }
+                        };
+                        let idx_val = self.compile_expr(index)?;
+                        let result = self.builder.build_call(fn_val, &[array_ptr.into(), idx_val.into()], "index_call").map_err(|e| {
+                            CodegenError::new(format!("failed to call index: {}", e))
+                        })?;
+                        let result_ptr = self.try_extract_result(result).into_pointer_value();
+                        Ok(result_ptr)
+                    }
+                }
+            }
+            _ => {
+                let val = self.compile_expr(expr)?;
+                let alloca = self.builder.build_alloca(val.get_type(), "temp_alloca").map_err(|e| {
+                    CodegenError::new(format!("failed to build alloca: {}", e))
+                })?;
+                self.builder.build_store(alloca, val).map_err(|e| {
+                    CodegenError::new(format!("failed to store: {}", e))
+                })?;
+                Ok(alloca)
+            }
+        }
+    }
+
+    fn compile_member_expr_with_autoderef(
+        &mut self,
+        expr: &Expr,
+        field: Option<&String>,
+        index: usize,
+    ) -> Result<(BasicValueEnum<'ctx>, Type), CodegenError> {
+        let mut val = self.compile_expr_to_pointer_val(expr)?.into();
+        let mut ty = self.expr_type(expr);
+        loop {
+            let has_field = match &ty {
+                Type::Tuple(elems) => index < elems.len(),
+                Type::Str => index == 0 || index == 1,
+                Type::Struct(name) | Type::GenericInstance(name, _) => {
+                    if let Some(field_name) = field {
+                        if let Some(fields) = self.struct_fields.get(name) {
+                            fields.iter().any(|f| f.name == *field_name)
+                        } else {
+                            false
+                        }
+                    } else {
+                        if let Some(fields) = self.struct_fields.get(name) {
+                            index < fields.len()
+                        } else {
+                            false
+                        }
+                    }
+                }
+                Type::Ref { inner, .. } => match inner.as_ref() {
+                    Type::Tuple(elems) => index < elems.len(),
+                    Type::Str => index == 0 || index == 1,
+                    Type::Struct(name) | Type::GenericInstance(name, _) => {
+                        if let Some(field_name) = field {
+                            if let Some(fields) = self.struct_fields.get(name) {
+                                fields.iter().any(|f| f.name == *field_name)
+                            } else {
+                                false
+                            }
+                        } else {
+                            if let Some(fields) = self.struct_fields.get(name) {
+                                index < fields.len()
+                            } else {
+                                false
+                            }
+                        }
+                    }
+                    _ => false,
+                }
+                _ => false,
+            };
+            if has_field {
+                break;
+            }
+            if let Some((next_ty, mangled_deref)) = self.get_custom_deref_target(&ty) {
+                let ptr = if let BasicValueEnum::PointerValue(p) = val {
+                    p
+                } else {
+                    let alloca = self.builder.build_alloca(val.get_type(), "deref_self").map_err(|e| {
+                        CodegenError::new(format!("failed to build alloca for deref: {}", e))
+                    })?;
+                    self.builder.build_store(alloca, val).map_err(|e| {
+                        CodegenError::new(format!("failed to store for deref: {}", e))
+                    })?;
+                    alloca
+                };
+                let fn_val = self.module.get_function(&mangled_deref).ok_or_else(|| {
+                    CodegenError::new(format!("internal: deref function {} not found", mangled_deref))
+                })?;
+                let res = self.builder.build_call(fn_val, &[ptr.into()], "deref_call").map_err(|e| {
+                    CodegenError::new(format!("failed to call deref: {}", e))
+                })?;
+                val = self.try_extract_result(res);
+                ty = Type::Ref {
+                    inner: Box::new(next_ty),
+                    is_mut: false,
+                };
+            } else if let Type::Ref { inner, .. } | Type::Ptr { inner, .. } = &ty {
+                let pointee_llvm_ty = self.type_to_llvm(inner.as_ref());
+                let ptr = val.into_pointer_value();
+                val = self.builder.build_load(pointee_llvm_ty, ptr, "deref_load").map_err(|e| {
+                    CodegenError::new(format!("failed to build load for deref: {}", e))
+                })?;
+                ty = inner.as_ref().clone();
+            } else {
+                break;
+            }
+        }
+        Ok((val, ty))
+    }
+
+    fn resolve_index_type(&self, ty: &Type) -> Type {
+        let mut ty = ty.clone();
+        loop {
+            let is_indexable = match &ty {
+                Type::Array { .. } | Type::Slice { .. } => true,
+                Type::Ref { inner, .. } => matches!(inner.as_ref(), Type::Array { .. } | Type::Slice { .. }),
+                _ => false,
+            };
+            if is_indexable {
+                break;
+            }
+            let type_name = match &ty {
+                Type::GenericInstance(name, args) => Self::mangle_generic_instance(name, args),
+                Type::Ref { inner, .. } => match inner.as_ref() {
+                    Type::GenericInstance(name, args) => Self::mangle_generic_instance(name, args),
+                    Type::Struct(name) => name.clone(),
+                    _ => Self::type_to_mangled_name(inner),
+                },
+                Type::Struct(name) => name.clone(),
+                _ => Self::type_to_mangled_name(&ty),
+            };
+            if let Some(methods) = self.impl_methods.get(&type_name)
+                && methods.iter().any(|(name, _)| name == "index" || name == "index_mut") {
+                    break;
+                }
+            if let Some((next_ty, _)) = self.get_custom_deref_target(&ty) {
+                ty = Type::Ref {
+                    inner: Box::new(next_ty),
+                    is_mut: false,
+                };
+            } else if let Type::Ref { inner, .. } | Type::Ptr { inner, .. } = &ty {
+                ty = inner.as_ref().clone();
+            } else {
+                break;
+            }
+        }
+        ty
+    }
+
+    fn compile_index_expr_with_autoderef(
+        &mut self,
+        expr: &Expr,
+    ) -> Result<(BasicValueEnum<'ctx>, Type), CodegenError> {
+        let mut val = self.compile_expr_to_pointer_val(expr)?.into();
+        let mut ty = self.expr_type(expr);
+        loop {
+            let is_indexable = match &ty {
+                Type::Array { .. } | Type::Slice { .. } => true,
+                Type::Ref { inner, .. } => matches!(inner.as_ref(), Type::Array { .. } | Type::Slice { .. }),
+                _ => false,
+            };
+            if is_indexable {
+                break;
+            }
+            let type_name = match &ty {
+                Type::GenericInstance(name, args) => Self::mangle_generic_instance(name, args),
+                Type::Ref { inner, .. } => match inner.as_ref() {
+                    Type::GenericInstance(name, args) => Self::mangle_generic_instance(name, args),
+                    Type::Struct(name) => name.clone(),
+                    _ => Self::type_to_mangled_name(inner),
+                },
+                Type::Struct(name) => name.clone(),
+                _ => Self::type_to_mangled_name(&ty),
+            };
+            if let Some(methods) = self.impl_methods.get(&type_name)
+                && methods.iter().any(|(name, _)| name == "index" || name == "index_mut") {
+                    break;
+                }
+            if let Some((next_ty, mangled_deref)) = self.get_custom_deref_target(&ty) {
+                let ptr = if let BasicValueEnum::PointerValue(p) = val {
+                    p
+                } else {
+                    let alloca = self.builder.build_alloca(val.get_type(), "deref_self").map_err(|e| {
+                        CodegenError::new(format!("failed to build alloca for deref: {}", e))
+                    })?;
+                    self.builder.build_store(alloca, val).map_err(|e| {
+                        CodegenError::new(format!("failed to store for deref: {}", e))
+                    })?;
+                    alloca
+                };
+                let fn_val = self.module.get_function(&mangled_deref).ok_or_else(|| {
+                    CodegenError::new(format!("internal: deref function {} not found", mangled_deref))
+                })?;
+                let res = self.builder.build_call(fn_val, &[ptr.into()], "deref_call").map_err(|e| {
+                    CodegenError::new(format!("failed to call deref: {}", e))
+                })?;
+                val = self.try_extract_result(res);
+                ty = Type::Ref {
+                    inner: Box::new(next_ty),
+                    is_mut: false,
+                };
+            } else if let Type::Ref { inner, .. } | Type::Ptr { inner, .. } = &ty {
+                let pointee_llvm_ty = self.type_to_llvm(inner.as_ref());
+                let ptr = val.into_pointer_value();
+                val = self.builder.build_load(pointee_llvm_ty, ptr, "deref_load").map_err(|e| {
+                    CodegenError::new(format!("failed to build load for deref: {}", e))
+                })?;
+                ty = inner.as_ref().clone();
+            } else {
+                break;
+            }
+        }
+        Ok((val, ty))
+    }
+
     /// Coerce an argument value to match the expected parameter type.
     /// Handles array-to-slice coercion where an array `[T; L]` or `&[T; L]` is passed
     /// to a function expecting `[T]` or `&[T]` by building a fat pointer `{ ptr, len }`.
@@ -9819,23 +10922,45 @@ impl<'ctx> CodeGen<'ctx> {
         let mut arg_val = arg_val;
         let mut arg_ty = arg_ty.clone();
 
-        // Recursively dereference references if the inner type matches the target parameter type,
-        // or if the inner type is itself a reference that needs to be loaded.
-        while let Type::Ref { inner, .. } = &arg_ty {
-            let inner_is_ref = matches!(inner.as_ref(), Type::Ref { .. });
-            if inner.as_ref() == param_ty || inner_is_ref {
-                let pointee_llvm_ty = self.type_to_llvm(inner.as_ref());
-                let ptr = arg_val.into_pointer_value();
-                arg_val = self
-                    .builder
-                    .build_load(pointee_llvm_ty, ptr, "deref_coerce")
-                    .map_err(|e| {
-                        CodegenError::new(format!("failed to build deref load for coercion: {}", e))
-                    })?;
-                arg_ty = inner.as_ref().clone();
-            } else {
-                break;
+        loop {
+            // 1. Reference loading coercion: e.g. &T -> T if param expects T, or &&T -> &T
+            if let Type::Ref { inner, .. } = &arg_ty {
+                let inner_is_ref = matches!(inner.as_ref(), Type::Ref { .. });
+                if inner.as_ref() == param_ty || inner_is_ref {
+                    let pointee_llvm_ty = self.type_to_llvm(inner.as_ref());
+                    let ptr = arg_val.into_pointer_value();
+                    arg_val = self
+                        .builder
+                        .build_load(pointee_llvm_ty, ptr, "deref_coerce")
+                        .map_err(|e| {
+                            CodegenError::new(format!("failed to build deref load for coercion: {}", e))
+                        })?;
+                    arg_ty = inner.as_ref().clone();
+                    continue;
+                }
             }
+
+            // 2. Custom Deref coercion: e.g. &T -> &U if T implements Deref<U>
+            if let Type::Ref { inner: arg_inner, .. } = &arg_ty
+                && let Type::Ref { inner: param_inner, .. } = param_ty
+                    && let Some((target, mangled_deref)) = self.get_custom_deref_target(arg_inner)
+                        && &target == param_inner.as_ref() {
+                            let ptr = arg_val.into_pointer_value();
+                            let fn_val = self.module.get_function(&mangled_deref).ok_or_else(|| {
+                                CodegenError::new(format!("internal: deref function {} not found", mangled_deref))
+                            })?;
+                            let res = self.builder.build_call(fn_val, &[ptr.into()], "deref_coerce_call").map_err(|e| {
+                                CodegenError::new(format!("failed to call deref for coercion: {}", e))
+                            })?;
+                            arg_val = self.try_extract_result(res);
+                            arg_ty = Type::Ref {
+                                inner: Box::new(target),
+                                is_mut: false,
+                            };
+                            continue;
+                        }
+
+            break;
         }
 
         // Check if the parameter expects a slice fat pointer

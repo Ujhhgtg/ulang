@@ -1,6 +1,14 @@
 use std::string::String;
 use std::vec::Vec;
 use std::libc::printf;
+use std::libc::__errno_location;
+use std::libc::strerror;
+use std::intrinsics::transmute;
+use std::intrinsics::slice_from_raw_parts;
+use std::result;
+use std::alloc::malloc;
+use std::alloc::memcpy;
+
 
 pub fn print(x: i32) {
     printf("%d".0, x);
@@ -25,3 +33,72 @@ pub fn print(s: &String) {
 pub fn println(s: &String) {
     println((*s).as_str());
 }
+
+pub enum ErrorKind {
+    NotFound,
+    PermissionDenied,
+    AlreadyExists,
+    Other,
+}
+
+pub struct Error {
+    pub repr: i32,
+    pub message: String,
+}
+
+fn c_str_to_str(ptr: *const u8) -> &str {
+    if (ptr as usize) == 0 {
+        return "";
+    };
+    let mut len = 0;
+    while *( (ptr as usize + len) as *const u8 ) != 0u8 {
+        len = len + 1;
+    };
+    transmute::<&[u8], &str>(slice_from_raw_parts(ptr, len))
+}
+
+pub fn to_c_str(s: &str) -> *mut u8 {
+    let len = s.1;
+    let ptr = malloc(len + 1);
+    memcpy(ptr, s.0, len);
+    *((ptr as usize + len) as *mut u8) = 0u8;
+    ptr
+}
+
+impl Error {
+    pub fn last_os_error() -> Error {
+        let code = *__errno_location();
+        let msg_ptr = strerror(code);
+        let msg_str = c_str_to_str(msg_ptr);
+        Error {
+            repr: code,
+            message: msg_str.to_string(),
+        }
+    }
+
+    pub fn from_raw_os_error(code: i32) -> Error {
+        let msg_ptr = strerror(code);
+        let msg_str = c_str_to_str(msg_ptr);
+        Error {
+            repr: code,
+            message: msg_str.to_string(),
+        }
+    }
+
+    pub fn kind(&self) -> ErrorKind {
+        let code = self.repr;
+        if code == 2 {
+            return ErrorKind::NotFound;
+        };
+        if code == 13 {
+            return ErrorKind::PermissionDenied;
+        };
+        if code == 17 {
+            return ErrorKind::AlreadyExists;
+        };
+        ErrorKind::Other
+    }
+}
+
+pub type Result<T> = result::Result<T, Error>;
+

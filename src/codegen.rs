@@ -947,14 +947,21 @@ impl<'ctx> CodeGen<'ctx> {
                     .push(("cmp".to_string(), fn_name));
             }
 
-            // Add, Sub, Mul, Div for numeric primitives
+            // Add, Sub, Mul, Div, Rem, BitAnd, BitOr, BitXor for numeric primitives
             if ty != &Type::Bool {
-                for (trait_name, method_name) in [
+                let mut operators = vec![
                     ("Add", "add"),
                     ("Sub", "sub"),
                     ("Mul", "mul"),
                     ("Div", "div"),
-                ] {
+                    ("Rem", "rem"),
+                ];
+                if !is_float {
+                    operators.push(("BitAnd", "bitand"));
+                    operators.push(("BitOr", "bitor"));
+                    operators.push(("BitXor", "bitxor"));
+                }
+                for (trait_name, method_name) in operators {
                     let fn_name = format!("__builtin_{}_{}_{}", trait_name, method_name, ty_name);
                     let param_types = [
                         self.context.ptr_type(AddressSpace::default()).into(),
@@ -1116,6 +1123,87 @@ impl<'ctx> CodeGen<'ctx> {
                                         .into()
                                 }
                             }
+                            "BitAnd" => {
+                                self.builder
+                                    .build_and(
+                                        self_loaded.into_int_value(),
+                                        other_loaded.into_int_value(),
+                                        "and",
+                                    )
+                                    .map_err(|e| {
+                                        CodegenError::new(format!("failed to build int and: {}", e))
+                                    })?
+                                    .into()
+                            }
+                            "BitOr" => {
+                                self.builder
+                                    .build_or(
+                                        self_loaded.into_int_value(),
+                                        other_loaded.into_int_value(),
+                                        "or",
+                                    )
+                                    .map_err(|e| {
+                                        CodegenError::new(format!("failed to build int or: {}", e))
+                                    })?
+                                    .into()
+                            }
+                            "BitXor" => {
+                                self.builder
+                                    .build_xor(
+                                        self_loaded.into_int_value(),
+                                        other_loaded.into_int_value(),
+                                        "xor",
+                                    )
+                                    .map_err(|e| {
+                                        CodegenError::new(format!("failed to build int xor: {}", e))
+                                    })?
+                                    .into()
+                            }
+                            "Rem" => {
+                                if is_float {
+                                    self.builder
+                                        .build_float_rem(
+                                            self_loaded.into_float_value(),
+                                            other_loaded.into_float_value(),
+                                            "rem",
+                                        )
+                                        .map_err(|e| {
+                                            CodegenError::new(format!(
+                                                "failed to build float rem: {}",
+                                                e
+                                            ))
+                                        })?
+                                        .into()
+                                } else if Self::is_signed(ty) {
+                                    self.builder
+                                        .build_int_signed_rem(
+                                            self_loaded.into_int_value(),
+                                            other_loaded.into_int_value(),
+                                            "rem",
+                                        )
+                                        .map_err(|e| {
+                                            CodegenError::new(format!(
+                                                "failed to build signed rem: {}",
+                                                e
+                                            ))
+                                        })?
+                                        .into()
+                                } else {
+                                    self.builder
+                                        .build_int_unsigned_rem(
+                                            self_loaded.into_int_value(),
+                                            other_loaded.into_int_value(),
+                                            "rem",
+                                        )
+                                        .map_err(|e| {
+                                            CodegenError::new(format!(
+                                                "failed to build unsigned rem: {}",
+                                                e
+                                            ))
+                                        })?
+                                        .into()
+                                }
+                            }
                             _ => unreachable!(),
                         };
 
@@ -1140,11 +1228,433 @@ impl<'ctx> CodeGen<'ctx> {
                 traits.insert("Sub".to_string());
                 traits.insert("Mul".to_string());
                 traits.insert("Div".to_string());
+                traits.insert("Rem".to_string());
+                if !is_float {
+                    traits.insert("BitAnd".to_string());
+                    traits.insert("BitOr".to_string());
+                    traits.insert("BitXor".to_string());
+                }
             }
             self.trait_impls.insert(ty_name.to_string(), traits);
             // Primitives are Copy
             self.copy_types.insert(ty_name.to_string());
         }
+        self.generate_str_trait_impls()?;
+        Ok(())
+    }
+
+    fn generate_str_trait_impls(&mut self) -> Result<(), CodegenError> {
+        let str_ref_ty = Type::Ref {
+            inner: Box::new(Type::Str),
+            is_mut: false,
+        };
+        let llvm_str_ref_ty = self.type_to_llvm(&str_ref_ty);
+
+        // Register in trait_impls
+        let mut traits = HashSet::new();
+        traits.insert("Eq".to_string());
+        traits.insert("Ord".to_string());
+        traits.insert("Clone".to_string());
+        traits.insert("Default".to_string());
+        traits.insert("std::cmp::Eq".to_string());
+        traits.insert("std::cmp::Ord".to_string());
+        traits.insert("core::cmp::Eq".to_string());
+        traits.insert("core::cmp::Ord".to_string());
+        traits.insert("core::clone::Clone".to_string());
+        traits.insert("core::default::Default".to_string());
+        self.trait_impls.insert("str".to_string(), traits);
+
+        // 1. Default::default for str -> returns { null, 0 }
+        {
+            let fn_name = "__builtin_Default_default_str".to_string();
+            let fn_type = llvm_str_ref_ty.fn_type(&[], false);
+            if self.module.get_function(&fn_name).is_none() {
+                let fn_val = self.module.add_function(&fn_name, fn_type, None);
+                let entry = self.context.append_basic_block(fn_val, "entry");
+                self.builder.position_at_end(entry);
+                
+                let null_ptr = self.context.ptr_type(AddressSpace::default()).const_null();
+                let zero_len = self.i64_type.const_zero();
+                
+                let mut str_struct = llvm_str_ref_ty.into_struct_type().get_undef().into();
+                str_struct = self
+                    .builder
+                    .build_insert_value(str_struct, null_ptr, 0, "ptr")
+                    .map_err(|e| CodegenError::new(format!("failed to insert ptr: {}", e)))?;
+                str_struct = self
+                    .builder
+                    .build_insert_value(str_struct, zero_len, 1, "len")
+                    .map_err(|e| CodegenError::new(format!("failed to insert len: {}", e)))?;
+                
+                self.builder.build_return(Some(&str_struct)).map_err(|e| {
+                    CodegenError::new(format!("failed to build default return: {}", e))
+                })?;
+            }
+            self.impl_methods
+                .entry("str".to_string())
+                .or_default()
+                .push(("default".to_string(), fn_name));
+        }
+
+        // 2. Clone::clone for str -> returns `{ ptr, len }` value
+        {
+            let fn_name = "__builtin_Clone_clone_str".to_string();
+            let param_types = [self.context.ptr_type(AddressSpace::default()).into()];
+            let fn_type = llvm_str_ref_ty.fn_type(&param_types, false);
+            if self.module.get_function(&fn_name).is_none() {
+                let fn_val = self.module.add_function(&fn_name, fn_type, None);
+                let entry = self.context.append_basic_block(fn_val, "entry");
+                self.builder.position_at_end(entry);
+                
+                let ptr_param = fn_val.get_first_param().unwrap().into_pointer_value();
+                let loaded = self
+                    .builder
+                    .build_load(llvm_str_ref_ty, ptr_param, "cloned")
+                    .map_err(|e| CodegenError::new(format!("failed to load for clone: {}", e)))?;
+                self.builder.build_return(Some(&loaded)).map_err(|e| {
+                    CodegenError::new(format!("failed to build clone return: {}", e))
+                })?;
+            }
+            self.impl_methods
+                .entry("str".to_string())
+                .or_default()
+                .push(("clone".to_string(), fn_name));
+        }
+
+        // 3. Eq::eq for str -> returns bool
+        {
+            let fn_name = "__builtin_Eq_eq_str".to_string();
+            let param_types = [
+                self.context.ptr_type(AddressSpace::default()).into(),
+                self.context.ptr_type(AddressSpace::default()).into(),
+            ];
+            let fn_type = self.bool_type.fn_type(&param_types, false);
+            if self.module.get_function(&fn_name).is_none() {
+                let fn_val = self.module.add_function(&fn_name, fn_type, None);
+                
+                let entry = self.context.append_basic_block(fn_val, "entry");
+                let cmp_len_block = self.context.append_basic_block(fn_val, "cmp_len");
+                let cmp_bytes_block = self.context.append_basic_block(fn_val, "cmp_bytes");
+                let ret_false_block = self.context.append_basic_block(fn_val, "ret_false");
+                let ret_true_block = self.context.append_basic_block(fn_val, "ret_true");
+                
+                // entry:
+                self.builder.position_at_end(entry);
+                let params = fn_val.get_params();
+                let lhs_ptr_val = params[0].into_pointer_value();
+                let rhs_ptr_val = params[1].into_pointer_value();
+                
+                // load the fat pointer structs from their pointers
+                let lhs = self
+                    .builder
+                    .build_load(llvm_str_ref_ty, lhs_ptr_val, "lhs")
+                    .map_err(|e| CodegenError::new(format!("failed to load lhs: {}", e)))?;
+                let rhs = self
+                    .builder
+                    .build_load(llvm_str_ref_ty, rhs_ptr_val, "rhs")
+                    .map_err(|e| CodegenError::new(format!("failed to load rhs: {}", e)))?;
+                
+                let lhs_ptr = self
+                    .builder
+                    .build_extract_value(lhs.into_struct_value(), 0, "lhs_ptr")
+                    .map_err(|e| CodegenError::new(format!("failed to extract lhs_ptr: {}", e)))?;
+                let lhs_len = self
+                    .builder
+                    .build_extract_value(lhs.into_struct_value(), 1, "lhs_len")
+                    .map_err(|e| CodegenError::new(format!("failed to extract lhs_len: {}", e)))?;
+                let rhs_ptr = self
+                    .builder
+                    .build_extract_value(rhs.into_struct_value(), 0, "rhs_ptr")
+                    .map_err(|e| CodegenError::new(format!("failed to extract rhs_ptr: {}", e)))?;
+                let rhs_len = self
+                    .builder
+                    .build_extract_value(rhs.into_struct_value(), 1, "rhs_len")
+                    .map_err(|e| CodegenError::new(format!("failed to extract rhs_len: {}", e)))?;
+                
+                // if lhs_len == rhs_len goto cmp_len_block else ret_false_block
+                let len_eq = self
+                    .builder
+                    .build_int_compare(
+                        inkwell::IntPredicate::EQ,
+                        lhs_len.into_int_value(),
+                        rhs_len.into_int_value(),
+                        "len_eq",
+                    )
+                    .map_err(|e| CodegenError::new(format!("failed to compare lengths: {}", e)))?;
+                self.builder
+                    .build_conditional_branch(len_eq, cmp_len_block, ret_false_block)
+                    .map_err(|e| CodegenError::new(format!("failed to build length branch: {}", e)))?;
+                
+                // cmp_len_block:
+                self.builder.position_at_end(cmp_len_block);
+                // if lhs_len == 0 goto ret_true_block else cmp_bytes_block
+                let zero_len = self
+                    .builder
+                    .build_int_compare(
+                        inkwell::IntPredicate::EQ,
+                        lhs_len.into_int_value(),
+                        self.i64_type.const_zero(),
+                        "zero_len",
+                    )
+                    .map_err(|e| CodegenError::new(format!("failed to compare length with zero: {}", e)))?;
+                self.builder
+                    .build_conditional_branch(zero_len, ret_true_block, cmp_bytes_block)
+                    .map_err(|e| CodegenError::new(format!("failed to build zero length branch: {}", e)))?;
+                
+                // cmp_bytes_block:
+                self.builder.position_at_end(cmp_bytes_block);
+                // call memcmp(lhs_ptr, rhs_ptr, lhs_len)
+                let memcmp_fn = self.module.get_function("memcmp").unwrap_or_else(|| {
+                    let memcmp_type = self.i32_type.fn_type(
+                        &[
+                            self.context.ptr_type(AddressSpace::default()).into(),
+                            self.context.ptr_type(AddressSpace::default()).into(),
+                            self.i64_type.into(),
+                        ],
+                        false,
+                    );
+                    self.module.add_function("memcmp", memcmp_type, None)
+                });
+                
+                let memcmp_res = self
+                    .builder
+                    .build_call(
+                        memcmp_fn,
+                        &[lhs_ptr.into(), rhs_ptr.into(), lhs_len.into()],
+                        "memcmp_res",
+                    )
+                    .map_err(|e| CodegenError::new(format!("failed to call memcmp: {}", e)))?;
+                let memcmp_int = self.try_extract_result(memcmp_res).into_int_value();
+                let bytes_eq = self
+                    .builder
+                    .build_int_compare(
+                        inkwell::IntPredicate::EQ,
+                        memcmp_int,
+                        self.i32_type.const_zero(),
+                        "bytes_eq",
+                    )
+                    .map_err(|e| CodegenError::new(format!("failed to compare memcmp result: {}", e)))?;
+                self.builder.build_return(Some(&bytes_eq)).map_err(|e| {
+                    CodegenError::new(format!("failed to build return: {}", e))
+                })?;
+                
+                // ret_false_block:
+                self.builder.position_at_end(ret_false_block);
+                self.builder
+                    .build_return(Some(&self.bool_type.const_int(0, false)))
+                    .map_err(|e| CodegenError::new(format!("failed to build false return: {}", e)))?;
+                
+                // ret_true_block:
+                self.builder.position_at_end(ret_true_block);
+                self.builder
+                    .build_return(Some(&self.bool_type.const_int(1, false)))
+                    .map_err(|e| CodegenError::new(format!("failed to build true return: {}", e)))?;
+            }
+            self.impl_methods
+                .entry("str".to_string())
+                .or_default()
+                .push(("eq".to_string(), fn_name));
+        }
+
+        // 4. Eq::ne for str -> returns bool (!eq)
+        {
+            let fn_name = "__builtin_Eq_ne_str".to_string();
+            let param_types = [
+                self.context.ptr_type(AddressSpace::default()).into(),
+                self.context.ptr_type(AddressSpace::default()).into(),
+            ];
+            let fn_type = self.bool_type.fn_type(&param_types, false);
+            if self.module.get_function(&fn_name).is_none() {
+                let fn_val = self.module.add_function(&fn_name, fn_type, None);
+                
+                let entry = self.context.append_basic_block(fn_val, "entry");
+                self.builder.position_at_end(entry);
+                
+                let params = fn_val.get_params();
+                let eq_fn = self.module.get_function("__builtin_Eq_eq_str").unwrap();
+                let eq_res = self
+                    .builder
+                    .build_call(eq_fn, &[params[0].into(), params[1].into()], "eq_res")
+                    .map_err(|e| CodegenError::new(format!("failed to call eq: {}", e)))?;
+                let eq_bool = self.try_extract_result(eq_res).into_int_value();
+                let ne_bool = self
+                    .builder
+                    .build_not(eq_bool, "ne_bool")
+                    .map_err(|e| CodegenError::new(format!("failed to build not: {}", e)))?;
+                
+                self.builder.build_return(Some(&ne_bool)).map_err(|e| {
+                    CodegenError::new(format!("failed to build return: {}", e))
+                })?;
+            }
+            self.impl_methods
+                .entry("str".to_string())
+                .or_default()
+                .push(("ne".to_string(), fn_name));
+        }
+
+        // 5. Ord::cmp for str -> returns i32
+        {
+            let fn_name = "__builtin_Ord_cmp_str".to_string();
+            let param_types = [
+                self.context.ptr_type(AddressSpace::default()).into(),
+                self.context.ptr_type(AddressSpace::default()).into(),
+            ];
+            let fn_type = self.i32_type.fn_type(&param_types, false);
+            if self.module.get_function(&fn_name).is_none() {
+                let fn_val = self.module.add_function(&fn_name, fn_type, None);
+                
+                let entry = self.context.append_basic_block(fn_val, "entry");
+                let cmp_bytes_block = self.context.append_basic_block(fn_val, "cmp_bytes");
+                let finish_block = self.context.append_basic_block(fn_val, "finish");
+                
+                // entry:
+                self.builder.position_at_end(entry);
+                let params = fn_val.get_params();
+                let lhs_ptr_val = params[0].into_pointer_value();
+                let rhs_ptr_val = params[1].into_pointer_value();
+                
+                let lhs = self
+                    .builder
+                    .build_load(llvm_str_ref_ty, lhs_ptr_val, "lhs")
+                    .map_err(|e| CodegenError::new(format!("failed to load lhs: {}", e)))?;
+                let rhs = self
+                    .builder
+                    .build_load(llvm_str_ref_ty, rhs_ptr_val, "rhs")
+                    .map_err(|e| CodegenError::new(format!("failed to load rhs: {}", e)))?;
+                
+                let lhs_ptr = self
+                    .builder
+                    .build_extract_value(lhs.into_struct_value(), 0, "lhs_ptr")
+                    .map_err(|e| CodegenError::new(format!("failed to extract lhs_ptr: {}", e)))?;
+                let lhs_len = self
+                    .builder
+                    .build_extract_value(lhs.into_struct_value(), 1, "lhs_len")
+                    .map_err(|e| CodegenError::new(format!("failed to extract lhs_len: {}", e)))?;
+                let rhs_ptr = self
+                    .builder
+                    .build_extract_value(rhs.into_struct_value(), 0, "rhs_ptr")
+                    .map_err(|e| CodegenError::new(format!("failed to extract rhs_ptr: {}", e)))?;
+                let rhs_len = self
+                    .builder
+                    .build_extract_value(rhs.into_struct_value(), 1, "rhs_len")
+                    .map_err(|e| CodegenError::new(format!("failed to extract rhs_len: {}", e)))?;
+                
+                // min_len = lhs_len < rhs_len ? lhs_len : rhs_len
+                let len_lt = self
+                    .builder
+                    .build_int_compare(
+                        inkwell::IntPredicate::ULT,
+                        lhs_len.into_int_value(),
+                        rhs_len.into_int_value(),
+                        "len_lt",
+                    )
+                    .map_err(|e| CodegenError::new(format!("failed to compare lengths: {}", e)))?;
+                let min_len = self
+                    .builder
+                    .build_select(len_lt, lhs_len, rhs_len, "min_len")
+                    .map_err(|e| CodegenError::new(format!("failed to build select for min_len: {}", e)))?;
+                
+                // if min_len == 0 goto finish
+                let min_len_zero = self
+                    .builder
+                    .build_int_compare(
+                        inkwell::IntPredicate::EQ,
+                        min_len.into_int_value(),
+                        self.i64_type.const_zero(),
+                        "min_len_zero",
+                    )
+                    .map_err(|e| CodegenError::new(format!("failed to compare min_len with zero: {}", e)))?;
+                self.builder
+                    .build_conditional_branch(min_len_zero, finish_block, cmp_bytes_block)
+                    .map_err(|e| CodegenError::new(format!("failed to build branch for min_len_zero: {}", e)))?;
+                
+                // cmp_bytes_block:
+                self.builder.position_at_end(cmp_bytes_block);
+                let memcmp_fn = self.module.get_function("memcmp").unwrap_or_else(|| {
+                    let memcmp_type = self.i32_type.fn_type(
+                        &[
+                            self.context.ptr_type(AddressSpace::default()).into(),
+                            self.context.ptr_type(AddressSpace::default()).into(),
+                            self.i64_type.into(),
+                        ],
+                        false,
+                    );
+                    self.module.add_function("memcmp", memcmp_type, None)
+                });
+                let memcmp_res = self
+                    .builder
+                    .build_call(
+                        memcmp_fn,
+                        &[lhs_ptr.into(), rhs_ptr.into(), min_len.into()],
+                        "memcmp_res",
+                    )
+                    .map_err(|e| CodegenError::new(format!("failed to call memcmp: {}", e)))?;
+                let memcmp_int = self.try_extract_result(memcmp_res).into_int_value();
+                
+                // if memcmp_res != 0, return memcmp_res, else goto finish
+                let memcmp_not_zero = self
+                    .builder
+                    .build_int_compare(
+                        inkwell::IntPredicate::NE,
+                        memcmp_int,
+                        self.i32_type.const_zero(),
+                        "memcmp_not_zero",
+                    )
+                    .map_err(|e| CodegenError::new(format!("failed to compare memcmp result with zero: {}", e)))?;
+                let ret_memcmp_block = self.context.append_basic_block(fn_val, "ret_memcmp");
+                self.builder
+                    .build_conditional_branch(memcmp_not_zero, ret_memcmp_block, finish_block)
+                    .map_err(|e| CodegenError::new(format!("failed to build branch for memcmp_not_zero: {}", e)))?;
+                
+                // ret_memcmp_block:
+                self.builder.position_at_end(ret_memcmp_block);
+                self.builder.build_return(Some(&memcmp_int)).map_err(|e| {
+                    CodegenError::new(format!("failed to build return for memcmp: {}", e))
+                })?;
+                
+                // finish_block:
+                self.builder.position_at_end(finish_block);
+                let len_gt = self
+                    .builder
+                    .build_int_compare(
+                        inkwell::IntPredicate::UGT,
+                        lhs_len.into_int_value(),
+                        rhs_len.into_int_value(),
+                        "len_gt",
+                    )
+                    .map_err(|e| CodegenError::new(format!("failed to compare len_gt: {}", e)))?;
+                let len_lt2 = self
+                    .builder
+                    .build_int_compare(
+                        inkwell::IntPredicate::ULT,
+                        lhs_len.into_int_value(),
+                        rhs_len.into_int_value(),
+                        "len_lt2",
+                    )
+                    .map_err(|e| CodegenError::new(format!("failed to compare len_lt2: {}", e)))?;
+                
+                let one = self.i32_type.const_int(1, true);
+                let neg_one = self.i32_type.const_int(-1i64 as u64, true);
+                let zero = self.i32_type.const_zero();
+                
+                let select_lt = self
+                    .builder
+                    .build_select(len_lt2, neg_one, zero, "select_lt")
+                    .map_err(|e| CodegenError::new(format!("failed to build select_lt: {}", e)))?;
+                let final_res = self
+                    .builder
+                    .build_select(len_gt, one, select_lt.into_int_value(), "final_res")
+                    .map_err(|e| CodegenError::new(format!("failed to build final_res select: {}", e)))?;
+                self.builder.build_return(Some(&final_res)).map_err(|e| {
+                    CodegenError::new(format!("failed to build return: {}", e))
+                })?;
+            }
+            self.impl_methods
+                .entry("str".to_string())
+                .or_default()
+                .push(("cmp".to_string(), fn_name));
+        }
+
         Ok(())
     }
 
@@ -2673,16 +3183,14 @@ impl<'ctx> CodeGen<'ctx> {
             (
                 Type::Ptr {
                     inner: p_inner,
-                    is_mut: p_mut,
+                    ..
                 },
                 Type::Ptr {
                     inner: a_inner,
-                    is_mut: a_mut,
+                    ..
                 },
             ) => {
-                if *p_mut == *a_mut {
-                    self.infer_type_mappings(p_inner, a_inner, type_params, mappings);
-                }
+                self.infer_type_mappings(p_inner, a_inner, type_params, mappings);
             }
             (Type::Array { inner: p_inner, .. }, Type::Array { inner: a_inner, .. }) => {
                 self.infer_type_mappings(p_inner, a_inner, type_params, mappings);
@@ -5316,6 +5824,45 @@ impl<'ctx> CodeGen<'ctx> {
                 let attr = self.context.create_enum_attribute(kind_id, 0);
                 val.add_attribute(inkwell::attributes::AttributeLoc::Function, attr);
             }
+            
+            // If it is an extern function with a qualified name, generate a wrapper that calls the raw extern function!
+            if func.is_extern && func.name.contains("::") {
+                let raw_name = func.name.split("::").last().unwrap().to_string();
+                let raw_fn = if let Some(existing_raw) = self.module.get_function(&raw_name) {
+                    existing_raw
+                } else {
+                    self.module.add_function(&raw_name, fn_type, None)
+                };
+                
+                let entry = self.context.append_basic_block(val, "entry");
+                let saved_bb = self.builder.get_insert_block();
+                self.builder.position_at_end(entry);
+                
+                let mut args_val = Vec::new();
+                for param in val.get_params() {
+                    args_val.push(param.into());
+                }
+                
+                let call_res = self.builder.build_call(raw_fn, &args_val, "call_raw").map_err(|e| {
+                    CodegenError::new(format!("failed to build call to raw extern: {}", e))
+                })?;
+                
+                if use_void_return {
+                    self.builder.build_return(None).map_err(|e| {
+                        CodegenError::new(format!("failed to build return for void wrapper: {}", e))
+                    })?;
+                } else {
+                    let ret_val = self.try_extract_result(call_res);
+                    self.builder.build_return(Some(&ret_val)).map_err(|e| {
+                        CodegenError::new(format!("failed to build return for wrapper: {}", e))
+                    })?;
+                }
+                
+                if let Some(bb) = saved_bb {
+                    self.builder.position_at_end(bb);
+                }
+            }
+            
             val
         };
 
@@ -5980,6 +6527,10 @@ impl<'ctx> CodeGen<'ctx> {
             BinOp::Sub => ("Sub", "sub"),
             BinOp::Mul => ("Mul", "mul"),
             BinOp::Div => ("Div", "div"),
+            BinOp::BitAnd => ("BitAnd", "bitand"),
+            BinOp::BitOr => ("BitOr", "bitor"),
+            BinOp::BitXor => ("BitXor", "bitxor"),
+            BinOp::Rem => ("Rem", "rem"),
             _ => return Err(format!("unsupported arithmetic operator {:?}", op).into()),
         };
 
@@ -7565,7 +8116,7 @@ impl<'ctx> CodeGen<'ctx> {
                 let rhs_val = self.compile_expr(rhs)?;
 
                 let result = match op {
-                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
+                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem | BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
                         self.compile_trait_arithmetic(op, lhs, rhs, lhs_val, rhs_val)?
                     }
                     _ => self.compile_trait_comparison(op, lhs, rhs, lhs_val, rhs_val)?,
@@ -10171,6 +10722,19 @@ impl<'ctx> CodeGen<'ctx> {
                                 Ok(ConstValue::Int(l / r))
                             }
                         }
+                        BinOp::Rem => {
+                            if r == 0 {
+                                Err(CodegenError::with_span(
+                                    "modulo by zero in const expression",
+                                    expr.span(),
+                                ))
+                            } else {
+                                Ok(ConstValue::Int(l % r))
+                            }
+                        }
+                        BinOp::BitAnd => Ok(ConstValue::Int(l & r)),
+                        BinOp::BitOr => Ok(ConstValue::Int(l | r)),
+                        BinOp::BitXor => Ok(ConstValue::Int(l ^ r)),
                         BinOp::Eq => Ok(ConstValue::Bool(l == r)),
                         BinOp::Neq => Ok(ConstValue::Bool(l != r)),
                         BinOp::Lt => Ok(ConstValue::Bool(l < r)),
@@ -10185,6 +10749,7 @@ impl<'ctx> CodeGen<'ctx> {
                         BinOp::Sub => Ok(ConstValue::Float(l - r)),
                         BinOp::Mul => Ok(ConstValue::Float(l * r)),
                         BinOp::Div => Ok(ConstValue::Float(l / r)),
+                        BinOp::Rem => Ok(ConstValue::Float(l % r)),
                         BinOp::Eq => Ok(ConstValue::Bool(l == r)),
                         BinOp::Neq => Ok(ConstValue::Bool(l != r)),
                         BinOp::Lt => Ok(ConstValue::Bool(l < r)),
@@ -11374,6 +11939,52 @@ impl<'ctx> CodeGen<'ctx> {
                                 CodegenError::new(format!("float-to-uint cast failed: {}", e))
                             })
                     }
+                }
+            }
+            BasicValueEnum::StructValue(src_struct) => {
+                if dst_llvm.is_struct_type() && src_struct.get_type() == dst_llvm.into_struct_type() {
+                    Ok(val)
+                } else {
+                    let alloca = self
+                        .builder
+                        .build_alloca(src_struct.get_type(), "struct_cast_alloca")
+                        .map_err(|e| CodegenError::new(format!("failed to build alloca for struct cast: {}", e)))?;
+                    self.builder
+                        .build_store(alloca, src_struct)
+                        .map_err(|e| CodegenError::new(format!("failed to store struct for cast: {}", e)))?;
+                    let casted_ptr = self
+                        .builder
+                        .build_bit_cast(alloca, self.context.ptr_type(AddressSpace::default()), "struct_cast_ptr")
+                        .map_err(|e| CodegenError::new(format!("failed to bitcast pointer for struct cast: {}", e)))?
+                        .into_pointer_value();
+                    let loaded = self
+                        .builder
+                        .build_load(dst_llvm, casted_ptr, "struct_cast_loaded")
+                        .map_err(|e| CodegenError::new(format!("failed to load struct after cast: {}", e)))?;
+                    Ok(loaded)
+                }
+            }
+            BasicValueEnum::ArrayValue(src_array) => {
+                if dst_llvm.is_array_type() && src_array.get_type() == dst_llvm.into_array_type() {
+                    Ok(val)
+                } else {
+                    let alloca = self
+                        .builder
+                        .build_alloca(src_array.get_type(), "array_cast_alloca")
+                        .map_err(|e| CodegenError::new(format!("failed to build alloca for array cast: {}", e)))?;
+                    self.builder
+                        .build_store(alloca, src_array)
+                        .map_err(|e| CodegenError::new(format!("failed to store array for cast: {}", e)))?;
+                    let casted_ptr = self
+                        .builder
+                        .build_bit_cast(alloca, self.context.ptr_type(AddressSpace::default()), "array_cast_ptr")
+                        .map_err(|e| CodegenError::new(format!("failed to bitcast pointer for array cast: {}", e)))?
+                        .into_pointer_value();
+                    let loaded = self
+                        .builder
+                        .build_load(dst_llvm, casted_ptr, "array_cast_loaded")
+                        .map_err(|e| CodegenError::new(format!("failed to load array after cast: {}", e)))?;
+                    Ok(loaded)
                 }
             }
             _ => Err(format!("unsupported value type for cast: val={:?}", val).into()),

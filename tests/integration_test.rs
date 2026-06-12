@@ -2898,4 +2898,105 @@ fn test_autoderef_indexing() {
     ));
 }
 
+#[test]
+fn test_fs_env_path_stdlib() {
+    assert!(run_test(
+        "fs_env_path_stdlib",
+        r#"
+        use std::path::PathBuf;
+        use std::env;
+        use std::fs;
+        use std::vec::Vec;
+        use std::string::String;
+        use std::io::println;
+        use std::panic::panic;
+
+        fn main() {
+            // 1. PathBuf tests
+            let mut pb = PathBuf::from("test_dir");
+            pb.push("subdir");
+            if pb.as_str() != "test_dir/subdir" {
+                panic("PathBuf push failed");
+            };
+
+            // 2. create_dir / remove_dir / metadata
+            let dir_path = "test_temp_dir_fs_test";
+            let create_res = fs::create_dir(dir_path);
+            if create_res.is_err() {
+                panic("create_dir failed");
+            };
+
+            let md = fs::metadata(dir_path).unwrap();
+            if !md.is_dir() {
+                panic("metadata is_dir failed");
+            };
+            if md.is_file() {
+                panic("metadata is_file failed");
+            };
+
+            // 3. chdir / current_dir
+            let orig_dir = env::current_dir().unwrap();
+            env::set_current_dir(dir_path).unwrap();
+            let new_dir = env::current_dir().unwrap();
+            if new_dir.as_str() == orig_dir.as_str() {
+                panic("set_current_dir did not change directory");
+            };
+
+            // Go back
+            env::set_current_dir(orig_dir.as_str()).unwrap();
+
+            // 4. write / read files
+            let file_path = "test_temp_dir_fs_test/test_file.txt";
+            let content = "Hello, ulang std::fs!";
+            fs::write(file_path, content).unwrap();
+
+            let file_md = fs::metadata(file_path).unwrap();
+            if !file_md.is_file() {
+                panic("file metadata is_file failed");
+            };
+            if file_md.len() != 21u64 {
+                panic("file metadata len failed");
+            };
+
+            let read_content = fs::read_to_string(file_path).unwrap();
+            if read_content.as_str() != content {
+                panic("read_to_string failed");
+            };
+
+            // 5. read_dir (listing)
+            let mut read_dir_iter = fs::read_dir("test_temp_dir_fs_test").unwrap();
+            let mut found_file = false;
+            
+            // Iterate using next()
+            let mut opt = read_dir_iter.next();
+            while opt.is_some() {
+                let entry = opt.unwrap().unwrap();
+                let name = entry.file_name();
+                if name.as_str() == "test_file.txt" {
+                    found_file = true;
+                };
+                opt = read_dir_iter.next();
+            };
+
+            if !found_file {
+                panic("read_dir failed to find file");
+            };
+
+            // 6. delete file & dir
+            fs::remove_file(file_path).unwrap();
+            let file_exists_md = fs::metadata(file_path);
+            if file_exists_md.is_ok() {
+                panic("remove_file failed (file still exists)");
+            };
+
+            fs::remove_dir(dir_path).unwrap();
+            let dir_exists_md = fs::metadata(dir_path);
+            if dir_exists_md.is_ok() {
+                panic("remove_dir failed (dir still exists)");
+            };
+        }
+        "#
+    ));
+}
+
 

@@ -1,0 +1,24 @@
+use std::io::println;
+
+fn main() {
+    let a = "hello";
+    let b = "world";
+    
+    if a == a {
+        println("a == a is true");
+    } else {
+        println("a == a is false");
+    };
+
+    if a == b {
+        println("a == b is true");
+    } else {
+        println("a == b is false");
+    };
+
+    if a != b {
+        println("a != b is true");
+    } else {
+        println("a != b is false");
+    };
+}

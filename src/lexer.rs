@@ -89,6 +89,14 @@ impl<'a> Lexer<'a> {
         // are clearer and just as fast as table-driven dispatch.
         // Spans are constructed after the match using `lo` and the advanced `pos`.
         let token = match c {
+            '%' => {
+                self.advance();
+                Token::Percent
+            }
+            '^' => {
+                self.advance();
+                Token::Caret
+            }
             '+' => {
                 self.advance();
                 Token::Plus

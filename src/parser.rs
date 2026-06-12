@@ -1879,7 +1879,7 @@ impl<'a> Parser<'a> {
     ///
     /// Precedence level: logical and < **comparison** < additive.
     fn parse_comparison(&mut self) -> Result<Expr, ParseError> {
-        let mut lhs = self.parse_additive()?;
+        let mut lhs = self.parse_bit_or()?;
         loop {
             let op = match self.peek_token() {
                 Token::EqEq => BinOp::Eq,
@@ -1891,7 +1891,7 @@ impl<'a> Parser<'a> {
                 _ => break,
             };
             self.advance();
-            let rhs = self.parse_additive()?;
+            let rhs = self.parse_bit_or()?;
             let span = Span::new(lhs.span().lo, rhs.span().hi);
             lhs = Expr::Binary {
                 op,
@@ -1902,6 +1902,67 @@ impl<'a> Parser<'a> {
         }
         Ok(lhs)
     }
+
+    fn parse_bit_or(&mut self) -> Result<Expr, ParseError> {
+        let mut lhs = self.parse_bit_xor()?;
+        loop {
+            if *self.peek_token() == Token::Pipe {
+                self.advance();
+                let rhs = self.parse_bit_xor()?;
+                let span = Span::new(lhs.span().lo, rhs.span().hi);
+                lhs = Expr::Binary {
+                    op: BinOp::BitOr,
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                    span,
+                };
+            } else {
+                break;
+            }
+        }
+        Ok(lhs)
+    }
+
+    fn parse_bit_xor(&mut self) -> Result<Expr, ParseError> {
+        let mut lhs = self.parse_bit_and()?;
+        loop {
+            if *self.peek_token() == Token::Caret {
+                self.advance();
+                let rhs = self.parse_bit_and()?;
+                let span = Span::new(lhs.span().lo, rhs.span().hi);
+                lhs = Expr::Binary {
+                    op: BinOp::BitXor,
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                    span,
+                };
+            } else {
+                break;
+            }
+        }
+        Ok(lhs)
+    }
+
+    fn parse_bit_and(&mut self) -> Result<Expr, ParseError> {
+        let mut lhs = self.parse_additive()?;
+        loop {
+            if *self.peek_token() == Token::Ampersand {
+                self.advance();
+                let rhs = self.parse_additive()?;
+                let span = Span::new(lhs.span().lo, rhs.span().hi);
+                lhs = Expr::Binary {
+                    op: BinOp::BitAnd,
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                    span,
+                };
+            } else {
+                break;
+            }
+        }
+        Ok(lhs)
+    }
+
 
     // Precedence: additive (+, -) — one level above term (multiplicative).
     /// Parse additive operators (`+`, `-`), left-associative.
@@ -2130,6 +2191,17 @@ impl<'a> Parser<'a> {
                     let span = Span::new(lhs.span().lo, rhs.span().hi);
                     lhs = Expr::Binary {
                         op: BinOp::Div,
+                        lhs: Box::new(lhs),
+                        rhs: Box::new(rhs),
+                        span,
+                    };
+                }
+                Token::Percent => {
+                    self.advance();
+                    let rhs = self.parse_primary_as()?;
+                    let span = Span::new(lhs.span().lo, rhs.span().hi);
+                    lhs = Expr::Binary {
+                        op: BinOp::Rem,
                         lhs: Box::new(lhs),
                         rhs: Box::new(rhs),
                         span,
@@ -3361,7 +3433,7 @@ impl<'a> Parser<'a> {
     /// Walk the entire program AST and resolve all type alias references.
     /// Replaces Type::Struct(name) where `name` is a simple alias, and
     /// Type::Alias(name, args) where `name` is a generic alias.
-    fn resolve_type_aliases(&self, program: &mut Program) -> Result<(), ParseError> {
+    pub fn resolve_type_aliases(&self, program: &mut Program) -> Result<(), ParseError> {
         // Clone alias data to avoid borrow conflicts
         let alias_defs: HashMap<String, TypeAliasDecl> = program
             .type_aliases
@@ -3370,6 +3442,9 @@ impl<'a> Parser<'a> {
             .collect();
 
         for func in &mut program.funcs {
+            for param in &mut func.type_params {
+                self.resolve_types_in_generic_param(param, &alias_defs)?;
+            }
             for param in &mut func.params {
                 self.resolve_type_in_place_owned(&mut param.ty, &alias_defs, &mut HashSet::new())?;
             }
@@ -3380,11 +3455,27 @@ impl<'a> Parser<'a> {
             self.resolve_types_in_block(&mut func.body, &alias_defs)?;
         }
         for s in &mut program.structs {
+            for param in &mut s.type_params {
+                self.resolve_types_in_generic_param(param, &alias_defs)?;
+            }
             for field in &mut s.fields {
                 self.resolve_type_in_place_owned(&mut field.ty, &alias_defs, &mut HashSet::new())?;
             }
         }
+        for e in &mut program.enums {
+            for param in &mut e.type_params {
+                self.resolve_types_in_generic_param(param, &alias_defs)?;
+            }
+            for variant in &mut e.variants {
+                if let Some(ref mut ty) = variant.ty {
+                    self.resolve_type_in_place_owned(ty, &alias_defs, &mut HashSet::new())?;
+                }
+            }
+        }
         for t in &mut program.traits {
+            for param in &mut t.type_params {
+                self.resolve_types_in_generic_param(param, &alias_defs)?;
+            }
             for method in &mut t.methods {
                 for param in &mut method.params {
                     self.resolve_type_in_place_owned(
@@ -3396,10 +3487,19 @@ impl<'a> Parser<'a> {
                 if let Some(ref mut ret) = method.return_type {
                     self.resolve_type_in_place_owned(ret, &alias_defs, &mut HashSet::new())?;
                 }
+                if let Some(ref mut body) = method.body {
+                    self.resolve_types_in_block(body, &alias_defs)?;
+                }
             }
         }
         for i in &mut program.impls {
+            for param in &mut i.type_params {
+                self.resolve_types_in_generic_param(param, &alias_defs)?;
+            }
             self.resolve_type_in_place_owned(&mut i.impl_type, &alias_defs, &mut HashSet::new())?;
+            for arg in &mut i.trait_args {
+                self.resolve_type_in_place_owned(arg, &alias_defs, &mut HashSet::new())?;
+            }
             for method in &mut i.methods {
                 for param in &mut method.params {
                     self.resolve_type_in_place_owned(
@@ -3411,10 +3511,18 @@ impl<'a> Parser<'a> {
                 if let Some(ref mut ret) = method.return_type {
                     self.resolve_type_in_place_owned(ret, &alias_defs, &mut HashSet::new())?;
                 }
+                self.resolve_types_in_block(&mut method.body, &alias_defs)?;
+            }
+            for c in &mut i.consts {
+                self.resolve_type_in_place_owned(&mut c.ty, &alias_defs, &mut HashSet::new())?;
+                self.resolve_types_in_expr(&mut c.value, &alias_defs)?;
             }
         }
         // Also resolve within the alias definitions themselves (for chained aliases)
         for alias in &mut program.type_aliases {
+            for param in &mut alias.type_params {
+                self.resolve_types_in_generic_param(param, &alias_defs)?;
+            }
             self.resolve_type_in_place_owned(
                 &mut alias.aliased_type,
                 &alias_defs,
@@ -3429,6 +3537,19 @@ impl<'a> Parser<'a> {
             }
         }
 
+        Ok(())
+    }
+
+    fn resolve_types_in_generic_param(
+        &self,
+        param: &mut GenericParam,
+        aliases: &HashMap<String, TypeAliasDecl>,
+    ) -> Result<(), ParseError> {
+        for bound in &mut param.bounds {
+            for arg in &mut bound.generic_args {
+                self.resolve_type_in_place_owned(arg, aliases, &mut HashSet::new())?;
+            }
+        }
         Ok(())
     }
 
@@ -3495,8 +3616,32 @@ impl<'a> Parser<'a> {
                 // Unknown alias — let codegen produce the error
                 Ok(())
             }
-            Type::GenericInstance(_name, args) => {
-                // Resolve type args within the generic instance
+            Type::GenericInstance(name, args) => {
+                if let Some(alias) = aliases.get(name) {
+                    if args.len() != alias.type_params.len() {
+                        return Err(ParseError {
+                            span: alias.span,
+                            msg: format!(
+                                "type alias `{}` expects {} type arguments, got {}",
+                                name,
+                                alias.type_params.len(),
+                                args.len()
+                            ),
+                        });
+                    }
+                    if !visiting.insert(name.clone()) {
+                        return Err(ParseError {
+                            span: alias.span,
+                            msg: format!("cyclic type alias `{}`", name),
+                        });
+                    }
+                    let mut substituted = alias.aliased_type.clone();
+                    let param_names: Vec<String> =
+                        alias.type_params.iter().map(|p| p.name.clone()).collect();
+                    Self::substitute_type_params(&mut substituted, &param_names, args);
+                    *ty = substituted;
+                    return self.resolve_type_in_place_owned(ty, aliases, visiting);
+                }
                 for arg in args.iter_mut() {
                     self.resolve_type_in_place_owned(arg, aliases, visiting)?;
                 }
@@ -3558,6 +3703,186 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn resolve_alias_name(&self, name: &str, aliases: &HashMap<String, TypeAliasDecl>) -> String {
+        let mut current = name.to_string();
+        let mut visiting = HashSet::new();
+        while let Some(alias) = aliases.get(&current) {
+            if !visiting.insert(current.clone()) {
+                break; // cycle
+            }
+            match &alias.aliased_type {
+                Type::Struct(base) => {
+                    current = base.clone();
+                }
+                Type::GenericInstance(base, _) => {
+                    current = base.clone();
+                }
+                Type::Alias(base, _) => {
+                    current = base.clone();
+                }
+                _ => break,
+            }
+        }
+        current
+    }
+
+    fn resolve_types_in_pattern(
+        &self,
+        pat: &mut Pattern,
+        aliases: &HashMap<String, TypeAliasDecl>,
+    ) -> Result<(), ParseError> {
+        match pat {
+            Pattern::EnumVariant { enum_name: Some(name), payload, .. } => {
+                *name = self.resolve_alias_name(name, aliases);
+                if let Some(p) = payload {
+                    self.resolve_types_in_pattern(p, aliases)?;
+                }
+            }
+            Pattern::EnumVariant { payload: Some(p), .. } => {
+                self.resolve_types_in_pattern(p, aliases)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn resolve_types_in_expr(
+        &self,
+        expr: &mut Expr,
+        aliases: &HashMap<String, TypeAliasDecl>,
+    ) -> Result<(), ParseError> {
+        match expr {
+            Expr::BoolLit(_, _) | Expr::IntLit(_, _) | Expr::FloatLit(_, _) | Expr::StrLit(_, _) | Expr::Ident(_, _) | Expr::Unit(_) => {}
+            Expr::Call { args, type_args, .. } => {
+                for arg in args {
+                    self.resolve_types_in_expr(arg, aliases)?;
+                }
+                for ty in type_args {
+                    self.resolve_type_in_place_owned(ty, aliases, &mut HashSet::new())?;
+                }
+            }
+            Expr::QualifiedCall { module, args, type_args, .. } => {
+                *module = self.resolve_alias_name(module, aliases);
+                for arg in args {
+                    self.resolve_types_in_expr(arg, aliases)?;
+                }
+                for ty in type_args {
+                    self.resolve_type_in_place_owned(ty, aliases, &mut HashSet::new())?;
+                }
+            }
+            Expr::Binary { lhs, rhs, .. } => {
+                self.resolve_types_in_expr(lhs, aliases)?;
+                self.resolve_types_in_expr(rhs, aliases)?;
+            }
+            Expr::Assign { target, value, .. } => {
+                self.resolve_types_in_expr(target, aliases)?;
+                self.resolve_types_in_expr(value, aliases)?;
+            }
+            Expr::Ref { expr: inner, .. } => {
+                self.resolve_types_in_expr(inner, aliases)?;
+            }
+            Expr::UnaryNot(inner, _) => {
+                self.resolve_types_in_expr(inner, aliases)?;
+            }
+            Expr::UnaryMinus(inner, _) => {
+                self.resolve_types_in_expr(inner, aliases)?;
+            }
+            Expr::Deref(inner, _) => {
+                self.resolve_types_in_expr(inner, aliases)?;
+            }
+            Expr::Cast { expr: inner, to_type, .. } => {
+                self.resolve_types_in_expr(inner, aliases)?;
+                self.resolve_type_in_place_owned(to_type, aliases, &mut HashSet::new())?;
+            }
+            Expr::Tuple(elems, _) => {
+                for elem in elems {
+                    self.resolve_types_in_expr(elem, aliases)?;
+                }
+            }
+            Expr::Member { expr: inner, .. } => {
+                self.resolve_types_in_expr(inner, aliases)?;
+            }
+            Expr::MethodCall { expr: receiver, args, type_args, .. } => {
+                self.resolve_types_in_expr(receiver, aliases)?;
+                for arg in args {
+                    self.resolve_types_in_expr(arg, aliases)?;
+                }
+                for ty in type_args {
+                    self.resolve_type_in_place_owned(ty, aliases, &mut HashSet::new())?;
+                }
+            }
+            Expr::StructLit { struct_name, fields, .. } => {
+                *struct_name = self.resolve_alias_name(struct_name, aliases);
+                for (_, f_expr) in fields {
+                    self.resolve_types_in_expr(f_expr, aliases)?;
+                }
+            }
+            Expr::EnumLit { enum_name, payload, .. } => {
+                *enum_name = self.resolve_alias_name(enum_name, aliases);
+                if let Some(p) = payload {
+                    self.resolve_types_in_expr(p, aliases)?;
+                }
+            }
+            Expr::If { cond, then_block, else_ifs, else_block, .. } => {
+                self.resolve_types_in_expr(cond, aliases)?;
+                self.resolve_types_in_block(then_block, aliases)?;
+                for (elif_cond, elif_block) in else_ifs {
+                    self.resolve_types_in_expr(elif_cond, aliases)?;
+                    self.resolve_types_in_block(elif_block, aliases)?;
+                }
+                if let Some(eb) = else_block {
+                    self.resolve_types_in_block(eb, aliases)?;
+                }
+            }
+            Expr::Loop { body, .. } => {
+                self.resolve_types_in_block(body, aliases)?;
+            }
+            Expr::While { cond, body, .. } => {
+                self.resolve_types_in_expr(cond, aliases)?;
+                self.resolve_types_in_block(body, aliases)?;
+            }
+            Expr::For { pattern, container, body, .. } => {
+                self.resolve_types_in_pattern(pattern, aliases)?;
+                self.resolve_types_in_expr(container, aliases)?;
+                self.resolve_types_in_block(body, aliases)?;
+            }
+            Expr::Array(elems, _) => {
+                for elem in elems {
+                    self.resolve_types_in_expr(elem, aliases)?;
+                }
+            }
+            Expr::Repeat(inner, _, _) => {
+                self.resolve_types_in_expr(inner, aliases)?;
+            }
+            Expr::Index { array, index, .. } => {
+                self.resolve_types_in_expr(array, aliases)?;
+                self.resolve_types_in_expr(index, aliases)?;
+            }
+            Expr::IfLet { pattern, scrutinee, then_block, else_block, .. } => {
+                self.resolve_types_in_pattern(pattern, aliases)?;
+                self.resolve_types_in_expr(scrutinee, aliases)?;
+                self.resolve_types_in_block(then_block, aliases)?;
+                if let Some(eb) = else_block {
+                    self.resolve_types_in_block(eb, aliases)?;
+                }
+            }
+            Expr::Match { scrutinee, arms, .. } => {
+                self.resolve_types_in_expr(scrutinee, aliases)?;
+                for arm in arms {
+                    self.resolve_types_in_pattern(&mut arm.pattern, aliases)?;
+                    if let Some(ref mut guard) = arm.guard {
+                        self.resolve_types_in_expr(guard, aliases)?;
+                    }
+                    self.resolve_types_in_block(&mut arm.body, aliases)?;
+                }
+            }
+            Expr::Block(block, _) => {
+                self.resolve_types_in_block(block, aliases)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Resolve types within a block body: type annotations, cast types,
     /// and recurse into nested blocks (if, loop, while).
     fn resolve_types_in_block(
@@ -3568,24 +3893,49 @@ impl<'a> Parser<'a> {
         for stmt in &mut body.stmts {
             match stmt {
                 Stmt::Let {
+                    pattern,
                     type_ann,
+                    init,
                     else_block,
                     ..
                 } => {
+                    self.resolve_types_in_pattern(pattern, aliases)?;
                     if let Some(ty) = type_ann {
                         self.resolve_type_in_place_owned(ty, aliases, &mut HashSet::new())?;
                     }
+                    self.resolve_types_in_expr(init, aliases)?;
                     if let Some(el_block) = else_block {
                         self.resolve_types_in_block(el_block, aliases)?;
                     }
                 }
                 Stmt::Const {
-                    type_ann: Some(ty), ..
+                    type_ann,
+                    init,
+                    ..
                 } => {
-                    self.resolve_type_in_place_owned(ty, aliases, &mut HashSet::new())?;
+                    if let Some(ty) = type_ann {
+                        self.resolve_type_in_place_owned(ty, aliases, &mut HashSet::new())?;
+                    }
+                    self.resolve_types_in_expr(init, aliases)?;
                 }
-                _ => {}
+                Stmt::Expr(expr) => {
+                    self.resolve_types_in_expr(expr, aliases)?;
+                }
+                Stmt::Return { value, .. } => {
+                    if let Some(val) = value {
+                        self.resolve_types_in_expr(val, aliases)?;
+                    }
+                }
+                Stmt::Break { value, .. } => {
+                    if let Some(val) = value {
+                        self.resolve_types_in_expr(val, aliases)?;
+                    }
+                }
+                Stmt::Continue { .. } => {}
             }
+        }
+        if let Some(ref mut tail) = body.tail_expr {
+            self.resolve_types_in_expr(tail, aliases)?;
         }
         Ok(())
     }

@@ -28,3 +28,20 @@ pub trait IndexMut<Idx, T> {
 pub trait Deref<Target> {
     fn deref(&self) -> &Target;
 }
+
+pub trait BitAnd {
+    fn bitand(&self, other: &Self) -> Self;
+}
+
+pub trait BitOr {
+    fn bitor(&self, other: &Self) -> Self;
+}
+
+pub trait BitXor {
+    fn bitxor(&self, other: &Self) -> Self;
+}
+
+pub trait Rem {
+    fn rem(&self, other: &Self) -> Self;
+}
+

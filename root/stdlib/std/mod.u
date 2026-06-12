@@ -7,6 +7,10 @@ pub mod panic;
 pub mod process;
 pub mod string;
 pub mod vec;
+pub mod env;
+pub mod fs;
+pub mod path;
+
 
 // Re-exported core modules
 pub use core::clone;

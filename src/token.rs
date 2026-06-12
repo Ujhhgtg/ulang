@@ -131,6 +131,8 @@ mod tests {
         assert_eq!(Token::AndAnd, Token::AndAnd);
         assert_eq!(Token::OrOr, Token::OrOr);
         assert_eq!(Token::Pipe, Token::Pipe);
+        assert_eq!(Token::Percent, Token::Percent);
+        assert_eq!(Token::Caret, Token::Caret);
         assert_eq!(Token::Eof, Token::Eof);
     }
 }
@@ -318,6 +320,10 @@ pub enum Token {
     Match,
     /// The `=>` punctuation — match arm arrow.
     FatArrow, // =>
+    /// The `%` operator — remainder/modulo.
+    Percent,
+    /// The `^` operator — bitwise XOR.
+    Caret,
     // Special
     /// End-of-file sentinel — emitted when the lexer reaches the end of input.
     Eof,

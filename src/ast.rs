@@ -556,6 +556,14 @@ pub enum BinOp {
     And,
     /// The `||` operator — logical OR.
     Or,
+    /// The `&` operator — bitwise AND.
+    BitAnd,
+    /// The `|` operator — bitwise OR.
+    BitOr,
+    /// The `^` operator — bitwise XOR.
+    BitXor,
+    /// The `%` operator — remainder/modulo.
+    Rem,
 }
 
 /// A struct type declaration.

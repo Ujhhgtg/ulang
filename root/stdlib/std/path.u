@@ -1,0 +1,47 @@
+use std::string::String;
+
+pub struct PathBuf {
+    pub string: String,
+}
+
+impl PathBuf {
+    pub fn new() -> PathBuf {
+        PathBuf { string: String::new() }
+    }
+
+    pub fn from(s: &str) -> PathBuf {
+        PathBuf { string: s.to_string() }
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.string.as_str()
+    }
+
+    pub fn display(&self) -> &str {
+        self.as_str()
+    }
+
+    pub fn push(&mut self, path: &str) {
+        if self.string.is_empty() {
+            self.string.push_str(path);
+            return;
+        };
+        let self_len = self.string.len();
+        let ends_with_slash = if self_len > 0 {
+            let last_char = *( (self.string.as_ptr() as usize + self_len - 1) as *const u8 );
+            last_char == 47u8
+        } else {
+            false
+        };
+        let starts_with_slash = if path.len() > 0 {
+            let first_char = *(path.0);
+            first_char == 47u8
+        } else {
+            false
+        };
+        if !ends_with_slash && !starts_with_slash {
+            self.string.push_str("/");
+        };
+        self.string.push_str(path);
+    }
+}

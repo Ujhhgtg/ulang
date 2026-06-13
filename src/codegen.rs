@@ -4659,13 +4659,29 @@ impl<'ctx> CodeGen<'ctx> {
                     .get(&mangled)
                     .copied()
                     .unwrap_or_else(|| {
-                        self.struct_types.get(name).copied().unwrap_or_else(|| {
-                            panic!(
-                                "unknown generic struct instance '{}' — known types: {:?}",
-                                mangled,
-                                self.struct_types.keys().collect::<Vec<_>>()
-                            )
-                        })
+                        // Fallback 1: look up by exact base name
+                        if let Some(ty) = self.struct_types.get(name).copied() {
+                            return ty;
+                        }
+                        // Fallback 2: search all keys by suffix (handles prefix mismatch like "result::Result" -> "fs::result::Result")
+                        let suffix = mangled.splitn(2, "__").nth(1).unwrap_or("").to_string();
+                        for (k, v) in self.struct_types.iter() {
+                            if k.ends_with(&suffix) && k.contains(name.rsplit_once("::").map_or(name.as_str(), |(_, l)| l)) {
+                                return *v;
+                            }
+                        }
+                        // Fallback 3: try just the base name suffix match
+                        let last_seg = name.rsplit_once("::").map_or("", |(_, l)| l);
+                        for (k, v) in self.struct_types.iter() {
+                            if k.ends_with(last_seg) {
+                                return *v;
+                            }
+                        }
+                        panic!(
+                            "unknown generic struct instance '{}' — known types: {:?}",
+                            mangled,
+                            self.struct_types.keys().collect::<Vec<_>>()
+                        )
                     })
                     .into()
             }
@@ -5241,10 +5257,15 @@ impl<'ctx> CodeGen<'ctx> {
                 }
                 let qualified_name = format!("{}::{}", module, callee);
                 let mangled_name = format!("{}::{}/{}", module, callee, args.len());
+                let arg_types: Vec<Type> = args.iter().map(|a| self.expr_type(a)).collect();
                 let mut name = if self.module.get_function(&qualified_name).is_some() {
                     qualified_name
                 } else if self.module.get_function(&mangled_name).is_some() {
                     mangled_name
+                } else if let Some(fn_val) = self.resolve_function(&qualified_name, &arg_types) {
+                    fn_val.get_name().to_string_lossy().to_string()
+                } else if let Some(fn_val) = self.resolve_function(&mangled_name, &arg_types) {
+                    fn_val.get_name().to_string_lossy().to_string()
                 } else {
                     qualified_name
                 };
@@ -5271,7 +5292,6 @@ impl<'ctx> CodeGen<'ctx> {
                         }
                     }
                     // Infer any remaining (unmapped) type parameters from arguments
-                    let arg_types: Vec<Type> = args.iter().map(|a| self.expr_type(a)).collect();
                     for (param, arg_ty) in gen_func.params.iter().zip(&arg_types) {
                         for name in &param_names {
                             if !mappings.contains_key(name) {
@@ -9566,6 +9586,13 @@ impl<'ctx> CodeGen<'ctx> {
                     self.struct_types
                         .get(&actual_name)
                         .copied()
+                        .or_else(|| {
+                            // Fallback: search by suffix (handles prefix mismatch)
+                            let last = actual_name.rsplit_once("::").map_or("", |(_, l)| l);
+                            self.struct_types.iter().find_map(|(k, v)| {
+                                if k.ends_with(last) { Some(*v) } else { None }
+                            })
+                        })
                         .ok_or_else(|| {
                             CodegenError::new(format!("unknown enum type '{}'", actual_name))
                         })?;

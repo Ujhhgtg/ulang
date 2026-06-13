@@ -770,14 +770,12 @@ fn resolve_module_uses(
     all_impls: &mut Vec<ImplDecl>,
     all_funcs: &mut HashMap<String, Function>,
     all_overloads: &mut OverloadMap,
-    all_aliases: &mut HashMap<String, TypeAliasDecl>,
     canonical_struct_sources: &HashMap<String, String>,
     resolving: &mut HashSet<String>,
-    parent_prefix: &str,
 ) {
     for use_decl in &program.uses {
         let path = &use_decl.path;
-        if path.len() < 2 || !(path[0] == "std" || path[0] == "core") {
+        if path.len() < 3 || !(path[0] == "std" || path[0] == "core") {
             continue;
         }
         let module_name = &path[1];
@@ -785,108 +783,68 @@ fn resolve_module_uses(
             continue; // already resolving/processed
         }
         if let Some(prog) = all_stdlib_progs.get(module_name) {
-            let prefix = if parent_prefix.is_empty() {
-                if !use_decl.module_path.is_empty() {
-                    format!("{}::", use_decl.module_path.join("::"))
-                } else {
-                    String::new()
-                }
-            } else {
-                if !use_decl.module_path.is_empty() {
-                    format!("{}::{}::", parent_prefix, use_decl.module_path.join("::"))
-                } else {
-                    format!("{}::", parent_prefix)
-                }
-            };
-
-            let qualify_prefix = if path.len() == 2 {
-                if prefix.is_empty() {
-                    module_name.clone()
-                } else {
-                    format!("{}{}", prefix, module_name)
-                }
-            } else {
-                if prefix.ends_with("::") {
-                    prefix[..prefix.len() - 2].to_string()
-                } else {
-                    prefix.clone()
-                }
-            };
-
-            let mut dep_prog = prog.clone();
-            qualify_imported_stdlib_program(&mut dep_prog, &qualify_prefix);
-
-            // Qualify items of dep_prog
-            if !qualify_prefix.is_empty() {
-                for s in &mut dep_prog.structs {
-                    s.name = format!("{}::{}", qualify_prefix, s.name);
-                }
-                for e in &mut dep_prog.enums {
-                    e.name = format!("{}::{}", qualify_prefix, e.name);
-                }
-                for t in &mut dep_prog.traits {
-                    t.name = format!("{}::{}", qualify_prefix, t.name);
-                }
-                for a in &mut dep_prog.type_aliases {
-                    a.name = format!("{}::{}", qualify_prefix, a.name);
-                }
-                for f in &mut dep_prog.funcs {
-                    if !f.name.starts_with(&format!("{}::", qualify_prefix)) {
-                        f.name = format!("{}::{}", qualify_prefix, f.name);
-                    }
-                }
-            }
-
             // First, resolve the dependency's own uses (recursive)
             resolve_module_uses(
-                &dep_prog,
+                prog,
                 all_stdlib_progs,
                 all_structs,
                 all_enums,
                 all_impls,
                 all_funcs,
                 all_overloads,
-                all_aliases,
                 canonical_struct_sources,
                 resolving,
-                &qualify_prefix,
             );
-
             // Import all structs from this dependency
-            for decl in &dep_prog.structs {
+            for decl in &prog.structs {
                 all_structs
                     .entry(decl.name.clone())
                     .or_insert_with(|| decl.clone());
             }
             // Import all enums from this dependency
-            for decl in &dep_prog.enums {
+            for decl in &prog.enums {
                 all_enums
                     .entry(decl.name.clone())
                     .or_insert_with(|| decl.clone());
             }
             // Import all impls
-            for decl in &dep_prog.impls {
+            for decl in &prog.impls {
                 all_impls.push(decl.clone());
             }
-            // Import overloads
-            let (module_funcs, module_overloads) = process_stdlib_functions(dep_prog.funcs.clone());
-            for (base_name, overloads_list) in &module_overloads {
-                all_overloads.insert(base_name.clone(), overloads_list.clone());
-            }
             // Import all functions (including extern "C" declarations)
-            for func in &module_funcs {
+            for func in &prog.funcs {
                 if !all_funcs.contains_key(&func.name) {
                     all_funcs.insert(func.name.clone(), func.clone());
                 }
             }
-            // Import all type aliases from this dependency
-            for decl in &dep_prog.type_aliases {
-                all_aliases
-                    .entry(decl.name.clone())
-                    .or_insert_with(|| decl.clone());
+            // Import overloads
+            if path.len() >= 3 {
+                let _target_name = &path[2];
+                let (_module_funcs, module_overloads) =
+                    process_stdlib_functions(prog.funcs.clone());
+                for (base_name, overloads_list) in &module_overloads {
+                    let qualified_base = format!("{}::{}", module_name, base_name);
+                    let qualified_list: Vec<(String, Vec<Type>)> = overloads_list
+                        .iter()
+                        .map(|(mangled, params)| {
+                            (format!("{}::{}", module_name, mangled), params.clone())
+                        })
+                        .collect();
+                    all_overloads.insert(qualified_base, qualified_list);
+                }
+            }
+            // Import impls that match this module's structs
+            for impl_decl in &prog.impls {
+                let impl_type_name = match &impl_decl.impl_type {
+                    Type::Struct(name) => name.clone(),
+                    Type::GenericInstance(name, _) => name.clone(),
+                    _ => continue,
+                };
+                if all_structs.contains_key(&impl_type_name) {
+                    // Already imported above, skip
+                }
             }
         }
-        resolving.remove(module_name);
     }
 }
 
@@ -1050,8 +1008,6 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
             let is_core = path[0] == "core";
             // --- Stdlib import branch ---
             if is_std || is_core {
-                let mut use_decl = use_decl.clone();
-                use_decl.is_pub = true;
                 if is_std && no_std {
                     eprintln!(
                         "error: use of std::{} requires the standard library (use --no-std)",
@@ -1093,22 +1049,6 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
                     .entry(module_name.clone())
                     .or_insert_with(|| stdlib_prog.clone());
 
-                let prefix = if !use_decl.module_path.is_empty() {
-                    format!("{}::", use_decl.module_path.join("::"))
-                } else {
-                    String::new()
-                };
-
-                let qualify_prefix = if path.len() == 2 {
-                    if prefix.is_empty() {
-                        module_name.clone()
-                    } else {
-                        format!("{}{}", prefix, module_name)
-                    }
-                } else {
-                    prefix.clone()
-                };
-
                 // Resolve this module's own transitive use declarations (recursive)
                 // Recursively resolve this module's internal use declarations
                 let mut resolving_modules = HashSet::new();
@@ -1121,19 +1061,20 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
                     &mut all_impls,
                     &mut all_funcs,
                     &mut all_overloads,
-                    &mut all_aliases,
                     &canonical_struct_sources,
                     &mut resolving_modules,
-                    &qualify_prefix,
                 );
-
-                let mut stdlib_prog = stdlib_prog.clone();
-                qualify_imported_stdlib_program(&mut stdlib_prog, &qualify_prefix);
 
                 // Mangle duplicate function names with $N suffix and build overload map
                 // Process duplicates and build overload map for this module
                 let (module_funcs, module_overloads) =
                     process_stdlib_functions(stdlib_prog.funcs.clone());
+
+                let prefix = if !use_decl.module_path.is_empty() {
+                    format!("{}::", use_decl.module_path.join("::"))
+                } else {
+                    String::new()
+                };
 
                 if path.len() == 2 {
                     // Namespace import: use std::string;
@@ -1222,31 +1163,15 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
                             all_funcs.insert(func.name.clone(), func.clone());
                         }
                     }
-                    // Import all type aliases from the module
-                    for decl in &stdlib_prog.type_aliases {
-                        let new_name = if prefix.is_empty() {
-                            format!("{}::{}", imported_module_name, decl.name)
-                        } else {
-                            format!("{}{}", prefix, decl.name)
-                        };
-                        let mut new_decl = decl.clone();
-                        new_decl.name = new_name.clone();
-                        new_decl.is_pub = use_decl.is_pub;
-                        all_aliases.entry(new_name).or_insert(new_decl);
-                    }
                 } else {
                     // Direct import: use std::string::String or std::io::println
                     // Single item lookup: struct, enum, trait, overloaded function, or plain function
                     // Direct import: use std::string::String or std::io::println
                     let target_name = &path[2];
 
-                    // Check if target is a struct, enum, or type alias in the module
+                    // Check if target is a struct or enum in the module
                     let is_struct = stdlib_prog.structs.iter().any(|s| s.name == *target_name);
                     let is_enum = stdlib_prog.enums.iter().any(|e| e.name == *target_name);
-                    let is_alias = stdlib_prog
-                        .type_aliases
-                        .iter()
-                        .any(|a| a.name == *target_name);
 
                     if is_struct {
                         // Import the struct
@@ -1422,22 +1347,6 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
                         for func in &module_funcs {
                             if func.is_extern && !all_funcs.contains_key(&func.name) {
                                 all_funcs.insert(func.name.clone(), func.clone());
-                            }
-                        }
-                    } else if is_alias {
-                        // Import the type alias
-                        for decl in &stdlib_prog.type_aliases {
-                            if decl.name == *target_name {
-                                let new_name = if prefix.is_empty() {
-                                    decl.name.clone()
-                                } else {
-                                    format!("{}{}", prefix, decl.name)
-                                };
-                                let mut new_decl = decl.clone();
-                                new_decl.name = new_name.clone();
-                                new_decl.is_pub = use_decl.is_pub;
-                                all_aliases.entry(new_name).or_insert(new_decl);
-                                break;
                             }
                         }
                     } else if stdlib_prog.traits.iter().any(|t| t.name == *target_name) {
@@ -1825,10 +1734,8 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
                 &mut all_impls,
                 &mut all_funcs,
                 &mut all_overloads,
-                &mut all_aliases,
                 &canonical_struct_sources,
                 &mut resolving_modules,
-                "",
             );
             for i in &prog.impls {
                 let is_always_accessible = match &i.impl_type {
@@ -1863,24 +1770,19 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
     }
 
     // Build the final Program with all resolved items and empty uses/modules
-    let mut final_program = Program {
-        uses: Vec::new(), // cleared after resolution
-        modules: Vec::new(),
-        funcs: all_funcs.into_values().collect(),
-        structs: all_structs.into_values().collect(),
-        enums: all_enums.into_values().collect(),
-        traits: all_traits.into_values().collect(),
-        impls: all_impls,
-        type_aliases: all_aliases.into_values().collect(),
-    };
-
-    let parser = parser::Parser::new(&[]);
-    if let Err(e) = parser.resolve_type_aliases(&mut final_program) {
-        eprintln!("type alias resolution error: {}", e.msg);
-        process::exit(1);
-    };
-
-    (final_program, all_overloads)
+    (
+        Program {
+            uses: Vec::new(), // cleared after resolution
+            modules: Vec::new(),
+            funcs: all_funcs.into_values().collect(),
+            structs: all_structs.into_values().collect(),
+            enums: all_enums.into_values().collect(),
+            traits: all_traits.into_values().collect(),
+            impls: all_impls,
+            type_aliases: all_aliases.into_values().collect(),
+        },
+        all_overloads,
+    )
 }
 
 fn main() {
@@ -2309,20 +2211,10 @@ fn qualify_type(ty: &mut Type, local_types: &HashSet<String>, prefix: &str) {
         Type::Struct(name) => {
             if local_types.contains(name) {
                 *name = format!("{}::{}", prefix, name);
-            } else if let Some((_, last)) = name.rsplit_once("::")
-                && !name.starts_with(&format!("{}::", prefix))
-                && local_types.contains(last)
-            {
-                *name = format!("{}::{}", prefix, name);
             }
         }
         Type::GenericInstance(name, args) => {
             if local_types.contains(name) {
-                *name = format!("{}::{}", prefix, name);
-            } else if let Some((_, last)) = name.rsplit_once("::")
-                && !name.starts_with(&format!("{}::", prefix))
-                && local_types.contains(last)
-            {
                 *name = format!("{}::{}", prefix, name);
             }
             for arg in args {
@@ -2331,11 +2223,6 @@ fn qualify_type(ty: &mut Type, local_types: &HashSet<String>, prefix: &str) {
         }
         Type::Alias(name, args) => {
             if local_types.contains(name) {
-                *name = format!("{}::{}", prefix, name);
-            } else if let Some((_, last)) = name.rsplit_once("::")
-                && !name.starts_with(&format!("{}::", prefix))
-                && local_types.contains(last)
-            {
                 *name = format!("{}::{}", prefix, name);
             }
             for arg in args {
@@ -3019,133 +2906,6 @@ fn qualify_block(
             submodules,
             top_level_modules,
         );
-    }
-}
-
-fn qualify_imported_stdlib_program(prog: &mut Program, prefix: &str) {
-    if prefix.is_empty() {
-        return;
-    }
-    // Gather local types and functions of this stdlib program
-    let mut local_types: HashSet<String> = prog
-        .structs
-        .iter()
-        .map(|s| s.name.clone())
-        .chain(prog.enums.iter().map(|e| e.name.clone()))
-        .chain(prog.traits.iter().map(|t| t.name.clone()))
-        .chain(prog.type_aliases.iter().map(|a| a.name.clone()))
-        .collect();
-    let mut local_funcs: HashSet<String> = prog.funcs.iter().map(|f| f.name.clone()).collect();
-
-    // Also add imported names
-    for use_decl in &prog.uses {
-        if use_decl.path.len() >= 2 {
-            let last = use_decl.path.last().unwrap();
-            if last.chars().next().unwrap().is_uppercase() {
-                local_types.insert(last.clone());
-            } else {
-                local_funcs.insert(last.clone());
-            }
-        }
-    }
-
-    let current_path: Vec<String> = prefix.split("::").map(|s| s.to_string()).collect();
-    let mut local_modules = HashSet::new();
-    for use_decl in &prog.uses {
-        if use_decl.path.len() >= 2 {
-            let last = use_decl.path.last().unwrap();
-            local_modules.insert(last.clone());
-        }
-    }
-
-    // Now qualify all items inside the program using `prefix`!
-    for s in &mut prog.structs {
-        for field in &mut s.fields {
-            qualify_type(&mut field.ty, &local_types, prefix);
-        }
-    }
-    for e in &mut prog.enums {
-        for variant in &mut e.variants {
-            if let Some(ref mut ty) = variant.ty {
-                qualify_type(ty, &local_types, prefix);
-            }
-        }
-    }
-    for t in &mut prog.traits {
-        for method in &mut t.methods {
-            for param in &mut method.params {
-                qualify_type(&mut param.ty, &local_types, prefix);
-            }
-            if let Some(ref mut ret) = method.return_type {
-                qualify_type(ret, &local_types, prefix);
-            }
-        }
-        for c in &mut t.consts {
-            qualify_type(&mut c.ty, &local_types, prefix);
-            if let Some(ref mut val) = c.default_value {
-                qualify_expr(
-                    val,
-                    &local_funcs,
-                    &local_types,
-                    prefix,
-                    &current_path,
-                    &local_modules,
-                    &HashSet::new(),
-                );
-            }
-        }
-    }
-    for i in &mut prog.impls {
-        qualify_type(&mut i.impl_type, &local_types, prefix);
-        for method in &mut i.methods {
-            for param in &mut method.params {
-                qualify_type(&mut param.ty, &local_types, prefix);
-            }
-            if let Some(ref mut ret) = method.return_type {
-                qualify_type(ret, &local_types, prefix);
-            }
-            qualify_block(
-                &mut method.body,
-                &local_funcs,
-                &local_types,
-                prefix,
-                &current_path,
-                &local_modules,
-                &HashSet::new(),
-            );
-        }
-        for c in &mut i.consts {
-            qualify_type(&mut c.ty, &local_types, prefix);
-            qualify_expr(
-                &mut c.value,
-                &local_funcs,
-                &local_types,
-                prefix,
-                &current_path,
-                &local_modules,
-                &HashSet::new(),
-            );
-        }
-    }
-    for func in &mut prog.funcs {
-        for param in &mut func.params {
-            qualify_type(&mut param.ty, &local_types, prefix);
-        }
-        if let Some(ref mut ret) = func.return_type {
-            qualify_type(ret, &local_types, prefix);
-        }
-        qualify_block(
-            &mut func.body,
-            &local_funcs,
-            &local_types,
-            prefix,
-            &current_path,
-            &local_modules,
-            &HashSet::new(),
-        );
-    }
-    for alias in &mut prog.type_aliases {
-        qualify_type(&mut alias.aliased_type, &local_types, prefix);
     }
 }
 

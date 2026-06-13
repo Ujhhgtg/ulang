@@ -869,8 +869,7 @@ fn resolve_module_uses(
                 all_impls.push(decl.clone());
             }
             // Import overloads
-            let (module_funcs, module_overloads) =
-                process_stdlib_functions(dep_prog.funcs.clone());
+            let (module_funcs, module_overloads) = process_stdlib_functions(dep_prog.funcs.clone());
             for (base_name, overloads_list) in &module_overloads {
                 all_overloads.insert(base_name.clone(), overloads_list.clone());
             }
@@ -1244,7 +1243,10 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
                     // Check if target is a struct, enum, or type alias in the module
                     let is_struct = stdlib_prog.structs.iter().any(|s| s.name == *target_name);
                     let is_enum = stdlib_prog.enums.iter().any(|e| e.name == *target_name);
-                    let is_alias = stdlib_prog.type_aliases.iter().any(|a| a.name == *target_name);
+                    let is_alias = stdlib_prog
+                        .type_aliases
+                        .iter()
+                        .any(|a| a.name == *target_name);
 
                     if is_struct {
                         // Import the struct
@@ -3020,15 +3022,15 @@ fn qualify_block(
     }
 }
 
-fn qualify_imported_stdlib_program(
-    prog: &mut Program,
-    prefix: &str,
-) {
+fn qualify_imported_stdlib_program(prog: &mut Program, prefix: &str) {
     if prefix.is_empty() {
         return;
     }
     // Gather local types and functions of this stdlib program
-    let mut local_types: HashSet<String> = prog.structs.iter().map(|s| s.name.clone())
+    let mut local_types: HashSet<String> = prog
+        .structs
+        .iter()
+        .map(|s| s.name.clone())
         .chain(prog.enums.iter().map(|e| e.name.clone()))
         .chain(prog.traits.iter().map(|t| t.name.clone()))
         .chain(prog.type_aliases.iter().map(|a| a.name.clone()))

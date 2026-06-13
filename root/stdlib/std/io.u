@@ -5,7 +5,6 @@ use std::libc::__errno_location;
 use std::libc::strerror;
 use std::intrinsics::transmute;
 use std::intrinsics::slice_from_raw_parts;
-use std::result;
 use std::alloc::malloc;
 use std::alloc::memcpy;
 
@@ -99,6 +98,3 @@ impl Error {
         ErrorKind::Other
     }
 }
-
-pub type Result<T> = result::Result<T, Error>;
-

@@ -1,4 +1,4 @@
-use std::io::Result;
+use std::result::Result;
 use std::io::Error;
 use std::io::to_c_str;
 use std::path::PathBuf;
@@ -17,7 +17,7 @@ pub struct File {
 }
 
 impl File {
-    pub fn open(path: &str) -> Result<File> {
+    pub fn open(path: &str) -> Result<File, Error> {
         let path_c = to_c_str(path);
         let fd = libc::open(path_c, 0, 0);
         libc::free(path_c);
@@ -27,11 +27,11 @@ impl File {
         Result::Ok(File { fd: fd })
     }
 
-    pub fn open(path: &PathBuf) -> Result<File> {
+    pub fn open(path: &PathBuf) -> Result<File, Error> {
         File::open(path.as_str())
     }
 
-    pub fn create(path: &str) -> Result<File> {
+    pub fn create(path: &str) -> Result<File, Error> {
         let path_c = to_c_str(path);
         let fd = libc::open(path_c, 577, 438);
         libc::free(path_c);
@@ -41,11 +41,11 @@ impl File {
         Result::Ok(File { fd: fd })
     }
 
-    pub fn create(path: &PathBuf) -> Result<File> {
+    pub fn create(path: &PathBuf) -> Result<File, Error> {
         File::create(path.as_str())
     }
 
-    pub fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+    pub fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
         let ptr = buf.as_ptr() as *mut u8;
         let n = libc::read(self.fd, ptr, buf.len());
         if n < 0 {
@@ -54,7 +54,7 @@ impl File {
         Result::Ok(n as usize)
     }
 
-    pub fn write(&mut self, buf: &[u8]) -> Result<usize> {
+    pub fn write(&mut self, buf: &[u8]) -> Result<usize, Error> {
         let ptr = buf.as_ptr();
         let n = libc::write(self.fd, ptr, buf.len());
         if n < 0 {
@@ -142,11 +142,11 @@ impl DirEntry {
         self.name
     }
 
-    pub fn file_type(&self) -> Result<FileType> {
+    pub fn file_type(&self) -> Result<FileType, Error> {
         Result::Ok(FileType { d_type: self.d_type })
     }
 
-    pub fn metadata(&self) -> Result<Metadata> {
+    pub fn metadata(&self) -> Result<Metadata, Error> {
         metadata(&self.path)
     }
 }
@@ -156,8 +156,8 @@ pub struct ReadDir {
     pub dir_path: String,
 }
 
-impl Iterator<Result<DirEntry>> for ReadDir {
-    fn next(&mut self) -> Option<Result<DirEntry>> {
+impl Iterator<Result<DirEntry, Error>> for ReadDir {
+    fn next(&mut self) -> Option<Result<DirEntry, Error>> {
         if (self.dirp as usize) == 0 {
             return Option::None;
         };
@@ -196,7 +196,7 @@ impl Drop for ReadDir {
     }
 }
 
-pub fn read(path: &str) -> Result<Vec<u8>> {
+pub fn read(path: &str) -> Result<Vec<u8>, Error> {
     let path_c = to_c_str(path);
     let fd = libc::open(path_c, 0, 0);
     libc::free(path_c);
@@ -262,11 +262,11 @@ pub fn read(path: &str) -> Result<Vec<u8>> {
     Result::Ok(Vec { ptr: buf, len: total_read, cap: limit })
 }
 
-pub fn read(path: &PathBuf) -> Result<Vec<u8>> {
+pub fn read(path: &PathBuf) -> Result<Vec<u8>, Error> {
     read(path.as_str())
 }
 
-pub fn read_to_string(path: &str) -> Result<String> {
+pub fn read_to_string(path: &str) -> Result<String, Error> {
     let res = read(path);
     match res {
         Result::Ok(v) => Result::Ok(String { vec: v }),
@@ -274,11 +274,11 @@ pub fn read_to_string(path: &str) -> Result<String> {
     }
 }
 
-pub fn read_to_string(path: &PathBuf) -> Result<String> {
+pub fn read_to_string(path: &PathBuf) -> Result<String, Error> {
     read_to_string(path.as_str())
 }
 
-pub fn write(path: &str, contents: &[u8]) -> Result<()> {
+pub fn write(path: &str, contents: &[u8]) -> Result<(), Error> {
     let path_c = to_c_str(path);
     let fd = libc::open(path_c, 577, 438);
     free(path_c);
@@ -304,7 +304,7 @@ pub fn write(path: &str, contents: &[u8]) -> Result<()> {
     Result::Ok(())
 }
 
-pub fn write(path: &str, contents: &str) -> Result<()> {
+pub fn write(path: &str, contents: &str) -> Result<(), Error> {
     let path_c = to_c_str(path);
     let fd = libc::open(path_c, 577, 438);
     free(path_c);
@@ -330,15 +330,15 @@ pub fn write(path: &str, contents: &str) -> Result<()> {
     Result::Ok(())
 }
 
-pub fn write(path: &PathBuf, contents: &[u8]) -> Result<()> {
+pub fn write(path: &PathBuf, contents: &[u8]) -> Result<(), Error> {
     write(path.as_str(), contents)
 }
 
-pub fn write(path: &PathBuf, contents: &str) -> Result<()> {
+pub fn write(path: &PathBuf, contents: &str) -> Result<(), Error> {
     write(path.as_str(), contents)
 }
 
-pub fn create_dir(path: &str) -> Result<()> {
+pub fn create_dir(path: &str) -> Result<(), Error> {
     let path_c = to_c_str(path);
     let res = libc::mkdir(path_c, 511);
     libc::free(path_c);
@@ -348,11 +348,11 @@ pub fn create_dir(path: &str) -> Result<()> {
     Result::Ok(())
 }
 
-pub fn create_dir(path: &PathBuf) -> Result<()> {
+pub fn create_dir(path: &PathBuf) -> Result<(), Error> {
     create_dir(path.as_str())
 }
 
-pub fn remove_file(path: &str) -> Result<()> {
+pub fn remove_file(path: &str) -> Result<(), Error> {
     let path_c = to_c_str(path);
     let res = libc::unlink(path_c);
     libc::free(path_c);
@@ -362,11 +362,11 @@ pub fn remove_file(path: &str) -> Result<()> {
     Result::Ok(())
 }
 
-pub fn remove_file(path: &PathBuf) -> Result<()> {
+pub fn remove_file(path: &PathBuf) -> Result<(), Error> {
     remove_file(path.as_str())
 }
 
-pub fn remove_dir(path: &str) -> Result<()> {
+pub fn remove_dir(path: &str) -> Result<(), Error> {
     let path_c = to_c_str(path);
     let res = libc::rmdir(path_c);
     libc::free(path_c);
@@ -376,11 +376,11 @@ pub fn remove_dir(path: &str) -> Result<()> {
     Result::Ok(())
 }
 
-pub fn remove_dir(path: &PathBuf) -> Result<()> {
+pub fn remove_dir(path: &PathBuf) -> Result<(), Error> {
     remove_dir(path.as_str())
 }
 
-pub fn metadata(path: &str) -> Result<Metadata> {
+pub fn metadata(path: &str) -> Result<Metadata, Error> {
     let path_c = to_c_str(path);
     let buf = libc::malloc(144);
     let res = libc::stat(path_c, buf);
@@ -395,11 +395,11 @@ pub fn metadata(path: &str) -> Result<Metadata> {
     Result::Ok(Metadata { mode: mode, size: size })
 }
 
-pub fn metadata(path: &PathBuf) -> Result<Metadata> {
+pub fn metadata(path: &PathBuf) -> Result<Metadata, Error> {
     metadata(path.as_str())
 }
 
-pub fn symlink_metadata(path: &str) -> Result<Metadata> {
+pub fn symlink_metadata(path: &str) -> Result<Metadata, Error> {
     let path_c = to_c_str(path);
     let buf = libc::malloc(144);
     let res = libc::lstat(path_c, buf);
@@ -414,11 +414,11 @@ pub fn symlink_metadata(path: &str) -> Result<Metadata> {
     Result::Ok(Metadata { mode: mode, size: size })
 }
 
-pub fn symlink_metadata(path: &PathBuf) -> Result<Metadata> {
+pub fn symlink_metadata(path: &PathBuf) -> Result<Metadata, Error> {
     symlink_metadata(path.as_str())
 }
 
-pub fn read_dir(path: &str) -> Result<ReadDir> {
+pub fn read_dir(path: &str) -> Result<ReadDir, Error> {
     let path_c = to_c_str(path);
     let dirp = libc::opendir(path_c);
     libc::free(path_c);
@@ -431,6 +431,6 @@ pub fn read_dir(path: &str) -> Result<ReadDir> {
     })
 }
 
-pub fn read_dir(path: &PathBuf) -> Result<ReadDir> {
+pub fn read_dir(path: &PathBuf) -> Result<ReadDir, Error> {
     read_dir(path.as_str())
 }

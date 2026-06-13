@@ -1,4 +1,5 @@
 use std::result::Result;
+use std::option::Option;
 use std::io::Error;
 use std::io::to_c_str;
 use std::path::PathBuf;
@@ -9,7 +10,6 @@ use std::intrinsics::transmute;
 use std::intrinsics::slice_from_raw_parts;
 use std::drop::Drop;
 use std::iter::Iterator;
-use std::option::Option;
 
 
 pub struct File {

@@ -5897,44 +5897,6 @@ impl<'ctx> CodeGen<'ctx> {
                 val.add_attribute(inkwell::attributes::AttributeLoc::Function, attr);
             }
 
-            // // If it is an extern function with a qualified name, generate a wrapper that calls the raw extern function!
-            // if func.is_extern && func.name.contains("::") {
-            //     let raw_name = func.name.split("::").last().unwrap().to_string();
-            //     let raw_fn = if let Some(existing_raw) = self.module.get_function(&raw_name) {
-            //         existing_raw
-            //     } else {
-            //         self.module.add_function(&raw_name, fn_type, None)
-            //     };
-
-            //     let entry = self.context.append_basic_block(val, "entry");
-            //     let saved_bb = self.builder.get_insert_block();
-            //     self.builder.position_at_end(entry);
-
-            //     let mut args_val = Vec::new();
-            //     for param in val.get_params() {
-            //         args_val.push(param.into());
-            //     }
-
-            //     let call_res = self.builder.build_call(raw_fn, &args_val, "call_raw").map_err(|e| {
-            //         CodegenError::new(format!("failed to build call to raw extern: {}", e))
-            //     })?;
-
-            //     if use_void_return {
-            //         self.builder.build_return(None).map_err(|e| {
-            //             CodegenError::new(format!("failed to build return for void wrapper: {}", e))
-            //         })?;
-            //     } else {
-            //         let ret_val = self.try_extract_result(call_res);
-            //         self.builder.build_return(Some(&ret_val)).map_err(|e| {
-            //             CodegenError::new(format!("failed to build return for wrapper: {}", e))
-            //         })?;
-            //     }
-
-            //     if let Some(bb) = saved_bb {
-            //         self.builder.position_at_end(bb);
-            //     }
-            // }
-
             val
         };
 

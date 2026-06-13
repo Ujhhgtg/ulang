@@ -9587,8 +9587,9 @@ impl<'ctx> CodeGen<'ctx> {
                         .get(&actual_name)
                         .copied()
                         .or_else(|| {
-                            // Fallback: search by suffix (handles prefix mismatch)
-                            let last = actual_name.rsplit_once("::").map_or("", |(_, l)| l);
+                            // Fallback: split by __ to get base name, then search
+                            let base = actual_name.splitn(2, "__").next().unwrap_or(&actual_name);
+                            let last = base.rsplit_once("::").map_or("", |(_, l)| l);
                             self.struct_types.iter().find_map(|(k, v)| {
                                 if k.ends_with(last) { Some(*v) } else { None }
                             })
@@ -10245,21 +10246,30 @@ impl<'ctx> CodeGen<'ctx> {
                         }
                         _ => {
                             return Err(
-                                format!("cannot pattern-match on type {:?}", scrutinee_ty).into()
+                                format!("cannot pattern-match on type {:?} (in function {:?})", scrutinee_ty, self.current_monomorphization.as_ref().map(|(_, m)| m.clone())).into()
                             );
                         }
                     },
                     _ => {
                         return Err(
-                            format!("cannot pattern-match on type {:?}", scrutinee_ty).into()
+                            format!("cannot pattern-match on type {:?} (in function {:?})", scrutinee_ty, self.current_monomorphization.as_ref().map(|(_, m)| m.clone())).into()
                         );
                     }
                 };
 
                 // Look up variant index from enum definition
-                let decl = self.enum_defs.get(&enum_type_name).ok_or_else(|| {
-                    CodegenError::new(format!("unknown enum '{}'", enum_type_name))
-                })?;
+                let decl = self.enum_defs.get(&enum_type_name)
+                    .or_else(|| {
+                        // Fallback: split by __ to get base name, then search
+                        let base = enum_type_name.splitn(2, "__").next().unwrap_or(&enum_type_name);
+                        let last = base.rsplit_once("::").map_or("", |(_, l)| l);
+                        self.enum_defs.iter().find_map(|(k, v)| {
+                            if k.ends_with(last) { Some(v) } else { None }
+                        })
+                    })
+                    .ok_or_else(|| {
+                        CodegenError::new(format!("unknown enum '{}'", enum_type_name))
+                    })?;
                 let variant_idx = decl
                     .variants
                     .iter()

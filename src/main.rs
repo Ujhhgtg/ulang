@@ -2307,10 +2307,20 @@ fn qualify_type(ty: &mut Type, local_types: &HashSet<String>, prefix: &str) {
         Type::Struct(name) => {
             if local_types.contains(name) {
                 *name = format!("{}::{}", prefix, name);
+            } else if let Some((_, last)) = name.rsplit_once("::")
+                && !name.starts_with(&format!("{}::", prefix))
+                && local_types.contains(last)
+            {
+                *name = format!("{}::{}", prefix, name);
             }
         }
         Type::GenericInstance(name, args) => {
             if local_types.contains(name) {
+                *name = format!("{}::{}", prefix, name);
+            } else if let Some((_, last)) = name.rsplit_once("::")
+                && !name.starts_with(&format!("{}::", prefix))
+                && local_types.contains(last)
+            {
                 *name = format!("{}::{}", prefix, name);
             }
             for arg in args {
@@ -2319,6 +2329,11 @@ fn qualify_type(ty: &mut Type, local_types: &HashSet<String>, prefix: &str) {
         }
         Type::Alias(name, args) => {
             if local_types.contains(name) {
+                *name = format!("{}::{}", prefix, name);
+            } else if let Some((_, last)) = name.rsplit_once("::")
+                && !name.starts_with(&format!("{}::", prefix))
+                && local_types.contains(last)
+            {
                 *name = format!("{}::{}", prefix, name);
             }
             for arg in args {

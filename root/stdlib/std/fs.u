@@ -28,7 +28,7 @@ impl File {
     }
 
     pub fn open(path: &PathBuf) -> Result<File, Error> {
-        File::open(path.as_str())
+        open(path.as_str())
     }
 
     pub fn create(path: &str) -> Result<File, Error> {

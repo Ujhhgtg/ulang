@@ -28,7 +28,7 @@ impl File {
     }
 
     pub fn open(path: &PathBuf) -> Result<File, Error> {
-        open(path.as_str())
+        File::open(path.as_str())
     }
 
     pub fn create(path: &str) -> Result<File, Error> {
@@ -164,7 +164,7 @@ impl Iterator<Result<DirEntry, Error>> for ReadDir {
         let mut entry = libc::readdir(self.dirp);
         while (entry as usize) != 0 {
             let name_ptr = (entry as usize + 19) as *const u8;
-            let mut name_len = 0;
+            let mut name_len = 0usize;
             while *( (name_ptr as usize + name_len) as *const u8 ) != 0u8 {
                 name_len = name_len + 1;
             };
@@ -210,8 +210,8 @@ pub fn read(path: &str) -> Result<Vec<u8>, Error> {
     libc::lseek(fd, 0, 0);
 
     if size == 0 {
-        let mut cap = 4096;
-        let mut len = 0;
+        let mut cap = 4096usize;
+        let mut len = 0usize;
         let mut buf = libc::malloc(cap);
         let mut err = false;
         let mut eof = false;
@@ -240,7 +240,7 @@ pub fn read(path: &str) -> Result<Vec<u8>, Error> {
     };
 
     let buf = libc::malloc(size as usize);
-    let mut total_read = 0;
+    let mut total_read = 0usize;
     let mut err = false;
     let limit = size as usize;
     while total_read < limit {
@@ -285,7 +285,7 @@ pub fn write(path: &str, contents: &[u8]) -> Result<(), Error> {
     if fd < 0 {
         return Result::Err(Error::last_os_error());
     };
-    let mut total_written = 0;
+    let mut total_written = 0usize;
     let mut err = false;
     let ptr = contents.as_ptr();
     let len = contents.len();
@@ -311,7 +311,7 @@ pub fn write(path: &str, contents: &str) -> Result<(), Error> {
     if fd < 0 {
         return Result::Err(Error::last_os_error());
     };
-    let mut total_written = 0;
+    let mut total_written = 0usize;
     let mut err = false;
     let ptr = contents.0;
     let len = contents.1;

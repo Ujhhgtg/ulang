@@ -24,15 +24,27 @@ use crate::token::Span;
 /// UTF-8 character (the line-number computation indexes into `source[..span.lo]` and
 /// will panic on a non-char boundary).
 pub fn emit_error(source: &str, path: &str, span: Span, title: &str, label: &str) {
+    // Clamp spans to the current source so errors originating from another file
+    // (for example a stdlib module) cannot cause panics when displayed against
+    // the top-level source buffer.
+    let mut lo = span.lo.min(source.len());
+    let mut hi = span.hi.min(source.len()).max(lo);
+    while lo > 0 && !source.is_char_boundary(lo) {
+        lo -= 1;
+    }
+    while hi < source.len() && !source.is_char_boundary(hi) {
+        hi += 1;
+    }
+
     // Compute 1-indexed line number from byte offset
-    let line_start = source[..span.lo].matches('\n').count() + 1;
+    let line_start = source[..lo].matches('\n').count() + 1;
 
     let report = Level::ERROR.primary_title(title).element(
         Snippet::source(source)
             .line_start(line_start)
             .fold(false)
             .path(path)
-            .annotation(AnnotationKind::Primary.span(span.lo..span.hi).label(label)),
+            .annotation(AnnotationKind::Primary.span(lo..hi).label(label)),
     );
 
     let renderer = Renderer::styled().decor_style(DecorStyle::Unicode);

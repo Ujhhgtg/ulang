@@ -1086,12 +1086,48 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
                         format!("{}{}", prefix, module_name)
                     };
 
+                    let mut module_local_types = HashSet::new();
+                    for s in &stdlib_prog.structs {
+                        module_local_types.insert(s.name.clone());
+                    }
+                    for e in &stdlib_prog.enums {
+                        module_local_types.insert(e.name.clone());
+                    }
+                    for t in &stdlib_prog.traits {
+                        module_local_types.insert(t.name.clone());
+                    }
+                    let mut module_local_funcs = HashSet::new();
+                    for f in &stdlib_prog.funcs {
+                        module_local_funcs.insert(f.name.clone());
+                    }
+                    for f in &module_funcs {
+                        module_local_funcs.insert(f.name.clone());
+                    }
+                    let empty_path: &[String] = &[];
+                    let empty_submodules: HashSet<String> = HashSet::new();
+                    let empty_top_level: HashSet<String> = HashSet::new();
+
                     // Import all functions, structs, traits, impls
                     for func in &module_funcs {
                         let qualified_name = format!("{}::{}", imported_module_name, func.name);
                         let mut new_func = func.clone();
                         new_func.name = qualified_name.clone();
-                        new_func.is_pub = use_decl.is_pub;
+                        new_func.is_pub = func.is_pub;
+                        for param in &mut new_func.params {
+                            qualify_type(&mut param.ty, &module_local_types, &imported_module_name);
+                        }
+                        if let Some(ref mut ret) = new_func.return_type {
+                            qualify_type(ret, &module_local_types, &imported_module_name);
+                        }
+                        qualify_block(
+                            &mut new_func.body,
+                            &module_local_funcs,
+                            &module_local_types,
+                            &imported_module_name,
+                            empty_path,
+                            &empty_submodules,
+                            &empty_top_level,
+                        );
                         all_funcs.insert(qualified_name, new_func);
                     }
                     // Register qualified overload names
@@ -1102,7 +1138,11 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
                             .map(|(mangled, params)| {
                                 let base_end = mangled.find('$').unwrap_or(mangled.len());
                                 let suffix = &mangled[base_end..];
-                                (format!("{}{}", qualified_base, suffix), params.clone())
+                                let mut qualified_params = params.clone();
+                                for p in &mut qualified_params {
+                                    qualify_type(p, &module_local_types, &imported_module_name);
+                                }
+                                (format!("{}{}", qualified_base, suffix), qualified_params)
                             })
                             .collect();
                         all_overloads.insert(qualified_base, qualified_list);
@@ -1116,7 +1156,7 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
                         };
                         let mut new_decl = decl.clone();
                         new_decl.name = new_name.clone();
-                        new_decl.is_pub = use_decl.is_pub;
+                        new_decl.is_pub = decl.is_pub;
                         all_structs.entry(new_name).or_insert(new_decl);
                     }
                     // Import all enums from the module
@@ -1128,20 +1168,37 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
                         };
                         let mut new_decl = decl.clone();
                         new_decl.name = new_name.clone();
-                        new_decl.is_pub = use_decl.is_pub;
+                        new_decl.is_pub = decl.is_pub;
                         all_enums.entry(new_name).or_insert(new_decl);
                     }
                     // Import all impls from the module
                     for decl in &stdlib_prog.impls {
                         let mut new_decl = decl.clone();
-                        match &mut new_decl.impl_type {
-                            Type::Struct(name) => {
-                                *name = format!("{}{}", prefix, name);
+                        qualify_type(
+                            &mut new_decl.impl_type,
+                            &module_local_types,
+                            &imported_module_name,
+                        );
+                        for method in &mut new_decl.methods {
+                            for param in &mut method.params {
+                                qualify_type(
+                                    &mut param.ty,
+                                    &module_local_types,
+                                    &imported_module_name,
+                                );
                             }
-                            Type::GenericInstance(name, _) => {
-                                *name = format!("{}{}", prefix, name);
+                            if let Some(ref mut ret) = method.return_type {
+                                qualify_type(ret, &module_local_types, &imported_module_name);
                             }
-                            _ => {}
+                            qualify_block(
+                                &mut method.body,
+                                &module_local_funcs,
+                                &module_local_types,
+                                &imported_module_name,
+                                empty_path,
+                                &empty_submodules,
+                                &empty_top_level,
+                            );
                         }
                         all_impls.push(new_decl);
                     }
@@ -1154,7 +1211,7 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
                         };
                         let mut new_decl = decl.clone();
                         new_decl.name = new_name.clone();
-                        new_decl.is_pub = use_decl.is_pub;
+                        new_decl.is_pub = decl.is_pub;
                         all_traits.entry(new_name).or_insert(new_decl);
                     }
                     // Import all extern "C" functions from the module
@@ -1769,6 +1826,18 @@ fn resolve_uses(program: Program, no_std: bool, _source_path: &str) -> (Program,
         }
     }
 
+    // Deduplicate impls that were pulled in multiple times through different
+    // stdlib module imports. Duplicate impls would otherwise cause the same
+    // methods to be declared and compiled repeatedly.
+    let mut seen_impls = std::collections::HashSet::new();
+    all_impls.retain(|i| {
+        let mut key = format!("{:?}|{:?}", i.impl_type, i.trait_name);
+        for m in &i.methods {
+            key.push_str(&format!("|{}|{}", m.name, m.params.len()));
+        }
+        seen_impls.insert(key)
+    });
+
     // Build the final Program with all resolved items and empty uses/modules
     (
         Program {
@@ -2336,19 +2405,28 @@ fn qualify_expr(
         } => {
             let segments: Vec<String> = module.split("::").map(|s| s.to_string()).collect();
             if !segments.is_empty() {
-                let resolved_path = if segments[0] == "crate" {
-                    segments[1..].to_vec()
-                } else if submodules.contains(&segments[0]) {
-                    let mut path = current_path.to_vec();
-                    path.extend(segments);
-                    path
-                } else if top_level_modules.contains(&segments[0]) {
-                    segments
+                if !prefix.is_empty()
+                    && segments.len() == 1
+                    && local_types.contains(&segments[0])
+                {
+                    // Associated function calls on a local type (e.g. `File::new`)
+                    // must be qualified to the imported module namespace.
+                    *module = format!("{}::{}", prefix, module);
                 } else {
-                    segments
-                };
-                if !resolved_path.is_empty() {
-                    *module = resolved_path.join("::");
+                    let resolved_path = if segments[0] == "crate" {
+                        segments[1..].to_vec()
+                    } else if submodules.contains(&segments[0]) {
+                        let mut path = current_path.to_vec();
+                        path.extend(segments);
+                        path
+                    } else if top_level_modules.contains(&segments[0]) {
+                        segments
+                    } else {
+                        segments
+                    };
+                    if !resolved_path.is_empty() {
+                        *module = resolved_path.join("::");
+                    }
                 }
             }
             for arg in args {

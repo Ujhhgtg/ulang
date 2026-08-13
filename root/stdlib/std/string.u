@@ -33,7 +33,7 @@ impl String {
     }
 
     pub fn clear(&mut self) {
-        self.vec.clear()
+        self.vec.clear();
     }
 
     pub fn push_str(&mut self, s: &str) {

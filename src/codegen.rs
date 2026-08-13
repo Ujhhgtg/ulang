@@ -1943,6 +1943,17 @@ impl<'ctx> CodeGen<'ctx> {
     /// Exit the current scope: drop non-moved variables in reverse declaration
     /// order, then pop the scope.
     fn exit_scope(&mut self) -> Result<(), CodegenError> {
+        // If the current block already terminated (e.g. after `return` or an
+        // implicit tail return), do not try to emit drop calls after it.
+        if self
+            .builder
+            .get_insert_block()
+            .is_some_and(|bb| bb.get_terminator().is_some())
+        {
+            self.scope_stack.pop();
+            return Ok(());
+        }
+
         // Clone scope data to avoid borrow conflicts with drop_variable
         let scope_data: Vec<(String, Type, inkwell::values::PointerValue)> =
             self.scope_stack.last().cloned().unwrap_or_default();
@@ -3794,6 +3805,136 @@ impl<'ctx> CodeGen<'ctx> {
         )
     }
 
+    /// Create the concrete LLVM type for a generic struct/enum instance without
+    /// compiling its generic methods. Used before function declaration so that
+    /// top-level functions can return/accept concrete generic instances.
+    fn prepare_generic_type(&mut self, base_name: &str, args: &[Type]) -> Result<(), CodegenError> {
+        let mangled = Self::mangle_generic_instance(base_name, args);
+        if self.struct_types.contains_key(&mangled) {
+            return Ok(());
+        }
+
+        if let Some(decl) = self.generic_struct_defs.get(base_name) {
+            let param_names: Vec<String> =
+                decl.type_params.iter().map(|p| p.name.clone()).collect();
+            let substituted_fields: Vec<StructField> = decl
+                .fields
+                .iter()
+                .map(|f| {
+                    let mut ty = f.ty.clone();
+                    Self::substitute_type_params(&mut ty, &param_names, args);
+                    StructField {
+                        name: f.name.clone(),
+                        ty,
+                        is_pub: f.is_pub,
+                        span: f.span,
+                    }
+                })
+                .collect();
+
+            // Recursively prepare any nested generic instances used by fields.
+            let nested: Vec<(String, Vec<Type>)> = {
+                let mut instances = Vec::new();
+                let mut seen = HashSet::new();
+                for field in &substituted_fields {
+                    Self::collect_from_types(std::slice::from_ref(&field.ty), &mut instances, &mut seen);
+                }
+                instances
+            };
+            for (sub_base, sub_args) in nested {
+                if self.generic_struct_defs.contains_key(&sub_base)
+                    || self.generic_enum_defs.contains_key(&sub_base)
+                {
+                    self.prepare_generic_type(&sub_base, &sub_args)?;
+                }
+            }
+
+            let struct_type = self.context.opaque_struct_type(&mangled);
+            let field_types: Vec<BasicTypeEnum<'ctx>> = substituted_fields
+                .iter()
+                .map(|f| self.type_to_llvm(&f.ty))
+                .collect();
+            struct_type.set_body(&field_types, false);
+            self.struct_fields
+                .insert(mangled.clone(), substituted_fields);
+            self.struct_types.insert(mangled.clone(), struct_type);
+            if let Some(base_decl) = self.generic_struct_defs.get(base_name) {
+                self.visibility_map
+                    .insert(mangled.clone(), base_decl.is_pub);
+                let mut field_map = HashMap::new();
+                for field in &base_decl.fields {
+                    field_map.insert(field.name.clone(), field.is_pub);
+                }
+                self.field_visibility_map.insert(mangled.clone(), field_map);
+            }
+        }
+
+        if let Some(decl_ref) = self.generic_enum_defs.get(base_name) {
+            let decl = decl_ref.clone();
+            let param_names: Vec<String> =
+                decl.type_params.iter().map(|p| p.name.clone()).collect();
+            let mut substituted_fields: Vec<StructField> = vec![StructField {
+                name: "__tag".to_string(),
+                ty: Type::I8,
+                is_pub: false,
+                span: Span::empty(0),
+            }];
+            for variant in &decl.variants {
+                if let Some(ref payload_ty) = variant.ty {
+                    let mut ty = payload_ty.clone();
+                    Self::substitute_type_params(&mut ty, &param_names, args);
+                    substituted_fields.push(StructField {
+                        name: format!("__{}", variant.name),
+                        ty,
+                        is_pub: false,
+                        span: Span::empty(0),
+                    });
+                }
+            }
+
+            let nested: Vec<(String, Vec<Type>)> = {
+                let mut instances = Vec::new();
+                let mut seen = HashSet::new();
+                for field in &substituted_fields {
+                    Self::collect_from_types(std::slice::from_ref(&field.ty), &mut instances, &mut seen);
+                }
+                instances
+            };
+            for (sub_base, sub_args) in nested {
+                if self.generic_struct_defs.contains_key(&sub_base)
+                    || self.generic_enum_defs.contains_key(&sub_base)
+                {
+                    self.prepare_generic_type(&sub_base, &sub_args)?;
+                }
+            }
+
+            let struct_type = self.context.opaque_struct_type(&mangled);
+            let field_types: Vec<BasicTypeEnum<'ctx>> = substituted_fields
+                .iter()
+                .map(|f| self.type_to_llvm(&f.ty))
+                .collect();
+            struct_type.set_body(&field_types, false);
+            self.struct_fields
+                .insert(mangled.clone(), substituted_fields);
+            self.struct_types.insert(mangled.clone(), struct_type);
+            if let Some(base_decl) = self.generic_enum_defs.get(base_name) {
+                self.visibility_map
+                    .insert(mangled.clone(), base_decl.is_pub);
+            }
+
+            let mut concrete_decl = decl.clone();
+            concrete_decl.name = mangled.clone();
+            for variant in &mut concrete_decl.variants {
+                if let Some(ref mut payload_ty) = variant.ty {
+                    Self::substitute_type_params(payload_ty, &param_names, args);
+                }
+            }
+            self.enum_defs.insert(mangled.clone(), concrete_decl);
+        }
+
+        Ok(())
+    }
+
     /// Ensure a generic struct/enum instance is monomorphized.
     fn ensure_monomorphized(&mut self, base_name: &str, args: &[Type]) -> Result<(), CodegenError> {
         let mangled = Self::mangle_generic_instance(base_name, args);
@@ -3805,7 +3946,9 @@ impl<'ctx> CodeGen<'ctx> {
             .insert(base_name.to_string(), mangled.clone());
 
         // 1a. Create concrete LLVM struct type (generic struct)
-        if let Some(decl) = self.generic_struct_defs.get(base_name) {
+        if !self.struct_types.contains_key(&mangled)
+            && let Some(decl) = self.generic_struct_defs.get(base_name)
+        {
             for (p, arg) in decl.type_params.iter().zip(args) {
                 for bound in &p.bounds {
                     if !self.check_type_implements_trait(arg, &bound.trait_name) {
@@ -3856,7 +3999,9 @@ impl<'ctx> CodeGen<'ctx> {
         }
 
         // 1b. Create concrete LLVM struct type (generic enum)
-        if let Some(decl) = self.generic_enum_defs.get(base_name) {
+        if !self.struct_types.contains_key(&mangled)
+            && let Some(decl) = self.generic_enum_defs.get(base_name)
+        {
             for (p, arg) in decl.type_params.iter().zip(args) {
                 for bound in &p.bounds {
                     if !self.check_type_implements_trait(arg, &bound.trait_name) {
@@ -4119,7 +4264,9 @@ impl<'ctx> CodeGen<'ctx> {
                 } else {
                     format!("{}::{}/{}", type_name, method.name, method.params.len())
                 };
-                self.visibility_map.insert(mangled_name, method.is_pub);
+                // Trait dispatch functions are internal and must remain callable
+                // even when the concrete impl method is not marked `pub`.
+                self.visibility_map.insert(mangled_name, true);
             }
         }
 
@@ -4164,7 +4311,21 @@ impl<'ctx> CodeGen<'ctx> {
         }
         // Phase 0.25: Generate builtin trait implementations for primitives
         self.generate_primitive_trait_impls()?;
+
+        // Phase 0.3: Prepare concrete generic types before any function
+        // declarations so non-generic impl methods and top-level functions can
+        // use concrete generic return types (e.g. `Result<T, Error>`).
+        let generic_instances = Self::collect_generic_instances(program);
+        for (base_name, args) in &generic_instances {
+            if self.generic_struct_defs.contains_key(base_name)
+                || self.generic_enum_defs.contains_key(base_name)
+            {
+                self.prepare_generic_type(base_name, args)?;
+            }
+        }
+
         // Phase 0.5: Separate generic impls, process non-generic ones
+        let mut inherent_method_counts: HashMap<(String, String, usize), usize> = HashMap::new();
         for decl in &program.impls {
             let type_name = match &decl.impl_type {
                 Type::Struct(name) => name.clone(),
@@ -4258,7 +4419,19 @@ impl<'ctx> CodeGen<'ctx> {
                 let mangled_name = if let Some(ref trait_name) = decl.trait_name {
                     format!("__trait_{}_{}_{}", trait_name, method.name, type_name)
                 } else {
-                    format!("{}::{}/{}", type_name, method.name, method.params.len())
+                    let key = (
+                        type_name.clone(),
+                        method.name.clone(),
+                        method.params.len(),
+                    );
+                    let idx = inherent_method_counts.entry(key).or_insert(0);
+                    let suffix = if *idx == 0 {
+                        String::new()
+                    } else {
+                        format!("${}", *idx)
+                    };
+                    *idx += 1;
+                    format!("{}::{}{}/{}", type_name, method.name, suffix, method.params.len())
                 };
                 let mut method_func = method.clone();
                 method_func.name = mangled_name.clone();
@@ -4341,17 +4514,9 @@ impl<'ctx> CodeGen<'ctx> {
             self.declare_function(func)?;
         }
 
-        // Phase 0.6: Discover and monomorphize all needed generic instances
-        let generic_instances = Self::collect_generic_instances(program);
-        for (base_name, args) in &generic_instances {
-            if self.generic_struct_defs.contains_key(base_name)
-                || self.generic_enum_defs.contains_key(base_name)
-            {
-                self.ensure_monomorphized(base_name, args)?;
-            }
-        }
-
-        // Phase 0.65: Set struct bodies for non-generic structs/enums
+        // Phase 0.65: Set struct bodies for non-generic structs/enums before
+        // monomorphizing generic methods, so `size_of` and field layout are
+        // available for non-generic types used inside generic code.
         for decl in &program.structs {
             if !decl.type_params.is_empty() {
                 continue;
@@ -4374,6 +4539,15 @@ impl<'ctx> CodeGen<'ctx> {
                 let ft: Vec<BasicTypeEnum<'ctx>> =
                     fields.iter().map(|f| self.type_to_llvm(&f.ty)).collect();
                 st.set_body(&ft, false);
+            }
+        }
+
+        // Phase 0.6b: Monomorphize generic instances (create methods/bodies).
+        for (base_name, args) in &generic_instances {
+            if self.generic_struct_defs.contains_key(base_name)
+                || self.generic_enum_defs.contains_key(base_name)
+            {
+                self.ensure_monomorphized(base_name, args)?;
             }
         }
         // Phase 0.75: Process #[derive(...)] (non-generic only)
@@ -4442,6 +4616,8 @@ impl<'ctx> CodeGen<'ctx> {
             }
         }
         // Phase 2b: Compile non-generic impl method bodies
+        let mut inherent_method_counts_phase2: HashMap<(String, String, usize), usize> =
+            HashMap::new();
         for decl in &program.impls {
             if !decl.type_params.is_empty() {
                 continue;
@@ -4465,7 +4641,19 @@ impl<'ctx> CodeGen<'ctx> {
                 let mangled_name = if let Some(ref trait_name) = decl.trait_name {
                     format!("__trait_{}_{}_{}", trait_name, method.name, type_name)
                 } else {
-                    format!("{}::{}/{}", type_name, method.name, method.params.len())
+                    let key = (
+                        type_name.clone(),
+                        method.name.clone(),
+                        method.params.len(),
+                    );
+                    let idx = inherent_method_counts_phase2.entry(key).or_insert(0);
+                    let suffix = if *idx == 0 {
+                        String::new()
+                    } else {
+                        format!("${}", *idx)
+                    };
+                    *idx += 1;
+                    format!("{}::{}{}/{}", type_name, method.name, suffix, method.params.len())
                 };
                 let mut method_func = method.clone();
                 method_func.name = mangled_name;
@@ -4673,48 +4861,17 @@ impl<'ctx> CodeGen<'ctx> {
                 .into(),
             Type::GenericInstance(name, args) => {
                 let mangled = Self::mangle_generic_instance(name, args);
-                // self.struct_types
-                //     .get(&mangled)
-                //     .copied()
-                // .unwrap_or_else(|| {
-                //     // Fallback 1: look up by exact base name
-                //     if let Some(ty) = self.struct_types.get(name).copied() {
-                //         return ty;
-                //     }
-                //     // Fallback 2: search all keys by suffix (handles prefix mismatch like "result::Result" -> "fs::result::Result")
-                //     let suffix = mangled.splitn(2, "__").nth(1).unwrap_or("").to_string();
-                //     for (k, v) in self.struct_types.iter() {
-                //         if k.ends_with(&suffix)
-                //             && k.contains(
-                //                 name.rsplit_once("::").map_or(name.as_str(), |(_, l)| l),
-                //             )
-                //         {
-                //             return *v;
-                //         }
-                //     }
-                //     // Fallback 3: try just the base name suffix match
-                //     let last_seg = name.rsplit_once("::").map_or("", |(_, l)| l);
-                //     for (k, v) in self.struct_types.iter() {
-                //         if k.ends_with(last_seg) {
-                //             return *v;
-                //         }
-                //     }
-                //     panic!(
-                //         "unknown generic struct instance '{}' — known types: {:?}",
-                //         mangled,
-                //         self.struct_types.keys().collect::<Vec<_>>()
-                //     )
-                // })
-                // .into()
                 self.struct_types
-                    .get(name)
+                    .get(&mangled)
                     .copied()
                     .unwrap_or_else(|| {
-                        panic!(
-                            "unknown generic struct instance '{}' — known types: {:?}",
-                            mangled,
-                            self.struct_types.keys().collect::<Vec<_>>()
-                        )
+                        self.struct_types.get(name).copied().unwrap_or_else(|| {
+                            panic!(
+                                "unknown generic struct instance '{}' — known types: {:?}",
+                                mangled,
+                                self.struct_types.keys().collect::<Vec<_>>()
+                            )
+                        })
                     })
                     .into()
             }
@@ -5937,7 +6094,6 @@ impl<'ctx> CodeGen<'ctx> {
 
         self.enter_scope();
         let result = self.compile_function_body_inner(func);
-
         if result.is_ok() {
             let _ = self.exit_scope();
         }
@@ -7860,7 +8016,10 @@ impl<'ctx> CodeGen<'ctx> {
                 // For generic structs, also try the monomorphized name
                 let monomorphized_name = Some(self.resolve_mangled_name(module))
                     .map(|mangled| format!("{}::{}/{}", mangled, callee, args.len()));
-                // Try direct lookup first, then mangled name (for impl methods), then overload map
+                // Try direct lookup first, then impl methods, then overload map.
+                // Impl methods are checked before the unqualified C fallback so a
+                // qualified call like `File::open` does not accidentally resolve to
+                // the libc `open` extern.
                 let mut resolved_fn_val = self
                     .module
                     .get_function(&qualified_name)
@@ -7870,16 +8029,16 @@ impl<'ctx> CodeGen<'ctx> {
                             .as_ref()
                             .and_then(|n| self.module.get_function(n))
                     })
+                    .or_else(|| {
+                        self.impl_methods.get(module).and_then(|methods| {
+                            methods
+                                .iter()
+                                .find(|(name, _)| name == callee)
+                                .and_then(|(_, mangled)| self.module.get_function(mangled))
+                        })
+                    })
                     .or_else(|| self.resolve_function(&qualified_name, &arg_types))
                     .or_else(|| self.resolve_function(&mangled_name, &arg_types));
-
-                // If not resolved directly, try looking up in impl_methods
-                if resolved_fn_val.is_none()
-                    && let Some(methods) = self.impl_methods.get(module)
-                    && let Some((_, mangled)) = methods.iter().find(|(name, _)| name == callee)
-                {
-                    resolved_fn_val = self.module.get_function(mangled);
-                }
 
                 // Try generic function
                 if resolved_fn_val.is_none() {
@@ -10533,6 +10692,21 @@ impl<'ctx> CodeGen<'ctx> {
         }
     }
 
+    /// Resolve an LLVM function, falling back to the unqualified C name for
+    /// qualified extern calls such as `std::libc::malloc` -> `malloc`.
+    fn get_llvm_function(&self, name: &str) -> Option<inkwell::values::FunctionValue<'ctx>> {
+        if let Some(fn_val) = self.module.get_function(name) {
+            return Some(fn_val);
+        }
+        if name.contains("::") && !self.overloads.contains_key(name) {
+            let last_seg = name.split("::").last().unwrap_or(name);
+            if let Some(fn_val) = self.module.get_function(last_seg) {
+                return Some(fn_val);
+            }
+        }
+        None
+    }
+
     /// Resolve a function name by trying direct lookup first, then overload map.
     fn resolve_function(
         &self,
@@ -10541,7 +10715,7 @@ impl<'ctx> CodeGen<'ctx> {
     ) -> Option<inkwell::values::FunctionValue<'ctx>> {
         let n_args = arg_types.len();
         // Try direct lookup first
-        if let Some(fn_val) = self.module.get_function(name) {
+        if let Some(fn_val) = self.get_llvm_function(name) {
             return Some(fn_val);
         }
         // Try overload map
